@@ -443,6 +443,60 @@ test('提示词：长任务触发整理后，system 里包含工作记录、产�
   }
 });
 
+test('请求结构：窗口把 user 全部挤出后，输入仍然包含 user 轮次', async () => {
+  const harness = await createHarness({
+    limits: { maxConcurrentRuns: 0, contextWindowChars: 400, pairingOvershootChars: 0 },
+    worker: () => mockReply({ text: '不应被调用' }),
+  });
+  try {
+    const { owner, task } = harness.runtime.createTask({
+      title: '无 user 历史', goal: 'g', ownerRole: '执行者', ownerBrief: 'b',
+    });
+    // 只造 assistant + tool 的历史，确保窗口内一条 user 都没有。
+    for (let index = 0; index < 8; index += 1) {
+      const base = index * 3 + 1;
+      harness.store.appendWorkerTurn({
+        id: `nu${index}_a`, workerId: owner.id, seq: base, role: 'assistant', content: null,
+        toolCalls: [{ id: `c${index}`, name: 'fs_list', arguments: '{"path":"."}' }],
+        toolCallId: null, createdAt: nowIso(),
+      });
+      harness.store.appendWorkerTurn({
+        id: `nu${index}_t`, workerId: owner.id, seq: base + 1, role: 'tool', content: 'x'.repeat(120),
+        toolCalls: null, toolCallId: `c${index}`, createdAt: nowIso(),
+      });
+      harness.store.appendWorkerTurn({
+        id: `nu${index}_b`, workerId: owner.id, seq: base + 2, role: 'assistant', content: '继续',
+        toolCalls: null, toolCallId: null, createdAt: nowIso(),
+      });
+    }
+
+    const build = (
+      harness.runtime as unknown as {
+        buildWorkerMessages: (worker: unknown, target: unknown) => Promise<{ role: string; content: string | null }[]>;
+      }
+    ).buildWorkerMessages.bind(harness.runtime);
+    const messages = await build(owner, task);
+
+    const users = messages.filter((message) => message.role === 'user');
+    assert.ok(users.length >= 1, '请求里必须至少有一条 user 消息');
+    assert.match(users[0]!.content ?? '', /稳定执行上下文/, 'user 轮次由程序稳定提供');
+    // 历史里没有被拆开的工具调用
+    for (let index = 0; index < messages.length; index += 1) {
+      const message = messages[index]!;
+      if (message.role !== 'assistant') continue;
+      const calls = (message as { toolCalls?: { id: string }[] }).toolCalls ?? [];
+      for (const call of calls) {
+        assert.ok(
+          messages.slice(index + 1).some((item) => item.role === 'tool' && (item as { toolCallId?: string }).toolCallId === call.id),
+          `调用 ${call.id} 缺少结果`,
+        );
+      }
+    }
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test('提示词：整理期间到达的新消息不会被算进已覆盖范围', async () => {
   const harness = await staticHarness({ contextWindowChars: 600, noteTriggerTurns: 4, noteTriggerChars: 200 });
   try {

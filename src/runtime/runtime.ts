@@ -52,6 +52,7 @@ import {
   estimateTurnsChars,
   planHistory,
   renderArtifactTable,
+  renderExecutionDirective,
   renderTaskFacts,
   type HistoryPlan,
 } from './context.ts';
@@ -1090,7 +1091,12 @@ export class Runtime implements ToolHost {
       windowSummary: `近期窗口含 ${plan.turns.length} 条，历史共 ${plan.totalTurns} 条（约 ${plan.totalChars} 字符）`,
     });
     const history = this.buildHistory(worker, plan);
-    return [{ role: 'system', content: system }, ...history];
+    // 无论窗口怎么裁，请求里都必须有一条 user 轮次，否则提供方可能返回空结果。
+    const directive: ChatMessage = {
+      role: 'user',
+      content: renderExecutionDirective({ task, worker, isOwner }),
+    };
+    return [{ role: 'system', content: system }, directive, ...history];
   }
 
   /**

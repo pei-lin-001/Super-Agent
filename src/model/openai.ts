@@ -140,6 +140,17 @@ export class OpenAICompatibleModel implements ModelClient {
     const effort = request.reasoningEffort ?? this.options.reasoningEffort;
     if (effort) body['reasoning_effort'] = effort;
 
+    // 排查用：设置 MODEL_DUMP_DIR 后，把每次实际发送的请求体落盘（不含密钥）。
+    const dumpDir = process.env['MODEL_DUMP_DIR'];
+    if (dumpDir) {
+      const { mkdirSync, writeFileSync } = await import('node:fs');
+      const { join } = await import('node:path');
+      mkdirSync(dumpDir, { recursive: true });
+      const roles = request.messages.map((message) => message.role).join(',');
+      const name = `${Date.now()}-${request.messages.length}-${roles.replace(/[^a-z,]/g, '')}.json`;
+      writeFileSync(join(dumpDir, name), JSON.stringify(body, null, 2), 'utf8');
+    }
+
     const maxAttempts = Math.max(0, this.options.retry) + 1;
     let attempt = 0;
     let loadWaits = 0;

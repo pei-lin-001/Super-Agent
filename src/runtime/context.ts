@@ -1,4 +1,4 @@
-import type { Artifact, Review, Task, WorkerTurn } from '../domain/types.ts';
+import type { Artifact, Review, Task, Worker, WorkerTurn } from '../domain/types.ts';
 import type { Store } from '../storage/store.ts';
 
 /** 按字符数估算长度：这是字符数，不是 token，也不是费用。 */
@@ -105,6 +105,23 @@ export function planHistory(input: {
     overshoot: Math.max(0, chars - windowChars),
     droppedTurns: stats.turns - kept.length,
   };
+}
+
+/**
+ * 每次模型调用都附带的稳定执行请求。
+ * 历史窗口可能把 user 轮次挤出预算，这里保证请求里始终有一条明确的 user 消息。
+ */
+export function renderExecutionDirective(input: { task: Task; worker: Worker; isOwner: boolean }): string {
+  const { task, worker, isOwner } = input;
+  return [
+    '（稳定执行上下文，每次调用都会重复提供，不是新消息，不需要回应它）',
+    `- 任务：${task.title}`,
+    `- 你的职责：${worker.role}`,
+    `- 具体工作：${worker.brief}`,
+    `- 当前要求版本：${task.reviewEpoch}`,
+    `- 角色：${isOwner ? '负责人' : '协作者'}`,
+    '请结合下面的历史继续推进当前工作。',
+  ].join('\n');
 }
 
 /** 程序事实：任务状态、要求版本、提交门槛。模型不能改写这些内容。 */
