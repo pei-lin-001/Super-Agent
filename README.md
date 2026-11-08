@@ -302,6 +302,28 @@ Router：`create_task` `send_to_worker` `stop_task` `list_tasks` `read_task`。
 
 `artifact_import` 登记的是**快照**：源文件之后再改，也不会改变已登记的版本；检查与交付绑定的始终是这个快照的指纹。
 
+### 工具链的真实端到端验收
+
+`pnpm smoke:toolkit`（`scripts/smoke-toolkit.ts`，场景 A：小型代码维护）会造一个带失败测试的小项目，
+让真实模型自己跑测试、定位、改文件、复跑、拉协作者检查、登记真实文件、提交。
+
+实际一次通过运行（`toolkit-20261108130415-9917`，验收配置 `MAX_STEPS_PER_WORKER=44`）：
+
+```
+任务 task_079c76b7 → completed，验收脚本退出码 0
+负责人 w1_843106d7（38 步，done）｜检查者 w2 撞 44 步上限失败，w3 接手完成
+产物：calc.py v1（485B，82587695baac…）、test_calc.py v1（639B）、FIX_NOTES.md v1（4888B）
+交付引用：三份产物全部 approved（要求版本 0）
+作业：62 个，61 个 exited、1 个 failed（真实失败被读到并处理）
+工具使用：proc_run 71｜fs_read 36｜fs_stat 28｜fs_list 9｜fs_glob 5｜fs_edit 2｜
+          artifact_import 3｜create_worker 2｜wait_for 3｜env_capabilities 1｜submit_result 1
+交付代码复跑：cd work/toolkit-…/artifacts/v1 && python3 -m pytest → 4 passed
+```
+
+**默认配置（`MAX_STEPS_PER_WORKER=24`）下两次都没跑完**：第一次负责人 23 步后卡在等待（系统通知没唤醒等待者，
+已修）；第二次负责人 24 步耗尽。工具变多以后，这条链路本身就在 30–40 步量级。
+这次通过用的是 44 步的验收配置，**不是默认值**，提高上限这件事没有进默认配置。
+
 ### 执行权限的真实边界
 
 - 文件工具被限制在任务目录与只读材料目录内，这是**应用层**检查。
@@ -348,7 +370,7 @@ REPL 命令：
 
 ```bash
 pnpm typecheck                              # 类型检查
-pnpm test                                   # 62 个测试，全部使用临时目录与模拟模型
+pnpm test                                   # 63 个测试，全部使用临时目录与模拟模型
 pnpm smoke:mini                             # 真实模型最小链路
 pnpm smoke:real                             # 真实模型综合协作场景
 node scripts/verify-run.ts <db> [taskId]    # 对已有运行记录重新做严格判定，不调用模型
