@@ -235,6 +235,80 @@ Router：`create_task` `send_to_worker` `stop_task` `list_tasks` `read_task`。
 
 **没有开放 shell 工具**：本模块用读写与搜索已能完成真实任务，开放 shell 会让取消与幂等语义变复杂。
 
+## 7.5 Worker 工具
+
+全部工具都在 `src/tools/` 下，通过 `ToolRegistry` 注册给 Worker。Router 不持有这些工具。
+
+### 文件
+
+| 工具 | 做什么 | 关键限制 |
+|---|---|---|
+| `fs_list` | 列目录 | 只读范围内 |
+| `fs_stat` | 文件类型、大小、mtime、sha256 | 只读范围内 |
+| `fs_glob` | 按 `**/*.py` 这类模式找文件 | 任务目录内，跳过 node_modules/.git |
+| `fs_search` | 按内容搜索，带行号与上下文 | 任务目录内 |
+| `fs_read` | 分段读取，尾部给下一次 offset | 单次上限 2MB |
+| `fs_write` | 创建或整体覆盖 | 任务目录内 |
+| `fs_edit` | 按原文精确替换 | 见下 |
+
+`fs_edit` 的语义是确定的：
+
+- 原文找不到 → 失败，不做任何改动；
+- 匹配到多处且没写 `replace_all` → 失败，指出歧义；
+- 传 `edits` 数组改多处时**先整体校验**，任何一处不合法都不写盘；
+- 传 `expected_sha256`（来自 `fs_read` / `fs_stat`）可在文件被别人改过时拒绝覆盖；
+- 成功后返回字符数、行数变化、移出的行和新指纹，便于核对。
+
+路径规则：`materials/` 前缀指向只读材料目录，其余落在 `work/<taskId>/`。符号链接指向目录外会被拒绝。
+
+### 命令与作业
+
+| 工具 | 做什么 |
+|---|---|
+| `proc_run` | 启动命令，返回作业 ID；`wait=true` 时直接等结果 |
+| `proc_read` | 按 offset 读 stdout/stderr，运行中也能读 |
+| `proc_wait` | 挂起等待作业结束，期间让出执行槽 |
+| `proc_stop` | 终止作业及其进程树 |
+| `proc_list` | 列出本任务的全部作业 |
+
+参数语义：`command` 是程序名，`args` 是参数数组，**不经过 shell**，所以文件名不会被当成命令语法。需要 shell 语义时自行调用 `bash -lc`，并清楚这意味着什么。
+
+- 标准输入：`stdin` 写入后关闭。
+- 执行超时：`timeout_seconds`，到时终止并记录 `timeout`。
+- 等待超时：`proc_wait` 的 `timeout_seconds` 只结束本次等待，作业继续跑。
+- 环境变量：子进程只继承 `PATH`/`HOME`/`LANG`/`TMPDIR` 等基础变量，**不传模型密钥与搜索凭据**。
+- 日志：落在 `work/.jobs/<taskId>/<jobId>.out|.err`，进程结束后仍可分段读取。
+- 重启：上次运行遗留的 `running` 作业一律标为 `unknown`（结果未知），不重放、不按 PID 误杀。
+
+### 联网与资料
+
+| 工具 | 做什么 | 依赖 |
+|---|---|---|
+| `net_fetch` | 抓取已知 URL：状态码、最终 URL、内容类型、正文；HTML 提正文，二进制落盘 | 无 |
+| `net_search` | 联网搜索，返回标题/URL/摘要 | `SEARCH_API_KEY`（未配置则报错，不伪造） |
+| `doc_pdf` | PDF 按页提取文字 | 系统 `pdftotext` |
+| `doc_notebook` | 读 .ipynb 的单元格与文本输出 | 无 |
+| `env_capabilities` | 报告当前可用能力（不输出密钥） | 无 |
+
+搜索摘要不等于网页正文，拿到线索后仍要用 `net_fetch` 打开来源。
+
+### 产物
+
+| 工具 | 做什么 |
+|---|---|
+| `artifact_save` | 文本内容存为产物（原有用法定持） |
+| `artifact_import` | 把任务目录里的真实文件按字节登记为产物 |
+| `artifact_read` / `artifact_list` | 读版本、列清单 |
+
+`artifact_import` 登记的是**快照**：源文件之后再改，也不会改变已登记的版本；检查与交付绑定的始终是这个快照的指纹。
+
+### 执行权限的真实边界
+
+- 文件工具被限制在任务目录与只读材料目录内，这是**应用层**检查。
+- `proc_run` 的工作目录只是进程的起始目录，**不是操作系统级隔离**。命令仍能访问运行用户可读写的其他路径。
+- 没有实现容器、沙箱或 seccomp。需要强隔离时请把整个程序放进容器运行。
+- 能做但没做的：命令字符串黑名单（不可靠，故意不做）。
+
 ## 8. 目录
 
 ```
@@ -274,7 +348,7 @@ REPL 命令：
 
 ```bash
 pnpm typecheck                              # 类型检查
-pnpm test                                   # 50 个测试，全部使用临时目录与模拟模型
+pnpm test                                   # 62 个测试，全部使用临时目录与模拟模型
 pnpm smoke:mini                             # 真实模型最小链路
 pnpm smoke:real                             # 真实模型综合协作场景
 node scripts/verify-run.ts <db> [taskId]    # 对已有运行记录重新做严格判定，不调用模型
