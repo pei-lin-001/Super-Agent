@@ -520,3 +520,69 @@ test('在线规则：不支持的 key 被拒绝，巡检间隔覆盖项可校验
     await harness.cleanup();
   }
 });
+
+test('同时启动：竞争条件下只有一个 Watchdog 生效', async () => {
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join: joinPath } = await import('node:path');
+  const { spawn } = await import('node:child_process');
+  const dir = await mkdtemp(joinPath(tmpdir(), 'wd-race-'));
+  const env = {
+    ...process.env,
+    DB_PATH: joinPath(dir, 'agent.db'),
+    WORK_DIR: joinPath(dir, 'work'),
+    WATCHDOG_NO_TICK: '1',
+    WATCHDOG_INTERVAL_MS: '3600000',
+    OLLAMA_BASE_URL: 'http://127.0.0.1:9/v1',
+    OLLAMA_API_KEY: 'test-key',
+    MODEL_NAME: 'mock-model',
+  };
+  // 同时拉起三个，必须只有一个留下
+  const children = [0, 1, 2].map(() =>
+    spawn(process.execPath, ['src/watchdog/main.ts'], { cwd: process.cwd(), env, stdio: 'ignore' }),
+  );
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    const alive = children.filter((child) => child.exitCode === null).length;
+    assert.equal(alive, 1, `应只有一个实例存活，实际 ${alive}`);
+  } finally {
+    for (const child of children) child.kill('SIGTERM');
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('停机标记：存在时不会自动拉起主系统', async () => {
+  const harness = await createHarness({ limits: { maxConcurrentRuns: 0 }, worker: () => mockReply({ text: 'ok' }) });
+  try {
+    harness.runtime.createTask({ title: '停机', goal: 'g', ownerRole: 'r', ownerBrief: 'b' });
+    const { mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+    const stopFile = join(harness.config.workDir, '.runtime', 'watchdog.stop');
+    mkdirSync(join(harness.config.workDir, '.runtime'), { recursive: true });
+    writeFileSync(stopFile, 'stopped', 'utf8');
+
+    let restarted = false;
+    const session = new WatchdogSession({
+      store: harness.store,
+      config: harness.config,
+      model: new MockModel(() => {
+        if (!restarted) {
+          restarted = true;
+          return mockReply({ toolCalls: [{ name: 'maintain', arguments: JSON.stringify({ action: 'restart_main', reason: '测试' }) }] });
+        }
+        return mockReply({ text: '已尝试，但被停机标记阻止' });
+      }),
+      modelName: 'mock',
+      restartMain: async () => {
+        if (existsSync(stopFile)) return { ok: false, message: '存在停机标记，不执行自动拉起' };
+        return { ok: true, message: '拉起' };
+      },
+    });
+    await session.ask('主系统停了吗？');
+    const actions = harness.store.listWdActions(5);
+    assert.ok(actions.some((action) => action.result.includes('停机标记')), '停机标记必须阻止拉起');
+    rmSync(stopFile, { force: true });
+  } finally {
+    await harness.cleanup();
+  }
+});

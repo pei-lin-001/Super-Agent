@@ -207,6 +207,14 @@ export class WatchdogSession {
       if (action === 'restart_main') {
         if (!this.deps.restartMain) return '当前环境没有配置主系统重启能力';
         const result = await this.deps.restartMain();
+        store.appendWdAction({
+          id: `wda_${randomBytes(4).toString('hex')}`,
+          issueId: str('issue_id') || null,
+          action: 'restart_main',
+          reason: str('reason') || '',
+          expected: '主系统恢复调度',
+          result: result.message,
+        });
         return result.message;
       }
       const payload: Record<string, unknown> = {

@@ -53,18 +53,50 @@ const session = new WatchdogSession({
 mkdirSync(dirname(pidFile), { recursive: true });
 
 // 单实例：同一时间只允许一个有效维护者，避免重复巡检与恢复风暴。
-const existing = (() => {
+// 原子抢占：同时启动时只有一个能拿到写句柄（O_EXCL），不依赖"先读再写"的顺序。
+const lockPath = `${pidFile}.lock`;
+let acquired = false;
+for (let attempt = 0; attempt < 2 && !acquired; attempt += 1) {
   try {
-    return JSON.parse(readFileSync(pidFile, 'utf8')) as { pid: number };
+    writeFileSync(lockPath, String(process.pid), { flag: 'wx' });
+    acquired = true;
   } catch {
-    return null;
+    // 锁文件已存在：确认持有者是否真的还活着，否则视为陈旧锁清理后重试。
+    let holder = 0;
+    try {
+      holder = Number(readFileSync(lockPath, 'utf8').trim());
+    } catch {
+      holder = 0;
+    }
+    const alive = Number.isInteger(holder) && holder >= 2 && isPidAlive(holder) && looksLikeOurProcess(holder, 'watchdog');
+    if (alive) {
+      console.log(`已有 Watchdog 在运行（pid=${holder}），本次不启动`);
+      store.close();
+      process.exit(3);
+    }
+    try {
+      rmSync(lockPath, { force: true });
+    } catch {
+      // 清理陈旧锁失败时直接退出，避免两个实例同时写库。
+      console.log('无法清理陈旧锁，本次不启动');
+      store.close();
+      process.exit(3);
+    }
   }
-})();
-if (existing && existing.pid !== process.pid && isPidAlive(existing.pid) && looksLikeOurProcess(existing.pid, 'watchdog')) {
-  console.log(`已有 Watchdog 在运行（pid=${existing.pid}），本次不启动`);
+}
+if (!acquired) {
+  console.log('未能取得单实例锁，本次不启动');
   store.close();
   process.exit(3);
 }
+const releaseLock = (): void => {
+  try {
+    rmSync(lockPath, { force: true });
+  } catch {
+    // 退出路径不阻塞。
+  }
+};
+process.on('exit', releaseLock);
 
 writeFileSync(pidFile, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }, null, 2), 'utf8');
 
