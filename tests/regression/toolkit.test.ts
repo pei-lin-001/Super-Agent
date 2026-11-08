@@ -451,3 +451,27 @@ test('大输出：完整日志可从作业里按 offset 读回，错误码不会
     await fixture.harness.cleanup();
   }
 });
+
+test('唤醒：等待中的 Worker 收到系统通知后会被唤醒，不会一直挂着', async () => {
+  const harness = await createHarness({ worker: () => ({ text: 'ok', toolCalls: [], finishReason: 'stop' }) as never });
+  try {
+    const { task, owner } = harness.runtime.createTask({
+      title: '唤醒', goal: 'g', ownerRole: '负责人', ownerBrief: 'b',
+    });
+    const helper = harness.runtime.createCollaborator(owner, '协作者', '干活');
+    // owner 进入等待，等 helper 的回复
+    harness.runtime.registerWait(owner, { from: helper.workerId!, timeoutMs: 60_000 });
+    harness.store.setWorkerStatus(owner.id, 'waiting');
+    assert.equal(harness.store.listActiveWaitsForWorker(owner.id).length, 1);
+
+    // 协作者失败：系统通知必须叫醒等待者，而不是让它一直等一个不会再回话的人
+    harness.runtime.notifySystem(owner.id, `协作者 ${helper.workerId} 失败：步数达到上限 24`);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(harness.store.listActiveWaitsForWorker(owner.id).length, 0, '等待应被解除');
+    // 被唤醒后不再停留在 waiting，而是重新进入调度
+    assert.notEqual(harness.store.getWorker(owner.id)?.status, 'waiting');
+    void task;
+  } finally {
+    await harness.cleanup();
+  }
+});

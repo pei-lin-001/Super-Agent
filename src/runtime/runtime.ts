@@ -1476,6 +1476,11 @@ export class Runtime implements ToolHost {
     });
   }
 
+  /** 供测试与外部组件投递系统通知。 */
+  notifySystem(workerId: string, body: string): void {
+    this.pushSystemNotice(workerId, body);
+  }
+
   private pushSystemNotice(workerId: string, body: string): void {
     const worker = this.store.getWorker(workerId);
     if (!worker) return;
@@ -1501,6 +1506,14 @@ export class Runtime implements ToolHost {
       consumedAt: null,
       error: null,
     });
+    // 通知代表状态变化。等待中的 Worker 必须醒来看一眼，
+    // 否则它等的对象（比如已经失败的协作者）永远不会再回话。
+    const current = this.store.getWorker(workerId);
+    if (!current || current.status !== 'waiting') return;
+    for (const wait of this.store.listActiveWaitsForWorker(workerId)) {
+      this.store.resolveWait(wait.id);
+    }
+    this.enqueue(workerId);
   }
 
   private markConsumed(messageId: string): void {
