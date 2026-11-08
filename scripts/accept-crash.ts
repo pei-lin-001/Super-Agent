@@ -38,12 +38,13 @@ function require_(condition: boolean, message: string): void {
 
 // ---- 本地受控模型：第一阶段写文件，之后提交 ----
 let modelCalls = 0;
-const STAGE1_CALLS = 6;
 const modelServer = createServer((req, res) => {
-  req.resume();
+  let raw = '';
+  req.on('data', (chunk) => {
+    raw += chunk.toString();
+  });
   req.on('end', () => {
     modelCalls += 1;
-    const toolPhase = modelCalls <= STAGE1_CALLS;
     const reply = (name: string, args: Record<string, unknown>, id: string): unknown => ({
       choices: [
         {
@@ -58,13 +59,47 @@ const modelServer = createServer((req, res) => {
       ],
       usage: { prompt_tokens: 12, completion_tokens: 6 },
     });
+    // 只解析真实请求体：工具 schema 和任务目标里也会出现这些词，
+    // 直接对整段文本做 includes 会把「工具定义」误当成「已经调用过」。
+    let parsed: { tools?: { function?: { name?: string } }[]; messages?: { role?: string; content?: string }[] } = {};
+    try {
+      parsed = JSON.parse(raw) as typeof parsed;
+    } catch {
+      parsed = {};
+    }
+    const toolNames = (parsed.tools ?? []).map((item) => item.function?.name ?? '');
+    const isWatchdog = toolNames.includes('check_main') || toolNames.includes('restart_main');
+    // 只看工具返回的内容：这决定了业务任务走到哪一步，与进程重启无关。
+    const toolOutputs = (parsed.messages ?? [])
+      .filter((message) => message.role === 'tool')
+      .map((message) => message.content ?? '')
+      .join('\n');
+    const hasProgress = toolOutputs.includes('progress.txt');
+    const hasDeliverable = toolOutputs.includes('deliverable.md');
+    const hasSubmit = toolOutputs.includes('已提交') || toolOutputs.includes('交付完成');
+
     let payload: unknown;
-    if (toolPhase) {
+    if (isWatchdog) {
+      const wdTurn = raw.split('"role":"tool"').length;
+      if (wdTurn <= 2) payload = reply('check_main', {}, `c${modelCalls}`);
+      else if (wdTurn <= 4) payload = reply('maintain', { action: 'restart_main', reason: '实例进程已退出' }, `c${modelCalls}`);
+      else {
+        payload = {
+          choices: [{ message: { content: '已核对主系统状态并尝试恢复，需要复查心跳与任务进度。' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 12, completion_tokens: 8 },
+        };
+      }
+    } else if (!hasProgress) {
       payload = reply('fs_write', { path: 'progress.txt', content: `stage1 call ${modelCalls}\n` }, `c${modelCalls}`);
-    } else if (modelCalls === STAGE1_CALLS + 1) {
+    } else if (!hasDeliverable) {
       payload = reply('artifact_save', { name: 'deliverable.md', content: '# 交付\n第二阶段完成\n' }, `c${modelCalls}`);
-    } else {
+    } else if (!hasSubmit) {
       payload = reply('submit_result', { summary: '恢复后完成交付', artifacts: ['deliverable.md'] }, `c${modelCalls}`);
+    } else {
+      payload = {
+        choices: [{ message: { content: '交付完成。' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 12, completion_tokens: 6 },
+      };
     }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify(payload));
@@ -109,33 +144,52 @@ try {
   for (let i = 0; i < 150 && !existsSync(join(workDir, '.runtime', 'heartbeat.json')); i += 1) await sleep(100);
   require_(existsSync(join(workDir, '.runtime', 'heartbeat.json')), '主进程已启动并写出心跳');
 
-  // 用独立进程注入任务（复用真实 API，不直接改数据库状态）
+  // 用独立进程写持久状态（任务 + 排队中的负责人），由常驻主系统接管调度。
+  // 不经过 Runtime：那样会在注入进程里启动执行，注入进程退出时把执行打断。
   const inject = spawn(
     process.execPath,
     [
-      '--env-file-if-exists=.env.local',
       '-e',
-      `import('./src/storage/store.ts').then(async ({Store}) => {
-         const { Runtime } = await import('./src/runtime/runtime.ts');
-         const { MockModel } = await import('./src/model/mock.ts');
+      `import('./src/storage/store.ts').then(async ({ Store }) => {
          const { loadConfig } = await import('./src/config.ts');
+         const { randomUUID } = await import('node:crypto');
          const config = loadConfig();
          const store = new Store(config.dbPath);
-         const runtime = new Runtime({ store, config, workerModel: new MockModel(() => ({ text: 'noop', reasoning: null, toolCalls: [], finishReason: 'stop', model: 'x', usage: null })) });
-         const { owner } = runtime.createTask({
-           title: '崩溃恢复验收任务', goal: '写出 progress.txt 并交付 deliverable.md',
-           doneCriteria: '产物 deliverable.md 已登记并被提交引用', requireReview: false,
-           ownerRole: '执行者', ownerBrief: '按阶段推进',
+         const suffix = randomUUID().replace(/-/g, '').slice(0, 8);
+         const taskId = 'task_' + suffix;
+         const groupId = 'grp_' + suffix;
+         const workerId = 'w1_' + suffix;
+         const now = new Date().toISOString();
+         store.createTask({
+           id: taskId, groupId, title: '崩溃恢复验收任务',
+           goal: '写出 progress.txt 并交付 deliverable.md',
+           brief: '', doneCriteria: '产物 deliverable.md 已登记并被提交引用',
+           requireReview: false, reviewEpoch: 0, ownerWorkerId: null,
+           status: 'active', closeReason: null, createdAt: now, updatedAt: now, closedAt: null,
          });
-         runtime.enqueue(owner.id);
+         store.createWorker({
+           id: workerId, groupId, parentId: null, role: '执行者', brief: '按阶段推进',
+           status: 'queued', model: null, stepCount: 0,
+           createdAt: now, updatedAt: now, lastError: null,
+         });
+         store.setTaskOwner(taskId, workerId);
+         store.appendEvent(taskId, workerId, 'task.created', '崩溃恢复验收任务');
          store.close();
-         console.log('injected');
+         console.log('injected ' + taskId);
        }).catch((error) => { console.error(error); process.exit(1); });`,
     ],
     { cwd: root, env, stdio: 'pipe' },
   );
+  let injectOut = '';
+  inject.stdout?.on('data', (c: Buffer) => {
+    injectOut += c.toString();
+  });
+  inject.stderr?.on('data', (c: Buffer) => {
+    injectOut += c.toString();
+  });
   await new Promise((resolve) => inject.on('exit', resolve));
-  await sleep(1500);
+  log(`注入：${injectOut.trim().split('\n').slice(-1)[0]}`);
+  await sleep(1200);
 
   const task = readTask();
   require_(task !== null, '任务已建立');
@@ -241,11 +295,13 @@ try {
     // 已退出
   }
   await sleep(800);
-  // 只清理本次创建的数据库；工作目录保留供复查
-  try {
-    rmSync(dbPath, { force: true });
-  } catch {
-    // 忽略
+  // 失败时保留数据库供复查；成功才清理本次创建的数据库。
+  if (failures.length === 0) {
+    try {
+      rmSync(dbPath, { force: true });
+    } catch {
+      // 忽略
+    }
   }
 }
 

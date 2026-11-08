@@ -55,7 +55,7 @@ function ensureJobs(): ProcessService {
 }
 
 function disposeJobs(): void {
-  disposeJobs();
+  wdJobs?.dispose();
   wdJobs = null;
 }
 
@@ -94,43 +94,43 @@ const LOCK_PATH = `${pidFile}.lock`;
  * 返回 'acquired'（本次持有）/ 'busy'（已有有效维护者）/ 'unknown'（探测失败，保守退出）。
  */
 async function acquireLock(): Promise<'acquired' | 'busy' | 'unknown' | 'failed'> {
-// 原子抢占：同时启动时只有一个能拿到写句柄（O_EXCL），不依赖"先读再写"的顺序。
-const lockPath = LOCK_PATH;
-let acquired = false;
-for (let attempt = 0; attempt < 8 && !acquired; attempt += 1) {
-try {
-  writeFileSync(lockPath, `${process.pid}\n`, { flag: 'wx' });
-  acquired = true;
-  break;
-} catch {
-  // 锁已存在：判断持有者状态
-}
-let holder = 0;
-try {
-  holder = Number(readFileSync(lockPath, 'utf8').trim());
-} catch {
-  holder = 0;
-}
-if (!Number.isInteger(holder) || holder < 2) {
-  // 刚创建、内容还没写完：不能当成陈旧锁，稍等再看。
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  continue;
-}
-const alive = isPidAlive(holder);
-const identity = alive ? identifyProcess(holder, 'watchdog') : 'mismatch';
-if (identity === 'match') return 'busy';
-if (identity === 'unknown') {
-  // 探测失败不等于对方已经退出：保守处理，不删锁、也不启动第二个。
-  return 'unknown';
-}
-try {
-  rmSync(lockPath, { force: true });
-} catch {
-  return 'failed';
-}
-}
+  // 原子抢占：同时启动时只有一个能拿到写句柄（O_EXCL），不依赖"先读再写"的顺序。
+  let acquired = false;
+  for (let attempt = 0; attempt < 8 && !acquired; attempt += 1) {
+    try {
+      writeFileSync(LOCK_PATH, `${process.pid}\n`, { flag: 'wx' });
+      acquired = true;
+      break;
+    } catch {
+      // 锁已存在：判断持有者状态
+    }
+    let holder = 0;
+    try {
+      holder = Number(readFileSync(LOCK_PATH, 'utf8').trim());
+    } catch {
+      holder = 0;
+    }
+    if (!Number.isInteger(holder) || holder < 2) {
+      // 刚创建、内容还没写完：不能当成陈旧锁，稍等再看。
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      continue;
+    }
+    const alive = isPidAlive(holder);
+    const identity = alive ? identifyProcess(holder, 'watchdog') : 'mismatch';
+    if (identity === 'match') return 'busy';
+    if (identity === 'unknown') {
+      // 探测失败不等于对方已经退出：保守处理，不删锁、也不启动第二个。
+      return 'unknown';
+    }
+    try {
+      rmSync(LOCK_PATH, { force: true });
+    } catch {
+      return 'failed';
+    }
+  }
   return acquired ? 'acquired' : 'failed';
 }
+
 // 释放锁时核对所有者：只删自己写的那个，避免旧进程清掉新进程的锁。
 let holdingLock = false;
 const releaseLock = (): void => {

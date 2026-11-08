@@ -1117,6 +1117,7 @@ export class Runtime implements ToolHost {
   }
 
   private pump(): void {
+    if (process.env['DEBUG_RUN']) console.error(`[pump] queue=${this.queue.length} running=${this.runningCount}`);
     while (!this.stopped && this.runningCount < this.config.limits.maxConcurrentRuns) {
       const workerId = this.queue.shift();
       if (!workerId) return;
@@ -1143,6 +1144,10 @@ export class Runtime implements ToolHost {
   }
 
   private async runWorker(workerId: string): Promise<void> {
+    const dbg = (m: string): void => {
+      if (process.env['DEBUG_RUN']) console.error(`[run:${workerId}] ${m}`);
+    };
+    dbg('enter');
     const controller = new AbortController();
     this.aborts.set(workerId, controller);
     let worker = this.store.getWorker(workerId);
@@ -1194,7 +1199,9 @@ export class Runtime implements ToolHost {
         this.recordInboxTurn(workerId, inbox);
         for (const message of inbox) this.markConsumed(message.id);
       }
+      dbg('before build');
       const messages = await this.buildWorkerMessages(worker, task);
+      dbg(`after build (${messages.length})`);
       // 上下文准备是异步的：发请求前再核一次资格，避免准备期间被暂停或停机。
       const beforeRequest = this.canRun(workerId, epoch);
       if (!beforeRequest.ok) {
@@ -1202,6 +1209,7 @@ export class Runtime implements ToolHost {
         this.settleWorker(workerId, beforeRequest.reason);
         return;
       }
+      dbg(`request model closed=${this.store.isClosed}`);
       const result = await new RecordingModel(this.workerModel, this.store, 'worker', {
         taskId: task.id,
         workerId,
@@ -1213,6 +1221,7 @@ export class Runtime implements ToolHost {
         signal: runController?.signal ?? null,
       });
 
+      dbg('model returned');
       const afterModel = this.canRun(workerId, epoch);
       if (!afterModel.ok) {
         this.store.appendEvent(task.id, workerId, 'run.stale', `模型响应返回后停止：${afterModel.reason}`);
@@ -1886,6 +1895,15 @@ export class Runtime implements ToolHost {
   tick(): void {
     this.drainControls();
     this.pumpRouter();
+    // 接管数据库里排队的业务 Worker：任务可能由另一个进程（运维注入、验收脚本）
+    // 创建，只写库不入本进程内存队列。enqueue 本身去重，重复扫描是安全的。
+    if (!this.stopped) {
+      for (const worker of this.store.listQueuedWorkers()) {
+        if (this.queue.includes(worker.id)) continue;
+        if (process.env['DEBUG_RUN']) console.error(`[tick] adopt queued ${worker.id}`);
+        this.enqueue(worker.id);
+      }
+    }
     const now = Date.now();
     for (const wait of this.store.listActiveWaits()) {
       if (new Date(wait.deadlineAt).getTime() > now) continue;

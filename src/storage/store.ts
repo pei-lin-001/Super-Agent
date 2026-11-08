@@ -365,6 +365,19 @@ export class Store {
     return this.all('SELECT * FROM worker WHERE group_id = ? ORDER BY created_at ASC', groupId).map(mapWorker);
   }
 
+  /**
+   * 数据库里排队中的业务 Worker（可能由另一个进程创建，需要本进程接管调度）。
+   * 维护挂起的是任务（task.maintenance），不是 Worker 自己的字段。
+   */
+  listQueuedWorkers(): Worker[] {
+    return this.all(
+      `SELECT w.* FROM worker w
+         LEFT JOIN task t ON t.id = w.group_id
+        WHERE w.status = 'queued' AND COALESCE(t.maintenance, 0) = 0
+        ORDER BY w.created_at ASC`,
+    ).map(mapWorker);
+  }
+
   listWorkers(): Worker[] {
     return this.all('SELECT * FROM worker ORDER BY created_at ASC').map(mapWorker);
   }

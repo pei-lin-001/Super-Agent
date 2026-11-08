@@ -397,15 +397,13 @@ export class WatchdogSession {
       },
     ];
     store.appendWdTurn({ id: `wdt_${randomBytes(4).toString('hex')}`, role: 'user', content: question });
-    for (let index = 0; index < 12; index += 1) {
-      // 最后一步不再给工具：必须基于已经拿到的证据给出结论，而不是无限调查。
-      const last = index === 11;
+    // 不设调用次数上限：维护者要调查多久就多久，直到它自己认为证据够了。
+    // 结束条件由模型给出（不再调用工具），不由程序的计数决定。
+    for (;;) {
       const result = await new RecordingModel(model, store, 'watchdog', { sessionId: null }).chat({
         model: modelName,
-        messages: last
-          ? [...messages, { role: 'user', content: '请基于目前已有证据直接作答：能确认什么、还不能确认什么。不要再调用工具。' }]
-          : messages,
-        tools: last ? [] : WD_TOOLS,
+        messages,
+        tools: WD_TOOLS,
         reasoningEffort: config.reasoningEffort,
       });
       messages.push({ role: 'assistant', content: result.text, ...(result.toolCalls.length > 0 ? { toolCalls: result.toolCalls } : {}) });
@@ -424,7 +422,6 @@ export class WatchdogSession {
         messages.push({ role: 'tool', content: output, toolCallId: call.id });
       }
     }
-    return '（达到工具调用上限，未得出结论）';
   }
 
   async runOnce(intervalMinutes: number): Promise<WatchdogResult> {
@@ -463,8 +460,8 @@ export class WatchdogSession {
 
     let steps = 0;
     let acted = false;
-    const maxSteps = 8;
-    for (let index = 0; index < maxSteps; index += 1) {
+    // 巡检同样不设步数上限：结束条件由模型给出，不由程序计数决定。
+    for (;;) {
       const result = await new RecordingModel(model, store, 'watchdog', { sessionId: null }).chat({
         model: modelName,
         messages,
