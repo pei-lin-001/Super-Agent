@@ -157,19 +157,25 @@ export class OpenAICompatibleModel implements ModelClient {
     let attempt = 0;
     let loadWaits = 0;
     let lastError: unknown = null;
+    // 单次调用自己的计数：并发时用共享计数器相减会串账。
+    let callAttempts = 0;
 
     while (attempt < maxAttempts) {
       this.httpAttempts += 1;
+      callAttempts += 1;
       await gate.acquire();
       try {
+        // 本地取消 + 单次超时合并成一个信号，两者任一触发都要中断请求。
+        const timeout = AbortSignal.timeout(this.options.timeoutMs);
+        const signal = request.signal ? AbortSignal.any([request.signal, timeout]) : timeout;
         const response = await this.fetchImpl(url, {
+          signal,
           method: 'POST',
           headers: {
             'content-type': 'application/json',
             authorization: `Bearer ${this.options.apiKey}`,
           },
           body: JSON.stringify(body),
-          signal: AbortSignal.timeout(this.options.timeoutMs),
         });
 
         const text = await response.text();
@@ -241,9 +247,15 @@ export class OpenAICompatibleModel implements ModelClient {
           toolCalls,
           finishReason: choice.finish_reason ?? 'unknown',
           model: json.model ?? request.model,
-          usage: json.usage
-            ? { promptTokens: json.usage.prompt_tokens ?? 0, completionTokens: json.usage.completion_tokens ?? 0 }
-            : null,
+          usage:
+            json.usage &&
+            (typeof json.usage.prompt_tokens === 'number' || typeof json.usage.completion_tokens === 'number')
+              ? {
+                  promptTokens: typeof json.usage.prompt_tokens === 'number' ? json.usage.prompt_tokens : 0,
+                  completionTokens: typeof json.usage.completion_tokens === 'number' ? json.usage.completion_tokens : 0,
+                }
+              : null,
+          httpAttempts: callAttempts,
         };
       } catch (error) {
         const isAbort = error instanceof Error && error.name === 'TimeoutError';

@@ -32,10 +32,14 @@ export interface StepResult {
   finishReason: string;
   model: string;
   usage: StepUsage | null;
+  /** 本次逻辑调用内部的 HTTP 尝试次数（含重试），不属于请求正文。 */
+  httpAttempts?: number;
 }
 
 export interface ChatRequest {
   model: string;
+  /** 本地取消控制，不会进入发往提供方的请求正文。 */
+  signal?: AbortSignal | null;
   messages: ChatMessage[];
   tools: ToolSchema[];
   reasoningEffort?: string;

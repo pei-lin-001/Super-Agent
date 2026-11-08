@@ -400,7 +400,7 @@ export class WatchdogSession {
     for (let index = 0; index < 12; index += 1) {
       // 最后一步不再给工具：必须基于已经拿到的证据给出结论，而不是无限调查。
       const last = index === 11;
-      const result = await model.chat({
+      const result = await new RecordingModel(model, store, 'watchdog', { sessionId: null }).chat({
         model: modelName,
         messages: last
           ? [...messages, { role: 'user', content: '请基于目前已有证据直接作答：能确认什么、还不能确认什么。不要再调用工具。' }]

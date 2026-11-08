@@ -725,6 +725,40 @@ export class Store {
     }));
   }
 
+  saveRouterDecision(input: {
+    id: string;
+    sessionId: string;
+    turnNo: number;
+    text: string | null;
+    toolCalls: unknown;
+  }): void {
+    this.run(
+      `INSERT INTO router_decision (id, session_id, turn_no, text, tool_calls, status, created_at)
+       VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
+      input.id, input.sessionId, input.turnNo, input.text, JSON.stringify(input.toolCalls), nowIso(),
+    );
+  }
+
+  pendingRouterDecision(
+    sessionId: string,
+  ): { id: string; turnNo: number; text: string | null; toolCalls: unknown } | null {
+    const row = this.get(
+      `SELECT * FROM router_decision WHERE session_id = ? AND status = 'pending' ORDER BY created_at ASC LIMIT 1`,
+      sessionId,
+    );
+    if (!row) return null;
+    return {
+      id: str(row['id']),
+      turnNo: num(row['turn_no']),
+      text: strOrNull(row['text']),
+      toolCalls: JSON.parse(str(row['tool_calls'])),
+    };
+  }
+
+  finishRouterDecision(id: string): void {
+    this.run(`UPDATE router_decision SET status = 'done' WHERE id = ?`, id);
+  }
+
   getRouterAction(sessionId: string, actionKey: string): { tool: string; result: string } | null {
     const row = this.get('SELECT tool, result FROM router_action WHERE session_id = ? AND action_key = ?', sessionId, actionKey);
     return row ? { tool: str(row['tool']), result: str(row['result']) } : null;

@@ -956,3 +956,90 @@ test('复查调度：未到期且无新情况时跳过一次模型审视', async
     await harness.cleanup();
   }
 });
+
+test('Router 决策身份：额度 1 时连续多轮建任务并正常结束', async () => {
+  const harness = await createHarness({ limits: { maxConcurrentRuns: 0 }, worker: () => mockReply({ text: 'ok' }) });
+  try {
+    const { Router } = await import('../../src/runtime/router.ts');
+    const { MockModel } = await import('../../src/model/mock.ts');
+    let call = 0;
+    const router = new Router(
+      harness.runtime,
+      new MockModel(() => {
+        call += 1;
+        if (call <= 3) {
+          return mockReply({
+            toolCalls: [
+              {
+                name: 'create_task',
+                arguments: { title: `任务${call}`, goal: 'g', owner_role: 'r', owner_brief: 'b' },
+              },
+            ],
+          });
+        }
+        return mockReply({ text: '全部完成' });
+      }),
+      { ...harness.config, limits: { ...harness.config.limits, maxRouterRounds: 1 } },
+    );
+    await router.handleUserMessage('依次建三个任务').catch(() => undefined);
+    assert.equal(harness.store.listTasks().length, 1, '第一轮只完成一个操作');
+    assert.ok(harness.store.pendingRouterSession(), '额度用完必须保留待续接会话');
+
+    await router.resume();
+    assert.equal(harness.store.listTasks().length, 2, '续接后应新建第二个任务，而不是复用第一个的结果');
+    assert.ok(harness.store.pendingRouterSession(), '再次用完额度仍然保持待续接');
+
+    await router.resume();
+    assert.equal(harness.store.listTasks().length, 3, '第三次续接新建第三个任务');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('Router 决策身份：同一个决策恢复时不重复执行', async () => {
+  const harness = await createHarness({ limits: { maxConcurrentRuns: 0 }, worker: () => mockReply({ text: 'ok' }) });
+  try {
+    // 模拟：决策已保存、操作已完成，恢复时应直接复用结果
+    harness.store.saveRouterSession({ id: 'rs_fixed', taskId: null, messages: [], reason: '进行中' });
+    harness.store.saveRouterDecision({
+      id: 'rd_fixed', sessionId: 'rs_fixed', turnNo: 0, text: null,
+      toolCalls: [{ id: 'call_1', name: 'create_task', arguments: '{"title":"唯一任务","goal":"g","owner_role":"r","owner_brief":"b"}' }],
+    });
+    harness.store.saveRouterAction({
+      id: 'ra_fixed', sessionId: 'rs_fixed', actionKey: 'rd_fixed:0', tool: 'create_task', result: '已完成',
+    });
+    const { Router } = await import('../../src/runtime/router.ts');
+    const { MockModel } = await import('../../src/model/mock.ts');
+    const router = new Router(harness.runtime, new MockModel(() => mockReply({ text: '好的' })), harness.config);
+    await router.resume().catch(() => undefined);
+    assert.equal(harness.store.listTasks().length, 0, '已完成的决策不能再次产生业务变更');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('Router 决策身份：新决策里同名同参数的操作照常执行', async () => {
+  const harness = await createHarness({ limits: { maxConcurrentRuns: 0 }, worker: () => mockReply({ text: 'ok' }) });
+  try {
+    const { Router } = await import('../../src/runtime/router.ts');
+    const { MockModel } = await import('../../src/model/mock.ts');
+    const same = '{"title":"同名任务","goal":"g","owner_role":"r","owner_brief":"b"}';
+    let call = 0;
+    const router = new Router(
+      harness.runtime,
+      new MockModel(() => {
+        call += 1;
+        // 每次用户消息只做一次操作，随后给结论，避免在额度内反复建任务
+        return call % 2 === 1
+          ? mockReply({ toolCalls: [{ name: 'create_task', arguments: same }] })
+          : mockReply({ text: '已创建' });
+      }),
+      harness.config,
+    );
+    await router.handleUserMessage('建一个任务').catch(() => undefined);
+    await router.handleUserMessage('再建一个一模一样的任务').catch(() => undefined);
+    assert.equal(harness.store.listTasks().length, 2, '参数相同的两次合法请求都应有结果');
+  } finally {
+    await harness.cleanup();
+  }
+});

@@ -1,6 +1,7 @@
 import type { Limits } from '../config.ts';
 import type { Task, Worker, WorkerNote, WorkerTurn } from '../domain/types.ts';
 import type { ChatMessage, ModelClient } from '../model/types.ts';
+import { RecordingModel } from '../model/recorder.ts';
 import type { Store } from '../storage/store.ts';
 import { groupTurns, estimateTurnChars, estimateTurnsChars, type HistoryPlan } from './context.ts';
 
@@ -208,7 +209,11 @@ export async function runNote(input: {
   const epochAtStart = task.reviewEpoch;
   let content: string;
   try {
-    const result = await model.chat({
+    // 工作记录整理同样是模型调用，必须和 Router/Worker 一样记账。
+    const result = await new RecordingModel(model, store, 'note', {
+      taskId: task.id,
+      workerId: worker.id,
+    }).chat({
       model: modelName,
       messages: buildNotePrompt({ task, worker, decision, limits }),
       tools: [],

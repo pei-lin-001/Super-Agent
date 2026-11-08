@@ -153,6 +153,17 @@ CREATE TABLE IF NOT EXISTS router_session (
 );
 CREATE INDEX IF NOT EXISTS idx_router_session_status ON router_session(status);
 
+CREATE TABLE IF NOT EXISTS router_decision (
+  id         TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  turn_no    INTEGER NOT NULL,
+  text       TEXT,
+  tool_calls TEXT NOT NULL,
+  status     TEXT NOT NULL DEFAULT 'pending',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_router_decision_session ON router_decision(session_id, status);
+
 CREATE TABLE IF NOT EXISTS router_action (
   id         TEXT PRIMARY KEY,
   session_id TEXT NOT NULL,

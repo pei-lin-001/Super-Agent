@@ -44,8 +44,20 @@ async function restartMain(): Promise<{ ok: boolean; message: string }> {
 
 // 维护者自己的作业服务：scope=watchdog，日志在 `.jobs/watchdog/`，
 // 与业务作业完全分开恢复，不会把主系统 running 作业标成 unknown。
-const wdJobs = new ProcessService({ store, logRoot: join(config.workDir, '.jobs', 'watchdog'), scope: 'watchdog' });
-wdJobs.recover();
+// 只有在真正取得维护执行资格之后才创建并恢复——查询类命令不应该碰它。
+let wdJobs: ProcessService | null = null;
+
+function ensureJobs(): ProcessService {
+  if (wdJobs) return wdJobs;
+  wdJobs = new ProcessService({ store, logRoot: join(config.workDir, '.jobs', 'watchdog'), scope: 'watchdog' });
+  wdJobs.recover();
+  return wdJobs;
+}
+
+function disposeJobs(): void {
+  disposeJobs();
+  wdJobs = null;
+}
 
 const session = new WatchdogSession({
   store,
@@ -56,7 +68,7 @@ const session = new WatchdogSession({
   health: () => mainHealth(config),
   processes: {
     start: (input) =>
-      wdJobs.start({
+      ensureJobs().start({
         taskId: 'watchdog',
         workerId: 'watchdog',
         command: input.command,
@@ -66,74 +78,76 @@ const session = new WatchdogSession({
         timeoutMs: input.timeoutMs,
         logRoot: join(config.workDir, '.jobs', 'watchdog'),
       }),
-    read: (id) => wdJobs.read(id, 'stdout', 0, 20_000),
+    read: (id) => ensureJobs().read(id, 'stdout', 0, 20_000),
     get: (id) => store.getJob(id),
-    stop: (id) => wdJobs.stop(id, '维护者停止'),
+    stop: (id) => ensureJobs().stop(id, '维护者停止'),
   },
 });
 
 mkdirSync(dirname(pidFile), { recursive: true });
 
 // 单实例：同一时间只允许一个有效维护者，避免重复巡检与恢复风暴。
+const LOCK_PATH = `${pidFile}.lock`;
+
+/**
+ * 取得唯一维护执行资格。
+ * 返回 'acquired'（本次持有）/ 'busy'（已有有效维护者）/ 'unknown'（探测失败，保守退出）。
+ */
+async function acquireLock(): Promise<'acquired' | 'busy' | 'unknown' | 'failed'> {
 // 原子抢占：同时启动时只有一个能拿到写句柄（O_EXCL），不依赖"先读再写"的顺序。
-const lockPath = `${pidFile}.lock`;
+const lockPath = LOCK_PATH;
 let acquired = false;
 for (let attempt = 0; attempt < 8 && !acquired; attempt += 1) {
-  try {
-    writeFileSync(lockPath, `${process.pid}\n`, { flag: 'wx' });
-    acquired = true;
-    break;
-  } catch {
-    // 锁已存在：判断持有者状态
-  }
-  let holder = 0;
-  try {
-    holder = Number(readFileSync(lockPath, 'utf8').trim());
-  } catch {
-    holder = 0;
-  }
-  if (!Number.isInteger(holder) || holder < 2) {
-    // 刚创建、内容还没写完：不能当成陈旧锁，稍等再看。
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    continue;
-  }
-  const alive = isPidAlive(holder);
-  const identity = alive ? identifyProcess(holder, 'watchdog') : 'mismatch';
-  if (identity === 'match') {
-    console.log(`已有 Watchdog 在运行（pid=${holder}），本次不启动`);
-    store.close();
-    process.exit(3);
-  }
-  if (identity === 'unknown') {
-    // 探测失败不等于对方已经退出：保守处理，不删锁、也不启动第二个。
-    console.log(`无法确认锁持有者 ${holder} 是否仍在运行，保守跳过本次启动`);
-    store.close();
-    process.exit(3);
-  }
-  try {
-    rmSync(lockPath, { force: true });
-  } catch {
-    // 清理陈旧锁失败时直接退出，避免两个实例同时写库。
-    console.log('无法清理陈旧锁，本次不启动');
-    store.close();
-    process.exit(3);
-  }
+try {
+  writeFileSync(lockPath, `${process.pid}\n`, { flag: 'wx' });
+  acquired = true;
+  break;
+} catch {
+  // 锁已存在：判断持有者状态
 }
-if (!acquired) {
-  console.log('未能取得单实例锁，本次不启动');
-  store.close();
-  process.exit(3);
+let holder = 0;
+try {
+  holder = Number(readFileSync(lockPath, 'utf8').trim());
+} catch {
+  holder = 0;
 }
+if (!Number.isInteger(holder) || holder < 2) {
+  // 刚创建、内容还没写完：不能当成陈旧锁，稍等再看。
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  continue;
+}
+const alive = isPidAlive(holder);
+const identity = alive ? identifyProcess(holder, 'watchdog') : 'mismatch';
+if (identity === 'match') return 'busy';
+if (identity === 'unknown') {
+  // 探测失败不等于对方已经退出：保守处理，不删锁、也不启动第二个。
+  return 'unknown';
+}
+try {
+  rmSync(lockPath, { force: true });
+} catch {
+  return 'failed';
+}
+}
+  return acquired ? 'acquired' : 'failed';
+}
+// 释放锁时核对所有者：只删自己写的那个，避免旧进程清掉新进程的锁。
+let holdingLock = false;
 const releaseLock = (): void => {
+  if (!holdingLock) return;
   try {
-    rmSync(lockPath, { force: true });
+    const holder = Number(readFileSync(LOCK_PATH, 'utf8').trim());
+    if (holder === process.pid) rmSync(LOCK_PATH, { force: true });
   } catch {
-    // 退出路径不阻塞。
+    // 锁已不存在或读不到：不强行删除。
   }
 };
 process.on('exit', releaseLock);
 
-writeFileSync(pidFile, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }, null, 2), 'utf8');
+function holdLock(): void {
+  holdingLock = true;
+  writeFileSync(pidFile, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }, null, 2), 'utf8');
+}
 
 // 维护者提问入口：写持久问题队列，由唯一的维护者串行处理。
 // 已有 Watchdog 在跑时，这里只当客户端，不会因为单实例约束被拒绝。
@@ -152,12 +166,15 @@ async function runQuestionWorker(): Promise<void> {
   }
 }
 
+// --answer：纯查询。不抢锁、不恢复作业、不启动模型会话。
 if (askIndex !== -1) {
   const question = process.argv[askIndex + 1] ?? '';
   if (question.trim() === '') {
     console.log('用法：pnpm watchdog --ask "为什么这个任务停住了？"');
+    store.close();
     process.exit(1);
   }
+  // 先入队：问题不会因为维护者忙碌或身份探测失败而丢失。
   store.insertWdQuestion(questionId, question);
   console.log(`已提交问题 ${questionId}`);
 
@@ -169,7 +186,7 @@ if (askIndex !== -1) {
       return null;
     }
   })();
-  // 注意：本进程可能已经写过 pid 文件，不能把自己当成"另一个维护者"。
+  // 本进程还没写过 pid 文件，不会把自己当成"另一个维护者"。
   const ownerAlive =
     existing !== null &&
     existing !== process.pid &&
@@ -179,7 +196,7 @@ if (askIndex !== -1) {
     looksLikeOurProcess(existing, 'watchdog');
 
   if (ownerAlive) {
-    // 已经有维护者在跑：等它处理，不启动第二个。
+    // 已经有维护者在跑：当客户端轮询，不抢执行资格。
     const deadline = Date.now() + 180_000;
     while (Date.now() < deadline) {
       const record = store.getWdQuestion(questionId);
@@ -191,37 +208,48 @@ if (askIndex !== -1) {
       }
       await new Promise((resolve) => setTimeout(resolve, 1500));
     }
-    console.log('问题仍在队列中（维护者尚未处理完），可用 --answer <问题ID> 稍后查询。');
+    console.log(`问题仍在队列中，可用 pnpm watchdog --answer ${questionId} 稍后查询。`);
     store.close();
     process.exit(5);
   }
 
-  // 没有维护者在跑：本次进程取得维护资格后处理问题。
+  // 没有维护者：先争取执行资格，拿到之后才初始化作业服务并处理问题。
+  const lock = await acquireLock();
+  if (lock !== 'acquired') {
+    console.log(
+      lock === 'unknown'
+        ? `无法确认现有维护者状态，问题 ${questionId} 已入队，请稍后用 --answer 查询`
+        : `维护执行资格被占用，问题 ${questionId} 已入队，请稍后用 --answer 查询`,
+    );
+    store.close();
+    process.exit(lock === 'unknown' ? 6 : 5);
+  }
+  holdLock();
+  ensureJobs();
   await runQuestionWorker();
   const record = store.getWdQuestion(questionId);
   if (record) {
     console.log('---');
     console.log(record.status === 'done' ? record.answer ?? '' : `处理失败：${record.error ?? '未知原因'}`);
   }
+  disposeJobs();
   store.close();
   process.exit(record?.status === 'done' ? 0 : 1);
 }
 
-const answerIndex = process.argv.indexOf('--answer');
-if (answerIndex !== -1) {
-  const id = process.argv[answerIndex + 1] ?? '';
-  const record = store.getWdQuestion(id);
-  if (!record) {
-    console.log(`找不到问题 ${id}`);
-    store.close();
-    process.exit(1);
-  }
-  console.log(`${record.status}｜${record.question}`);
-  if (record.answer) console.log(`回答：${record.answer}`);
-  if (record.error) console.log(`失败：${record.error}`);
+// 常驻模式：先取得唯一维护执行资格，再初始化自己的作业服务并恢复。
+const residentLock = await acquireLock();
+if (residentLock !== 'acquired') {
+  console.log(
+    residentLock === 'unknown'
+      ? '无法确认现有维护者状态，本次不启动（保守处理，不删锁）'
+      : '已有维护者在运行，本次不启动',
+  );
   store.close();
-  process.exit(0);
+  process.exit(3);
 }
+holdLock();
+ensureJobs();
 
 const log = (message: string): void => {
   console.log(`[${new Date().toISOString().slice(11, 19)}] ${message}`);
@@ -316,7 +344,7 @@ setInterval(() => {
 
 const shutdown = (): void => {
   log('Watchdog 退出');
-  wdJobs.dispose();
+  disposeJobs();
   store.close();
   process.exit(0);
 };

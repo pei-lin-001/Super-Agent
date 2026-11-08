@@ -178,16 +178,31 @@ export class Runtime implements ToolHost {
   }
 
   async stop(): Promise<void> {
+    // 1) 不再接受新调度
     this.stopped = true;
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
     }
-    // 停止后不再执行排队中的工作，否则等待队列永远清不空。
     this.queue.length = 0;
     this.rerunRequested.clear();
+    // 2) 取消在途模型请求：不取消的话，等 15 秒也只是等到数据库被关掉
+    for (const controller of this.aborts.values()) {
+      try {
+        controller.abort();
+      } catch {
+        // 已取消或已结束
+      }
+    }
+    // 3) 等在途执行收尾（取消后通常很快返回）
     await this.waitForIdle(15_000);
-    // 后台进程不随队列清空而结束，必须显式收掉，否则会继续改文件。
+    // 4) 兜底：仍然没退出说明提供方忽略了取消。再等一小段，
+    //    之后迟到的回调会因为 stopped 标记和 isClosed 检查而不再写库。
+    if (this.runningCount > 0) {
+      this.store.appendEvent(null, null, 'runtime.stop_slow', `${this.runningCount} 个执行在取消后仍未结束`);
+      await this.waitForIdle(5_000);
+    }
+    // 5) 作业：终态任务不能留下继续运行的进程
     this.jobs.dispose();
   }
 
@@ -1149,6 +1164,7 @@ export class Runtime implements ToolHost {
 
     // 本轮执行的代次：暂停、取消、恢复都会推进它，旧响应因此失去资格。
     const epoch = this.store.getWorker(workerId)?.runEpoch ?? 0;
+    const runController = this.aborts.get(workerId);
     const stale = (): boolean => {
       const current = this.store.getWorker(workerId);
       if (!current) return true;
@@ -1179,6 +1195,13 @@ export class Runtime implements ToolHost {
         for (const message of inbox) this.markConsumed(message.id);
       }
       const messages = await this.buildWorkerMessages(worker, task);
+      // 上下文准备是异步的：发请求前再核一次资格，避免准备期间被暂停或停机。
+      const beforeRequest = this.canRun(workerId, epoch);
+      if (!beforeRequest.ok) {
+        this.store.appendEvent(task.id, workerId, 'run.stale', `准备完成后停止：${beforeRequest.reason}`);
+        this.settleWorker(workerId, beforeRequest.reason);
+        return;
+      }
       const result = await new RecordingModel(this.workerModel, this.store, 'worker', {
         taskId: task.id,
         workerId,
@@ -1187,6 +1210,7 @@ export class Runtime implements ToolHost {
         messages,
         tools: this.tools.schemas(),
         reasoningEffort: this.config.reasoningEffort,
+        signal: runController?.signal ?? null,
       });
 
       const afterModel = this.canRun(workerId, epoch);

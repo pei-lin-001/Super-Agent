@@ -32,7 +32,10 @@ export class RecordingModel implements ModelClient {
   }
 
   async chat(request: ChatRequest): Promise<StepResult> {
-    if (this.store.isClosed) return this.inner.chat(request);
+    // 存储已关闭时不再发起新的业务模型调用：迟到的调度不应该继续消耗资源。
+    if (this.store.isClosed) {
+      throw new Error('存储已关闭，拒绝发起新的模型调用');
+    }
     const id = `mc_${randomBytes(6).toString('hex')}`;
     try {
       this.store.startModelCall({ id, purpose: this.purpose, model: request.model, ...this.scope });
@@ -42,7 +45,13 @@ export class RecordingModel implements ModelClient {
     }
     try {
       const result = await this.inner.chat(request);
-      this.safeFinish({ id, status: 'ok', usage: result.usage ?? null, error: null });
+      this.safeFinish({
+        id,
+        status: 'ok',
+        usage: result.usage ?? null,
+        httpAttempts: result.httpAttempts ?? null,
+        error: null,
+      });
       return result;
     } catch (error) {
       const message = (error as Error).message;
@@ -51,6 +60,7 @@ export class RecordingModel implements ModelClient {
         id,
         status: cancelled ? 'cancelled' : 'failed',
         usage: null,
+        httpAttempts: ((error as { httpAttempts?: number }).httpAttempts ?? null) as number | null,
         error: message,
       });
       throw error;
@@ -59,9 +69,14 @@ export class RecordingModel implements ModelClient {
 
   private safeFinish(input: Parameters<Store['finishModelCall']>[0]): void {
     try {
+      if (this.store.isClosed) {
+        console.warn(`[记账] 存储已关闭，调用 ${input.id} 的状态未能写入`);
+        return;
+      }
       this.store.finishModelCall(input);
-    } catch {
-      // 存储已关闭时不再写库。
+    } catch (error) {
+      // 记账失败要有可见诊断，不能静默吞掉。
+      console.warn(`[记账] 写入调用 ${input.id} 失败：${(error as Error).message}`);
     }
   }
 }

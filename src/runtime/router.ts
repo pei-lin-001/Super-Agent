@@ -88,7 +88,11 @@ export class Router {
   private readonly readOnly: boolean;
   private resumeMessages: ChatMessage[] | null = null;
   private resumeSessionId: string | null = null;
-  private lastRunFailed = false;
+  private lastOutcome: 'done' | 'suspended' | 'failed' = 'done';
+
+  private currentOutcome(): 'done' | 'suspended' | 'failed' {
+    return this.lastOutcome;
+  }
 
   constructor(runtime: Runtime, model: ModelClient, config: Config, options: { readOnly?: boolean } = {}) {
     this.runtime = runtime;
@@ -99,14 +103,21 @@ export class Router {
 
   handleUserMessage(content: string): Promise<void> {
     const run = this.chain.then(() => this.run(content));
-    // 内部串行链吞掉失败，避免一次故障让后续所有消息都直接失败；
-    // 调用方通过返回的 promise 得知这一轮到底有没有完成。
-    this.chain = run.catch(() => undefined);
-    return run.catch((error: unknown) => {
-      this.lastRunFailed = true;
-      this.publish({ type: 'router.notice', text: `Router 运行失败：${(error as Error).message}` });
-      throw error;
-    });
+    // 内部串行链吞掉失败，避免一次故障让后续所有消息都直接失败。
+    this.chain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run.then(
+      (outcome) => {
+        this.lastOutcome = outcome;
+      },
+      (error: unknown) => {
+        this.lastOutcome = 'failed';
+        this.publish({ type: 'router.notice', text: `Router 运行失败：${(error as Error).message}` });
+        throw error;
+      },
+    );
   }
 
   /** Worker 有结果/失败/提问时触发一次自动汇报；多次通知会合并。 */
@@ -117,11 +128,13 @@ export class Router {
       this.notifyScheduled = false;
       if (this.runtime.isStopped) return;
       if (this.runtime.store.listRouterInbox().length === 0) return;
-      this.chain = this.chain
-        .then(() => this.run(null))
-        .catch((error: unknown) =>
-          this.publish({ type: 'router.notice', text: `Router 自动汇报失败：${(error as Error).message}` }),
-        );
+      const next = this.chain.then(() => this.run(null));
+      this.chain = next.then(
+        () => undefined,
+        (error: unknown) => {
+          this.publish({ type: 'router.notice', text: `Router 自动汇报失败：${(error as Error).message}` });
+        },
+      );
     }, 0);
   }
 
@@ -129,10 +142,11 @@ export class Router {
     this.runtime.publish(event);
   }
 
-  private async run(userText: string | null): Promise<void> {
-    if (this.runtime.isStopped) return;
+  /** 返回这次协调的结果：完成 / 额度用完待续接 / 失败。只有完成才关闭会话。 */
+  private async run(userText: string | null): Promise<'done' | 'suspended'> {
+    if (this.runtime.isStopped) return 'done';
     const inbox = this.runtime.store.listRouterInbox();
-    if (userText === null && inbox.length === 0) return;
+    if (userText === null && inbox.length === 0) return 'done';
 
     const pending = inbox
       .map(
@@ -166,10 +180,62 @@ export class Router {
 
     this.publish({ type: 'router.start' });
 
-    // 调度轮数是本次运行的额度，不是失败条件：用完就保存进度，下次 tick 接着做。
+    // 一条协调会话贯穿多轮调度与重试。
     const sessionId = this.resumeSessionId ?? `rs_${randomBytes(4).toString('hex')}`;
+    // 会话在第一次模型请求前就落库：额度耗尽或失败时，续接入口始终存在。
+    this.runtime.store.saveRouterSession({
+      id: sessionId,
+      taskId: null,
+      messages: messages.filter((message) => message.role !== 'system'),
+      reason: '进行中',
+    });
     const maxRounds = Math.max(1, this.config.limits.maxRouterRounds);
+
+    const runOptions = (calls: unknown, results: Map<number, string>): string[] => {
+      const list = Array.isArray(calls) ? (calls as { id: string; name: string }[]) : [];
+      const outputs: string[] = [];
+      for (let index = 0; index < list.length; index += 1) {
+        const saved = results.get(index);
+        if (saved === undefined) return outputs;
+        messages.push({ role: 'tool', content: saved, toolCallId: list[index]!.id });
+        outputs.push(saved);
+      }
+      return outputs;
+    };
+    void runOptions;
+
     for (let step = 0; step < maxRounds; step += 1) {
+      // 先消费上次保存、但尚未执行完的那次决策：恢复时不会重放已完成的动作。
+      const pending = this.runtime.store.pendingRouterDecision(sessionId);
+      if (pending) {
+        const calls = (pending.toolCalls as { id: string; name: string; arguments: string }[]) ?? [];
+        messages.push({
+          role: 'assistant',
+          content: pending.text,
+          ...(calls.length > 0 ? { toolCalls: calls } : {}),
+        });
+        for (let index = 0; index < calls.length; index += 1) {
+          const call = calls[index]!;
+          const actionKey = `${pending.id}:${index}`;
+          const cached = this.runtime.store.getRouterAction(sessionId, actionKey);
+          if (cached) {
+            messages.push({ role: 'tool', content: cached.result, toolCallId: call.id });
+            continue;
+          }
+          const content = await this.executeTool(call.name, call.arguments);
+          this.runtime.store.saveRouterAction({
+            id: `ra_${randomBytes(4).toString('hex')}`,
+            sessionId,
+            actionKey,
+            tool: call.name,
+            result: content,
+          });
+          messages.push({ role: 'tool', content, toolCallId: call.id });
+        }
+        this.runtime.store.finishRouterDecision(pending.id);
+        continue;
+      }
+
       const result = await new RecordingModel(this.model, this.runtime.store, 'router', {
         sessionId,
       }).chat({
@@ -178,18 +244,14 @@ export class Router {
         tools: this.readOnly ? [] : ROUTER_TOOLS,
         reasoningEffort: this.config.reasoningEffort,
       });
-      messages.push({
-        role: 'assistant',
-        content: result.text,
-        ...(result.toolCalls.length > 0 ? { toolCalls: result.toolCalls } : {}),
-      });
 
       if (result.toolCalls.length === 0) {
         const answer = result.text?.trim() ?? '';
         if (answer === '') {
           this.publish({ type: 'router.notice', text: 'Router 没有输出内容，已忽略本轮。' });
-          return;
+          return 'done';
         }
+        messages.push({ role: 'assistant', content: answer });
         this.runtime.store.appendRouterTurn({
           id: `rt_${randomBytes(4).toString('hex')}_a`,
           role: 'assistant',
@@ -198,14 +260,26 @@ export class Router {
         });
         this.publish({ type: 'router.reply', text: answer });
         for (const message of inbox) this.consume(message.id);
-        return;
+        return 'done';
       }
 
+      // 决策先落库，工具调用身份从这条记录派生，不依赖每轮从 0 开始的循环位置。
+      const decisionId = `rd_${randomBytes(4).toString('hex')}`;
+      this.runtime.store.saveRouterDecision({
+        id: decisionId,
+        sessionId,
+        turnNo: step,
+        text: result.text,
+        toolCalls: result.toolCalls,
+      });
+      messages.push({
+        role: 'assistant',
+        content: result.text,
+        ...(result.toolCalls.length > 0 ? { toolCalls: result.toolCalls } : {}),
+      });
       for (let index = 0; index < result.toolCalls.length; index += 1) {
         const call = result.toolCalls[index]!;
-        // 内部动作使用稳定标识：同一会话里同一个调用恢复后返回原结果，
-        // 不会因为重试而重复建任务、重复追加要求。
-        const actionKey = `${step}:${index}:${call.name}`;
+        const actionKey = `${decisionId}:${index}`;
         const cached = this.runtime.store.getRouterAction(sessionId, actionKey);
         if (cached) {
           messages.push({ role: 'tool', content: cached.result, toolCallId: call.id });
@@ -221,6 +295,7 @@ export class Router {
         });
         messages.push({ role: 'tool', content, toolCallId: call.id });
       }
+      this.runtime.store.finishRouterDecision(decisionId);
     }
 
     // 保存未完成的协调过程，下一轮继续；不依赖新的用户消息，也不重复已完成动作。
@@ -232,7 +307,7 @@ export class Router {
     });
     this.runtime.store.appendEvent(null, null, 'router.suspended', `达到单轮调度额度 ${maxRounds}，已保存进度`);
     this.publish({ type: 'router.notice', text: `Router 达到单轮调度额度 ${maxRounds}，已保存进度，稍后继续。` });
-
+    return 'suspended';
   }
 
   /** 是否存在待续接的协调过程：以持久化状态为准，重启后依然成立。 */
@@ -250,10 +325,21 @@ export class Router {
     const localSession = this.resumeSessionId;
     this.resumeMessages = restored;
     this.resumeSessionId = session.id;
-    this.lastRunFailed = false;
+    this.lastOutcome = 'done';
     try {
       await this.handleUserMessage('（继续上次未完成的协调工作，不要重复已经完成的操作）');
-      if (this.lastRunFailed) throw new Error('这一轮协调没有完成');
+      const outcome = this.currentOutcome();
+      if (outcome === 'failed') throw new Error('这一轮协调没有完成');
+      if (outcome === 'suspended') {
+        // 额度再次用完：会话必须继续保持待续接，不能在这里关掉。
+        this.runtime.store.saveRouterSession({
+          id: session.id,
+          taskId: null,
+          messages: restored,
+          reason: '额度用尽，等待续接',
+        });
+        return;
+      }
       // 只有这一轮真的跑完才关闭会话；失败时保留，下一轮还能恢复。
       this.runtime.store.closeRouterSession(session.id, 'done');
     } catch (error) {

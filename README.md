@@ -434,6 +434,16 @@ rollback_override key=worker.check_rules version=1
 - 拉起有 120 秒冷却和 `work/.runtime/restart.json` 记录；启动失败保留 `work/.runtime/main.log`。
 - 停机标记在**动作执行前**重新检查，维护者明确停机时不会被自动拉起。
 
+### 协调会话的三种结果
+
+`run()` 返回 `done` / `suspended` / 失败：
+
+- `done`：协调工作真的完成，才关闭会话；
+- `suspended`：本轮额度用完，保存进度并保持待续接——`resume()` 不会把它关掉；
+- 失败：保留进度，按错误性质决定重试或上报。
+
+工具调用的身份来自**已保存的决策记录**（`router_decision.id + 调用位置`），不来自每轮从 0 开始的循环位置。参数摘要不参与去重：两次参数完全相同的请求可以是两个合法操作。
+
 ### 调用统计
 
 `model_call` 表按**每次 chat 调用**记账，不用对话条数反推：
@@ -512,7 +522,7 @@ REPL 命令：
 
 ```bash
 pnpm typecheck                              # 类型检查
-pnpm test                                   # 89 个测试
+pnpm test                                   # 92 个测试
 node scripts/accept-crash.ts                # 崩溃恢复验收（真实杀进程 + 本地受控模型），全部使用临时目录与模拟模型
 pnpm smoke:mini                             # 真实模型最小链路
 pnpm smoke:real                             # 真实模型综合协作场景
