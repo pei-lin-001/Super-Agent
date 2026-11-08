@@ -17,12 +17,23 @@ import {
   nowIso,
 } from '../domain/ids.ts';
 import { isTerminalTask, isTerminalWorker } from '../domain/state.ts';
-import type { Artifact, Message, MessageKind, MessageRefs, RuntimeEvent, Task, Worker } from '../domain/types.ts';
+import type {
+  Artifact,
+  Message,
+  MessageKind,
+  MessageRefs,
+  RuntimeEvent,
+  Task,
+  Worker,
+  WorkerNote,
+  WorkerTurn,
+} from '../domain/types.ts';
 import { ModelError } from '../model/types.ts';
 import type { ChatMessage, ModelClient, StepResult, ToolCall } from '../model/types.ts';
 import { artifactTools } from '../tools/artifacts.ts';
 import { collabTools } from '../tools/collab.ts';
 import { fileTools } from '../tools/files.ts';
+import { historyTools } from '../tools/history.ts';
 import { ToolRegistry } from '../tools/registry.ts';
 import type {
   CreateCollaboratorResult,
@@ -36,6 +47,15 @@ import type {
   WaitResult,
 } from '../tools/types.ts';
 import { workerSystemPrompt } from './prompts.ts';
+import {
+  collectArtifactLines,
+  estimateTurnsChars,
+  planHistory,
+  renderArtifactTable,
+  renderTaskFacts,
+  type HistoryPlan,
+} from './context.ts';
+import { buildNotePrompt, decideNote, runNote, type NoteDecision } from './note.ts';
 import type { Store } from '../storage/store.ts';
 
 export interface CreateTaskInput {
@@ -77,7 +97,7 @@ export class Runtime implements ToolHost {
     this.config = options.config;
     this.workerModel = options.workerModel;
     this.defaultWaitTimeoutMs = options.config.limits.waitTimeoutMs;
-    this.tools = new ToolRegistry('worker', [...fileTools, ...artifactTools, ...collabTools]);
+    this.tools = new ToolRegistry('worker', [...fileTools, ...artifactTools, ...collabTools, ...historyTools]);
   }
 
   // ---------------- 事件 ----------------
@@ -514,12 +534,18 @@ export class Runtime implements ToolHost {
    * 每个版本写独立路径，旧版本内容不再被覆盖；
    * 文件写成功但登记失败时删掉文件，不留下"看起来成功"的状态。
    */
-  saveArtifact(worker: Worker, name: string, content: string): Artifact {
+  saveArtifact(worker: Worker, name: string, content: string): { artifact: Artifact; reused: boolean } {
     const task = this.store.getTaskByGroup(worker.groupId);
     if (!task) throw new Error('任务不存在');
     if (isTerminalTask(task.status)) throw new Error(`任务已处于 ${task.status}，不能再保存产物`);
     const safeName = normalizeRelativePath(name, '产物文件名');
     const latest = this.store.latestArtifactByName(task.id, safeName);
+    // 内容与最新版本完全相同时复用，不制造无意义的新版本；这不会改变检查状态。
+    const digest = createHash('sha256').update(Buffer.from(content, 'utf8')).digest('hex');
+    if (latest && latest.sha256 === digest) {
+      this.store.appendEvent(task.id, worker.id, 'artifact.reused', `${safeName} v${latest.version}`);
+      return { artifact: latest, reused: true };
+    }
     const version = (latest?.version ?? 0) + 1;
     const relativePath = `${task.id}/artifacts/v${version}/${safeName}`;
     const absolutePath = resolveInside(this.config.workDir, relativePath);
@@ -551,7 +577,7 @@ export class Runtime implements ToolHost {
       throw error;
     }
     this.store.appendEvent(task.id, worker.id, 'artifact.saved', `${safeName} v${version}`);
-    return artifact;
+    return { artifact, reused: false };
   }
 
   getArtifact(id: string): Artifact | null {
@@ -916,7 +942,7 @@ export class Runtime implements ToolHost {
         this.recordInboxTurn(workerId, inbox);
         for (const message of inbox) this.markConsumed(message.id);
       }
-      const messages = this.buildWorkerMessages(worker, task);
+      const messages = await this.buildWorkerMessages(worker, task);
       const result = await this.workerModel.chat({
         model: worker.model ?? this.config.workerModel,
         messages,
@@ -992,20 +1018,78 @@ export class Runtime implements ToolHost {
     }
   }
 
-  private buildWorkerMessages(worker: Worker, task: Task): ChatMessage[] {
+  private planFor(worker: Worker): HistoryPlan {
+    return planHistory({
+      store: this.store,
+      workerId: worker.id,
+      windowChars: this.config.limits.contextWindowChars,
+      overshootChars: this.config.limits.pairingOvershootChars,
+    });
+  }
+
+  private latestUpdateFor(task: Task): string | null {
+    const updates = this.store
+      .listGroupMessages(task.groupId, 200)
+      .filter((message) => message.kind === 'update')
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+    return updates.at(-1)?.body ?? null;
+  }
+
+  /** 触发条件由 note.decideNote 判定；失败只记录，不影响本轮执行。 */
+  private async maybeRefreshNote(worker: Worker, task: Task): Promise<void> {
+    const decision: NoteDecision = decideNote({
+      store: this.store,
+      worker,
+      task,
+      history: this.planFor(worker),
+      limits: this.config.limits,
+    });
+    if (decision.action === 'none') return;
+    const result = await runNote({
+      model: this.workerModel,
+      modelName: worker.model ?? this.config.workerModel,
+      store: this.store,
+      worker,
+      task,
+      decision,
+      limits: this.config.limits,
+    });
+    if (result.ok) {
+      this.store.appendEvent(task.id, worker.id, 'note.saved', `覆盖到 turn#${decision.toSeq}`);
+    } else {
+      this.store.appendEvent(task.id, worker.id, 'note.failed', result.reason ?? '未知原因');
+      this.emit({ type: 'error', text: `工作记录整理失败（已保留原始历史）：${result.reason ?? '未知原因'}` });
+    }
+  }
+
+  private async buildWorkerMessages(worker: Worker, task: Task): Promise<ChatMessage[]> {
+    await this.maybeRefreshNote(worker, task);
+
+    const plan = this.planFor(worker);
     const collaborators = this.store.listGroupWorkers(task.groupId).map((item) => ({
       id: item.id,
       role: item.role,
       status: item.status,
       parentId: item.parentId,
     }));
+    const isOwner = task.ownerWorkerId === worker.id;
+    const artifacts = this.store.listArtifacts(task.id);
+    const reviews = this.store.listReviews(task.id);
+    const note = this.store.latestSuccessfulNote(worker.id);
+
     const system = workerSystemPrompt({
       task,
       worker,
       collaborators,
-      isOwner: task.ownerWorkerId === worker.id,
+      isOwner,
+      taskFacts: renderTaskFacts({ task, isOwner, latestUpdate: this.latestUpdateFor(task) }),
+      artifactTable: renderArtifactTable({ task, lines: collectArtifactLines(task, artifacts, reviews) }),
+      noteText: note && note.epoch === task.reviewEpoch ? note.content : null,
+      noteStaleEpoch: note && note.epoch !== task.reviewEpoch ? note.epoch : null,
+      noteCoveredSeq: note?.coveredSeq ?? 0,
+      windowSummary: `近期窗口含 ${plan.turns.length} 条，历史共 ${plan.totalTurns} 条（约 ${plan.totalChars} 字符）`,
     });
-    const history = this.buildHistory(worker);
+    const history = this.buildHistory(worker, plan);
     return [{ role: 'system', content: system }, ...history];
   }
 
@@ -1013,20 +1097,10 @@ export class Runtime implements ToolHost {
    * 取最近若干轮，但保证「工具调用」与「工具结果」成对出现：
    * 窗口起点落在 tool 上时向前扩展，缺结果的调用补一条明确的未执行记录。
    */
-  private buildHistory(worker: Worker): ChatMessage[] {
-    const WINDOW = 16;
+  private buildHistory(worker: Worker, plan: HistoryPlan): ChatMessage[] {
     const TOOL_LIMIT = 8000;
-    let turns = this.store.listWorkerTurns(worker.id, WINDOW);
-    let guard = 0;
-    while (turns.length > 0 && turns[0]!.role === 'tool' && guard < 8) {
-      const before = this.store.listWorkerTurnsBefore(worker.id, turns[0]!.seq, 8);
-      if (before.length === 0) {
-        turns = turns.slice(1);
-        continue;
-      }
-      turns = [...before, ...turns];
-      guard += 1;
-    }
+    const turns = plan.turns;
+    void worker;
 
     const toToolMessage = (turn: (typeof turns)[number]): ChatMessage => {
       const content = turn.content ?? '';
@@ -1055,7 +1129,9 @@ export class Runtime implements ToolHost {
           if (!seen.has(call.id)) {
             messages.push({
               role: 'tool',
-              content: `[未执行] ${call.name}：历史记录中缺少对应结果`,
+              content:
+                `[执行结果未知] ${call.name}：历史只记录了这次调用，没有记录结果（可能是进程中断）。` +
+                '不要当成未执行，也不要自动重做；先核对当前文件与消息再决定。',
               toolCallId: call.id,
             });
           }
@@ -1128,6 +1204,29 @@ export class Runtime implements ToolHost {
     }
     lines.push('</inbox>');
     return lines.join('\n');
+  }
+
+  searchWorkerTurns(
+    workerId: string,
+    options: { fromSeq: number; toSeq: number; role: string | null; limit: number },
+  ): WorkerTurn[] {
+    return this.store.searchWorkerTurns(workerId, options);
+  }
+
+  listWorkerTurnsRange(workerId: string, fromSeq: number, toSeq: number): WorkerTurn[] {
+    return this.store.listWorkerTurnsRange(workerId, fromSeq, toSeq);
+  }
+
+  getMessageForWorker(workerId: string, messageId: string): Message | null {
+    const message = this.store.getMessage(messageId);
+    if (!message) return null;
+    // 只能读自己收发的消息，避免跨 Worker 窥探过程细节。
+    if (message.fromId !== workerId && message.toId !== workerId) return null;
+    return message;
+  }
+
+  listWorkerNotes(workerId: string): WorkerNote[] {
+    return this.store.listWorkerNotes(workerId, 5);
   }
 
   private toolContext(workerId: string): ToolContext {
