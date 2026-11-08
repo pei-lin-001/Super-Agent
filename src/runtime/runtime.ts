@@ -1,14 +1,16 @@
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
+import { assertInsideRoot, normalizeRelativePath, resolveInside } from '../tools/paths.ts';
 
 import type { Config } from '../config.ts';
 import {
   isoAfter,
   newArtifactId,
   newMessageId,
+  newReviewId,
   newTaskId,
   newWaitId,
   newWorkerId,
@@ -62,6 +64,8 @@ export class Runtime implements ToolHost {
   private readonly tools: ToolRegistry;
   private readonly queue: string[] = [];
   private readonly running = new Set<string>();
+  /** 本轮执行期间收到的调度请求，等本轮结束后各跑一次。 */
+  private readonly rerunRequested = new Set<string>();
   private runningCount = 0;
   private workerSequence = 0;
   private stopped = false;
@@ -108,6 +112,9 @@ export class Runtime implements ToolHost {
       clearInterval(this.timer);
       this.timer = null;
     }
+    // 停止后不再执行排队中的工作，否则等待队列永远清不空。
+    this.queue.length = 0;
+    this.rerunRequested.clear();
     await this.waitForIdle(15_000);
   }
 
@@ -125,6 +132,7 @@ export class Runtime implements ToolHost {
       brief: input.brief ?? '',
       doneCriteria: input.doneCriteria ?? '',
       requireReview: input.requireReview ?? false,
+      reviewEpoch: 0,
       ownerWorkerId: null,
       status: 'active',
       closeReason: null,
@@ -159,14 +167,16 @@ export class Runtime implements ToolHost {
     brief: string;
     model: string | null;
   }): Worker {
-    const existing = this.store.listGroupWorkers(input.groupId);
-    if (existing.length >= this.config.limits.maxWorkersPerGroup) {
-      throw new Error(`群组 Worker 数量已达上限 ${this.config.limits.maxWorkersPerGroup}`);
+    // 组内按「累计创建」计预算，防止一个任务无限拉人；全局按「当前活跃」计资源。
+    const createdInGroup = this.store.countWorkersInGroup(input.groupId);
+    if (createdInGroup >= this.config.limits.maxWorkersPerGroup) {
+      throw new Error(`本任务已累计创建 ${createdInGroup} 个 Worker，达到上限 ${this.config.limits.maxWorkersPerGroup}`);
     }
-    if (this.store.countWorkers() >= this.config.limits.maxTotalWorkers) {
-      throw new Error(`全局 Worker 数量已达上限 ${this.config.limits.maxTotalWorkers}`);
+    const active = this.store.countActiveWorkers();
+    if (active >= this.config.limits.maxTotalWorkers) {
+      throw new Error(`当前活跃 Worker 已达上限 ${this.config.limits.maxTotalWorkers}，请等待现有任务结束`);
     }
-    this.workerSequence = Math.max(this.workerSequence, existing.length) + 1;
+    this.workerSequence = Math.max(this.workerSequence, createdInGroup) + 1;
     const now = nowIso();
     const worker: Worker = {
       id: newWorkerId(this.workerSequence),
@@ -174,7 +184,7 @@ export class Runtime implements ToolHost {
       parentId: input.parentId,
       role: input.role,
       brief: input.brief,
-      status: 'idle',
+      status: 'queued',
       model: input.model,
       stepCount: 0,
       createdAt: now,
@@ -210,14 +220,33 @@ export class Runtime implements ToolHost {
 
   // ---------------- 消息 ----------------
 
+  /**
+   * 三件事在一处保证：
+   * 1) 广播按接收者各投一条，消费状态天然隔离；
+   * 2) 只有 intent=review 的请求才产生检查记录；
+   * 3) 回复正式检查必须给出结构化结论，否则请求保持 pending。
+   */
   sendMessage(input: SendMessageInput): SendMessageResult {
     const from = this.store.getWorker(input.from.id);
     if (!from) return { ok: false, reason: '发送者不存在' };
     const task = this.store.getTaskByGroup(from.groupId);
     if (!task) return { ok: false, reason: '任务不存在' };
+    if (isTerminalTask(task.status)) return { ok: false, reason: `任务已处于 ${task.status}，不能再发消息` };
+
+    const intent = typeof input.intent === 'string' ? input.intent : null;
+    const outcome = input.outcome ?? null;
 
     if ((input.kind === 'update' || input.kind === 'stop') && task.ownerWorkerId !== from.id) {
       return { ok: false, reason: '只有任务负责人可以发送 update / stop' };
+    }
+    if (outcome !== null && input.kind !== 'reply') {
+      return { ok: false, reason: 'outcome 只能出现在 reply 上' };
+    }
+    if (intent === 'review' && input.kind !== 'request') {
+      return { ok: false, reason: 'intent=review 只能用于 request' };
+    }
+    if (outcome !== null && !['approved', 'changes_required', 'inconclusive'].includes(outcome)) {
+      return { ok: false, reason: `未知的检查结论：${outcome}` };
     }
 
     if (input.kind === 'request') {
@@ -227,97 +256,155 @@ export class Runtime implements ToolHost {
       }
     }
 
+    let origin: Message | null = null;
+    if (input.kind === 'reply') {
+      if (!input.replyTo) return { ok: false, reason: 'reply 必须带 reply_to' };
+      origin = this.store.getMessage(input.replyTo);
+      if (!origin) return { ok: false, reason: `被回复的消息不存在：${input.replyTo}` };
+      if (origin.groupId !== from.groupId) return { ok: false, reason: '不能跨群组回复' };
+      if (origin.kind !== 'request') return { ok: false, reason: `只能回复 request，不能回复 ${origin.kind}` };
+      if (origin.toKind === 'worker' && origin.toId !== from.id) {
+        return { ok: false, reason: '只能回复发给自己的请求' };
+      }
+      if (origin.fromId === from.id) return { ok: false, reason: '不能回复自己发出的请求' };
+      const existing = this.store
+        .listGroupMessages(from.groupId, 500)
+        .some((message) => message.replyTo === origin!.id && message.kind === 'reply');
+      if (existing) return { ok: false, reason: '该请求已经有回复，请作为新请求继续讨论' };
+      const reviews = this.store.listReviewsByRequest(origin.id);
+      if (reviews.length > 0 && (outcome === null || outcome === 'pending')) {
+        return {
+          ok: false,
+          reason: '这是正式检查请求，回复必须给出 outcome：approved / changes_required / inconclusive',
+        };
+      }
+    }
+
     const broadcast = input.to === 'group' || input.to === from.groupId;
-    let toKind: Message['toKind'];
-    let toId: string;
+    let recipients: Worker[];
     if (broadcast) {
       if (task.ownerWorkerId !== from.id) return { ok: false, reason: '只有任务负责人可以向全组广播' };
-      toKind = 'group';
-      toId = from.groupId;
+      if (intent === 'review') return { ok: false, reason: '检查请求必须指定具体的检查者，不能广播' };
+      recipients = this.store
+        .listGroupWorkers(from.groupId)
+        .filter((worker) => worker.id !== from.id && !isTerminalWorker(worker.status));
+      if (recipients.length === 0) return { ok: false, reason: '群组内没有其他可接收的 Worker' };
     } else {
       const target = this.store.getWorker(input.to);
       if (!target) return { ok: false, reason: `接收者不存在：${input.to}` };
       if (target.id === from.id) return { ok: false, reason: '不能给自己发消息' };
       if (target.groupId !== from.groupId) return { ok: false, reason: '跨群组消息需要先由 Router 建立关联' };
       if (isTerminalWorker(target.status)) return { ok: false, reason: `接收者 ${target.id} 已处于 ${target.status}` };
-      toKind = 'worker';
-      toId = target.id;
+      recipients = [target];
     }
 
-    if (input.kind === 'reply') {
-      if (!input.replyTo) return { ok: false, reason: 'reply 必须带 reply_to' };
-      const origin = this.store.getMessage(input.replyTo);
-      if (!origin) return { ok: false, reason: `被回复的消息不存在：${input.replyTo}` };
-      if (origin.toKind === 'worker' && origin.toId !== from.id) {
-        return { ok: false, reason: '只能回复发给自己的请求' };
+    const baseDedupe = input.dedupeKey ?? null;
+    const broadcastId = broadcast ? newMessageId() : null;
+    const createdIds: string[] = [];
+    let firstMessageId: string | null = null;
+
+    for (const recipient of recipients) {
+      const dedupeKey = baseDedupe ? (broadcast ? `${baseDedupe}#${recipient.id}` : baseDedupe) : null;
+      if (dedupeKey) {
+        const existing = this.store.findMessageByDedupeKey(from.groupId, dedupeKey);
+        if (existing) {
+          createdIds.push(existing.id);
+          firstMessageId ??= existing.id;
+          continue;
+        }
       }
-      if (origin.groupId !== from.groupId) return { ok: false, reason: '不能跨群组回复' };
-      if (origin.kind !== 'request') return { ok: false, reason: `只能回复 request，不能回复 ${origin.kind}` };
-      const existing = this.store
-        .listGroupMessages(from.groupId, 500)
-        .some((message) => message.replyTo === origin.id && message.kind === 'reply');
-      if (existing) return { ok: false, reason: '该请求已经有回复，请作为新请求继续讨论' };
+      const message = this.buildMessage({
+        from,
+        task,
+        toId: recipient.id,
+        kind: input.kind,
+        body: input.body,
+        intent,
+        outcome,
+        replyTo: input.replyTo ?? null,
+        refs: input.refs ?? null,
+        dedupeKey,
+        broadcastId,
+      });
+      this.store.tx(() => {
+        this.store.insertMessage(message);
+        this.store.setMessageStatus(message.id, 'delivered');
+        if (intent === 'review' && message.refs?.artifacts?.length) {
+          const reviews = message.refs.artifacts.map((ref) => {
+            const artifact = this.store.getArtifact(ref.artifactId);
+            if (!artifact) throw new Error(`产物未登记：${ref.artifactId}`);
+            return {
+              id: newReviewId(),
+              taskId: task.id,
+              artifactId: artifact.id,
+              artifactVersion: artifact.version,
+              artifactSha256: artifact.sha256,
+              epoch: task.reviewEpoch,
+              requestedBy: from.id,
+              reviewerId: recipient.id,
+              requestMessageId: message.id,
+              replyMessageId: null,
+              outcome: 'pending' as const,
+              createdAt: nowIso(),
+            };
+          });
+          this.store.createReviews(reviews);
+        }
+      });
+      createdIds.push(message.id);
+      firstMessageId ??= message.id;
+      this.store.appendEvent(task.id, from.id, `message.${input.kind}`, `${from.id} → ${recipient.id}`);
+      this.emit({ type: 'message.sent', messageId: message.id, from: from.id, to: recipient.id, kind: input.kind });
+      this.onMessageDelivered(message);
     }
 
-    const dedupeKey = input.dedupeKey ?? null;
-    if (dedupeKey) {
-      const existing = this.store.findMessageByDedupeKey(from.groupId, dedupeKey);
-      if (existing) {
-        return { ok: true, messageId: existing.id, reason: 'dedupe' };
-      }
+    if (input.kind === 'reply' && origin && outcome) {
+      this.store.answerReview(origin.id, firstMessageId!, from.id, outcome);
     }
-    const now = nowIso();
-    const message: Message = {
+    if (!broadcast && (input.kind === 'update' || input.kind === 'stop')) {
+      this.store.appendEvent(task.id, from.id, `message.${input.kind}.direct`, input.body.slice(0, 120));
+    }
+
+    return { ok: true, messageId: firstMessageId ?? undefined, messageIds: createdIds };
+  }
+
+  private buildMessage(input: {
+    from: Worker;
+    task: Task;
+    toId: string;
+    kind: MessageKind;
+    body: string;
+    intent: string | null;
+    outcome: string | null;
+    replyTo: string | null;
+    refs: MessageRefs | null;
+    dedupeKey: string | null;
+    broadcastId: string | null;
+  }): Message {
+    const payload: Record<string, unknown> = {};
+    if (input.intent) payload['intent'] = input.intent;
+    if (input.outcome) payload['outcome'] = input.outcome;
+    return {
       id: newMessageId(),
-      groupId: from.groupId,
-      taskId: task.id,
+      groupId: input.from.groupId,
+      taskId: input.task.id,
       fromKind: 'worker',
-      fromId: from.id,
-      toKind,
-      toId,
+      fromId: input.from.id,
+      toKind: 'worker',
+      toId: input.toId,
       kind: input.kind,
       body: input.body,
-      payload: input.intent ? { intent: input.intent } : null,
-      replyTo: input.replyTo ?? null,
-      refs: this.normalizeRefs(input.refs ?? null, task.id),
-      dedupeKey: input.dedupeKey ?? null,
+      payload: Object.keys(payload).length > 0 ? payload : null,
+      replyTo: input.replyTo,
+      refs: this.normalizeRefs(input.refs, input.task.id),
+      dedupeKey: input.dedupeKey,
+      broadcastId: input.broadcastId,
       status: 'queued',
-      createdAt: now,
+      createdAt: nowIso(),
       deliveredAt: null,
       consumedAt: null,
       error: null,
     };
-    this.store.insertMessage(message);
-    this.store.setMessageStatus(message.id, 'delivered');
-    this.store.appendEvent(task.id, from.id, `message.${input.kind}`, `${from.id} → ${toId}`);
-
-    if (input.kind === 'reply' && message.replyTo) {
-      const origin = this.store.getMessage(message.replyTo);
-      if (origin?.kind === 'request') this.store.answerReview(origin.id, message.id);
-    }
-    if (input.kind === 'request') {
-      const refs = message.refs?.artifacts ?? [];
-      for (const ref of refs) {
-        const artifact = this.store.getArtifact(ref.artifactId);
-        if (!artifact) continue;
-        this.store.createReview({
-          id: `rev_${message.id.slice(4, 12)}`,
-          taskId: task.id,
-          artifactId: artifact.id,
-          artifactVersion: artifact.version,
-          requestedBy: from.id,
-          reviewerId: toKind === 'worker' ? toId : null,
-          requestMessageId: message.id,
-          replyMessageId: null,
-          status: 'pending',
-          createdAt: now,
-        });
-      }
-    }
-
-    this.emit({ type: 'message.sent', messageId: message.id, from: from.id, to: toId, kind: input.kind });
-    this.onMessageDelivered(message);
-    return { ok: true, messageId: message.id };
   }
 
   private normalizeRefs(refs: MessageRefs | null, taskId: string): MessageRefs | null {
@@ -410,6 +497,7 @@ export class Runtime implements ToolHost {
       id: waitId,
       workerId: worker.id,
       groupId: worker.groupId,
+      reason: options.reason ?? 'reply',
       matchFrom: options.from ?? null,
       matchReplyTo: options.replyTo ?? null,
       matchKinds: options.kinds ?? null,
@@ -422,31 +510,76 @@ export class Runtime implements ToolHost {
 
   // ---------------- 产物 ----------------
 
+  /**
+   * 每个版本写独立路径，旧版本内容不再被覆盖；
+   * 文件写成功但登记失败时删掉文件，不留下"看起来成功"的状态。
+   */
   saveArtifact(worker: Worker, name: string, content: string): Artifact {
     const task = this.store.getTaskByGroup(worker.groupId);
     if (!task) throw new Error('任务不存在');
-    const latest = this.store.latestArtifactByName(task.id, name);
+    if (isTerminalTask(task.status)) throw new Error(`任务已处于 ${task.status}，不能再保存产物`);
+    const safeName = normalizeRelativePath(name, '产物文件名');
+    const latest = this.store.latestArtifactByName(task.id, safeName);
     const version = (latest?.version ?? 0) + 1;
-    const relativePath = `${task.id}/artifacts/${name}`;
-    const absolutePath = resolve(this.config.workDir, relativePath);
+    const relativePath = `${task.id}/artifacts/v${version}/${safeName}`;
+    const absolutePath = resolveInside(this.config.workDir, relativePath);
+    const root = resolve(this.config.workDir, task.id);
     mkdirSync(dirname(absolutePath), { recursive: true });
-    // 同步写入，避免同一 Worker 的多次工具调用交错。
+    assertInsideRoot(root, dirname(absolutePath));
+
     const bytes = Buffer.from(content, 'utf8');
     writeFileSyncSafe(absolutePath, bytes);
     const artifact: Artifact = {
       id: newArtifactId(),
       taskId: task.id,
       workerId: worker.id,
-      name,
+      name: safeName,
       path: relativePath,
       version,
       sha256: createHash('sha256').update(bytes).digest('hex'),
       bytes: bytes.byteLength,
       createdAt: nowIso(),
     };
-    this.store.insertArtifact(artifact);
-    this.store.appendEvent(task.id, worker.id, 'artifact.saved', `${name} v${version}`);
+    try {
+      this.store.insertArtifact(artifact);
+    } catch (error) {
+      try {
+        rmSync(absolutePath, { force: true });
+      } catch {
+        // 清理失败不覆盖原始错误
+      }
+      throw error;
+    }
+    this.store.appendEvent(task.id, worker.id, 'artifact.saved', `${safeName} v${version}`);
     return artifact;
+  }
+
+  getArtifact(id: string): Artifact | null {
+    return this.store.getArtifact(id);
+  }
+
+  /** 按版本读取产物内容，并校验登记时的指纹，防止文件被绕过改写。 */
+  async readArtifactVersion(
+    taskId: string,
+    name: string,
+    version?: number | null,
+  ): Promise<{ artifact: Artifact; content: string }> {
+    const safeName = normalizeRelativePath(name, '产物文件名');
+    const artifact =
+      version === null || version === undefined
+        ? this.store.latestArtifactByName(taskId, safeName)
+        : this.store.getArtifactVersion(taskId, safeName, version);
+    if (!artifact) {
+      throw new Error(version === null || version === undefined ? `产物不存在：${safeName}` : `产物不存在：${safeName} v${version}`);
+    }
+    const absolute = resolveInside(this.config.workDir, artifact.path);
+    if (!existsSync(absolute)) throw new Error(`产物文件缺失：${safeName} v${artifact.version}`);
+    const content = await readFile(absolute, 'utf8');
+    const digest = createHash('sha256').update(Buffer.from(content, 'utf8')).digest('hex');
+    if (digest !== artifact.sha256) {
+      throw new Error(`产物内容与登记不一致（${safeName} v${artifact.version}），拒绝按旧版本号读取`);
+    }
+    return { artifact, content };
   }
 
   listArtifacts(taskId: string): Artifact[] {
@@ -460,6 +593,10 @@ export class Runtime implements ToolHost {
 
   // ---------------- 提交与汇报 ----------------
 
+  /**
+   * 交付校验。检查要求按「产物 id + 内容指纹 + 当前要求版本」精确匹配：
+   * 检查旧版本、检查别的文件、结论不是通过、或者检查后又改了内容，都拿不到放行。
+   */
   async submitResult(worker: Worker, summary: string, artifactNames: string[]): Promise<SubmitResult> {
     const task = this.store.getTaskByGroup(worker.groupId);
     if (!task) return { ok: false, reason: '任务不存在' };
@@ -469,9 +606,15 @@ export class Runtime implements ToolHost {
 
     const resolved: Artifact[] = [];
     for (const name of artifactNames) {
-      const artifact = this.store.latestArtifactByName(task.id, name);
+      let safeName: string;
+      try {
+        safeName = normalizeRelativePath(name, '产物文件名');
+      } catch (error) {
+        return { ok: false, reason: (error as Error).message };
+      }
+      const artifact = this.store.latestArtifactByName(task.id, safeName);
       if (!artifact) return { ok: false, reason: `产物未登记：${name}` };
-      const absolute = resolve(this.config.workDir, artifact.path);
+      const absolute = resolveInside(this.config.workDir, artifact.path);
       if (!existsSync(absolute)) return { ok: false, reason: `产物文件不存在：${name}` };
       const content = await readFile(absolute);
       const digest = createHash('sha256').update(content).digest('hex');
@@ -488,13 +631,32 @@ export class Runtime implements ToolHost {
 
     if (task.requireReview) {
       const reviews = this.store.listReviews(task.id);
-      if (reviews.length === 0) return { ok: false, reason: '该任务要求同组检查，但尚未发起检查请求' };
-      const pending = reviews.filter((review) => review.status === 'pending');
-      if (pending.length > 0) return { ok: false, reason: `还有 ${pending.length} 个检查请求未回复` };
-      const maxVersion = Math.max(...resolved.map((artifact) => artifact.version));
-      const answered = reviews.filter((review) => review.status === 'answered');
-      const covered = answered.some((review) => review.artifactVersion <= maxVersion);
-      if (!covered) return { ok: false, reason: '没有覆盖当前产物的检查记录' };
+      const current = reviews.filter((review) => review.epoch === task.reviewEpoch);
+      const missing = resolved.filter(
+        (artifact) =>
+          !current.some(
+            (review) =>
+              review.artifactId === artifact.id &&
+              review.artifactSha256 === artifact.sha256 &&
+              review.outcome === 'approved',
+          ),
+      );
+      if (missing.length > 0) {
+        const stats = {
+          pending: current.filter((review) => review.outcome === 'pending').length,
+          changes: current.filter((review) => review.outcome === 'changes_required').length,
+          inconclusive: current.filter((review) => review.outcome === 'inconclusive').length,
+          stale: reviews.length - current.length,
+        };
+        const names = missing.map((artifact) => `${artifact.name} v${artifact.version}`).join('、');
+        return {
+          ok: false,
+          reason:
+            `以下产物没有当前要求（要求版本 ${task.reviewEpoch}）下明确的检查通过结论：${names}。` +
+            `检查记录：待回复 ${stats.pending}、需修改 ${stats.changes}、无法判断 ${stats.inconclusive}、旧要求 ${stats.stale}。` +
+            `请对最新版本重新取得 approved 结论。`,
+        };
+      }
     }
 
     const artifactIds = resolved.map((artifact) => artifact.id);
@@ -514,6 +676,7 @@ export class Runtime implements ToolHost {
         replyTo: null,
         refs: { artifacts: resolved.map((artifact) => ({ artifactId: artifact.id, name: artifact.name, version: artifact.version })) },
         dedupeKey: null,
+        broadcastId: null,
         status: 'queued',
         createdAt: now,
         deliveredAt: null,
@@ -547,6 +710,7 @@ export class Runtime implements ToolHost {
       replyTo: null,
       refs: this.normalizeRefs(refs ?? null, task.id),
       dedupeKey: null,
+      broadcastId: null,
       status: 'queued',
       createdAt: nowIso(),
       deliveredAt: null,
@@ -589,6 +753,7 @@ export class Runtime implements ToolHost {
       replyTo: null,
       refs: null,
       dedupeKey: null,
+      broadcastId: null,
       status: 'queued',
       createdAt: nowIso(),
       deliveredAt: null,
@@ -599,8 +764,10 @@ export class Runtime implements ToolHost {
     this.store.setMessageStatus(message.id, 'delivered');
     this.store.appendEvent(task.id, null, `router.${input.kind}`, worker.id);
     if (input.kind === 'update') {
-      // 补充要求写入任务定义，后续 Worker 的 system prompt 都能看到。
+      // 补充要求写入任务定义，后续 Worker 的 system prompt 都能看到；
+      // 同时抬升要求版本，旧检查结论不再作为新要求的验收依据。
       this.store.updateTaskRequirements(task.id, { brief: `${task.brief}\n[补充要求 ${nowIso()}] ${input.body}`.trim() });
+      this.store.bumpReviewEpoch(task.id);
     }
     this.emit({ type: 'message.sent', messageId: message.id, from: 'router', to: worker.id, kind: input.kind });
     this.onMessageDelivered(message);
@@ -640,6 +807,7 @@ export class Runtime implements ToolHost {
       replyTo: null,
       refs: null,
       dedupeKey: null,
+      broadcastId: null,
       status: 'queued',
       createdAt: nowIso(),
       deliveredAt: null,
@@ -665,11 +833,18 @@ export class Runtime implements ToolHost {
 
   // ---------------- 调度 ----------------
 
+  /**
+   * 请求调度。运行中收到请求不会丢：记在 rerunRequested，等本轮结束后再跑一次。
+   * 这样既保证「跑完再来」，又保证同一 Worker 同时只有一个执行过程。
+   */
   enqueue(workerId: string): void {
     if (this.stopped) return;
     const worker = this.store.getWorker(workerId);
     if (!worker || isTerminalWorker(worker.status)) return;
-    if (this.running.has(workerId)) return;
+    if (this.running.has(workerId)) {
+      this.rerunRequested.add(workerId);
+      return;
+    }
     if (this.queue.includes(workerId)) return;
     this.queue.push(workerId);
     this.pump();
@@ -689,6 +864,12 @@ export class Runtime implements ToolHost {
         .finally(() => {
           this.running.delete(workerId);
           this.runningCount -= 1;
+          if (this.rerunRequested.delete(workerId)) {
+            const current = this.store.getWorker(workerId);
+            if (current && !isTerminalWorker(current.status) && !this.queue.includes(workerId)) {
+              this.queue.push(workerId);
+            }
+          }
           this.pump();
         });
     }
@@ -761,14 +942,28 @@ export class Runtime implements ToolHost {
         return;
       }
 
-      for (const call of result.toolCalls) {
+      for (let index = 0; index < result.toolCalls.length; index += 1) {
+        const call = result.toolCalls[index]!;
         const currentTask = this.store.getTaskByGroup(worker.groupId);
         if (!currentTask || isTerminalTask(currentTask.status)) {
+          this.recordUnexecuted(worker, result.toolCalls.slice(index), '任务已结束，剩余调用未执行');
           this.store.setWorkerStatus(workerId, 'cancelled', '任务已结束');
           return;
         }
         const outcome = await this.tools.execute(call.name, call.arguments, this.toolContext(workerId));
         this.recordToolTurn(worker, call, outcome.content);
+        if (outcome.type === 'wait' || outcome.type === 'finish') {
+          // 一批调用里只执行到一半就挂起时，剩下的调用必须留下明确记录，
+          // 否则对话里会出现没有结果的 tool_call，严格校验的端点会直接拒绝请求。
+          const rest = result.toolCalls.slice(index + 1);
+          if (rest.length > 0) {
+            this.recordUnexecuted(
+              worker,
+              rest,
+              outcome.type === 'wait' ? '本次运行因等待而提前结束，该调用未执行' : '本次运行因提交/停止而结束，该调用未执行',
+            );
+          }
+        }
         if (outcome.type === 'wait') {
           this.store.setWorkerStatus(workerId, 'waiting');
           this.emit({ type: 'worker.status', workerId, status: 'waiting' });
@@ -781,10 +976,19 @@ export class Runtime implements ToolHost {
       }
     }
 
+    // 单轮步数用完但整体预算还在：转回 queued 并请求下一轮。
     const current = this.store.getWorker(workerId);
     if (current && current.status === 'running') {
-      this.store.setWorkerStatus(workerId, 'idle');
+      this.store.setWorkerStatus(workerId, 'queued');
+      this.emit({ type: 'worker.status', workerId, status: 'queued' });
       this.enqueue(workerId);
+    }
+  }
+
+  /** 为未执行的调用补一条明确的 tool 记录，不伪造成功。 */
+  private recordUnexecuted(worker: Worker, calls: ToolCall[], reason: string): void {
+    for (const call of calls) {
+      this.recordToolTurn(worker, call, `[未执行] ${call.name}：${reason}`);
     }
   }
 
@@ -801,24 +1005,75 @@ export class Runtime implements ToolHost {
       collaborators,
       isOwner: task.ownerWorkerId === worker.id,
     });
-    const history = this.store.listWorkerTurns(worker.id, 16).map((turn): ChatMessage => {
+    const history = this.buildHistory(worker);
+    return [{ role: 'system', content: system }, ...history];
+  }
+
+  /**
+   * 取最近若干轮，但保证「工具调用」与「工具结果」成对出现：
+   * 窗口起点落在 tool 上时向前扩展，缺结果的调用补一条明确的未执行记录。
+   */
+  private buildHistory(worker: Worker): ChatMessage[] {
+    const WINDOW = 16;
+    const TOOL_LIMIT = 8000;
+    let turns = this.store.listWorkerTurns(worker.id, WINDOW);
+    let guard = 0;
+    while (turns.length > 0 && turns[0]!.role === 'tool' && guard < 8) {
+      const before = this.store.listWorkerTurnsBefore(worker.id, turns[0]!.seq, 8);
+      if (before.length === 0) {
+        turns = turns.slice(1);
+        continue;
+      }
+      turns = [...before, ...turns];
+      guard += 1;
+    }
+
+    const toToolMessage = (turn: (typeof turns)[number]): ChatMessage => {
+      const content = turn.content ?? '';
+      const clipped =
+        content.length > TOOL_LIMIT
+          ? `${content.slice(0, TOOL_LIMIT)}\n…（工具输出共 ${content.length} 字符，已截断；需要完整内容请用 offset 续读）`
+          : content;
+      return { role: 'tool', content: clipped, toolCallId: turn.toolCallId ?? undefined };
+    };
+
+    const messages: ChatMessage[] = [];
+    for (let index = 0; index < turns.length; index += 1) {
+      const turn = turns[index]!;
+      if (turn.role === 'assistant' && Array.isArray(turn.toolCalls) && turn.toolCalls.length > 0) {
+        const calls = turn.toolCalls as ToolCall[];
+        const following: (typeof turns)[number][] = [];
+        let cursor = index + 1;
+        while (cursor < turns.length && turns[cursor]!.role === 'tool') {
+          following.push(turns[cursor]!);
+          cursor += 1;
+        }
+        messages.push({ role: 'assistant', content: turn.content, toolCalls: calls });
+        const seen = new Set(following.map((item) => item.toolCallId));
+        for (const item of following) messages.push(toToolMessage(item));
+        for (const call of calls) {
+          if (!seen.has(call.id)) {
+            messages.push({
+              role: 'tool',
+              content: `[未执行] ${call.name}：历史记录中缺少对应结果`,
+              toolCallId: call.id,
+            });
+          }
+        }
+        index = cursor - 1;
+        continue;
+      }
       if (turn.role === 'tool') {
-        const content = turn.content ?? '';
-        const clipped = content.length > 4000 ? `${content.slice(0, 4000)}\n…（工具输出过长已截断）` : content;
-        return { role: 'tool', content: clipped, toolCallId: turn.toolCallId ?? undefined };
+        messages.push(toToolMessage(turn));
+        continue;
       }
       if (turn.role === 'user') {
-        return { role: 'user', content: turn.content };
+        messages.push({ role: 'user', content: turn.content });
+        continue;
       }
-      return {
-        role: 'assistant',
-        content: turn.content,
-        ...(Array.isArray(turn.toolCalls) && turn.toolCalls.length > 0
-          ? { toolCalls: turn.toolCalls as ToolCall[] }
-          : {}),
-      };
-    });
-    return [{ role: 'system', content: system }, ...history];
+      messages.push({ role: 'assistant', content: turn.content });
+    }
+    return messages;
   }
 
   /** 第一个 user 消息必须落库，否则后续请求会缺少 user 轮次。 */
@@ -859,6 +1114,9 @@ export class Runtime implements ToolHost {
       lines.push(`- [${message.id}] 来自 ${origin}｜kind=${message.kind}${message.replyTo ? `｜回复 ${message.replyTo}` : ''}`);
       if (message.payload && typeof message.payload['intent'] === 'string') {
         lines.push(`  intent: ${String(message.payload['intent'])}`);
+      }
+      if (message.payload && typeof message.payload['outcome'] === 'string') {
+        lines.push(`  outcome: ${String(message.payload['outcome'])}`);
       }
       lines.push(`  内容：${message.body}`);
       if (message.refs?.files && message.refs.files.length > 0) lines.push(`  引用文件：${message.refs.files.join(', ')}`);
@@ -932,6 +1190,7 @@ export class Runtime implements ToolHost {
       replyTo: null,
       refs: null,
       dedupeKey: null,
+      broadcastId: null,
       status: 'queued',
       createdAt: nowIso(),
       deliveredAt: null,
@@ -959,10 +1218,23 @@ export class Runtime implements ToolHost {
     }
     const worker = this.store.getWorker(workerId);
     if (!worker || isTerminalWorker(worker.status)) return;
+    // 重试时间点写进数据库：进程重启后由 tick 继续这个等待，不依赖内存定时器。
+    this.store.clearWaitsForWorker(workerId);
     this.store.setWorkerStatus(workerId, 'waiting');
-    this.pushSystemNotice(workerId, `模型提供方暂时不可用：${(error as Error).message}。60 秒后自动重试。`);
+    this.store.createWait({
+      id: newWaitId(),
+      workerId,
+      groupId: worker.groupId,
+      reason: 'provider',
+      matchFrom: null,
+      matchReplyTo: null,
+      matchKinds: null,
+      deadlineAt: isoAfter(60_000),
+      createdAt: nowIso(),
+      resolvedAt: null,
+    });
+    this.pushSystemNotice(workerId, `模型提供方暂时不可用：${(error as Error).message}。已安排 60 秒后自动重试。`);
     this.emit({ type: 'error', text: `Worker ${workerId} 等待模型恢复：${(error as Error).message}` });
-    setTimeout(() => this.enqueue(workerId), 60_000).unref?.();
   }
 
   private async failWorker(workerId: string, reason: string): Promise<void> {
@@ -1012,6 +1284,12 @@ export class Runtime implements ToolHost {
       this.store.resolveWait(wait.id);
       const worker = this.store.getWorker(wait.workerId);
       if (!worker || isTerminalWorker(worker.status)) continue;
+      if (wait.reason === 'provider') {
+        // 提供方等待写在数据库里，进程重启后照样能续上。
+        this.pushSystemNotice(worker.id, '模型提供方已恢复等待窗口，继续上次未完成的工作。');
+        this.enqueue(worker.id);
+        continue;
+      }
       this.pushSystemNotice(worker.id, '等待已超时，没有收到匹配回复。请决定继续等待、自己推进，或向 Router 说明阻塞。');
       this.enqueue(worker.id);
     }
@@ -1037,17 +1315,63 @@ export class Runtime implements ToolHost {
     return this.runningCount === 0 && this.queue.length === 0;
   }
 
-  /** 重启恢复：把上次中断的 running 状态转回可继续的 waiting，并说明中断。 */
-  recover(): { interruptedWorkers: number } {
+  /**
+   * 重启恢复：按持久化状态分情况处理，而不是把所有 waiting 一律重跑。
+   *
+   * - running：上次进程在执行中被打断。转 queued 并写提示，由模型核对历史后决定下一步，
+   *   程序不自动重放结果不明的工具调用。
+   * - queued：已排队未执行，直接重新入队。
+   * - waiting：读 wait_record 判断在等什么；等回复/等用户的保持不动，
+   *   等提供方且已过期的重新入队，没有任何等待记录的（历史遗留）转 queued。
+   * - 终态：忽略。
+   *
+   * 重复调用是幂等的：状态已归一，enqueue 本身也会去重。
+   */
+  recover(): { interrupted: number; requeued: number; waiting: number; recovered: number } {
     let interrupted = 0;
+    let requeued = 0;
+    let waiting = 0;
+
     for (const worker of this.store.listWorkers()) {
-      if (worker.status !== 'running') continue;
-      this.store.setWorkerStatus(worker.id, 'waiting');
-      this.pushSystemNotice(worker.id, '检测到上次进程在执行中断。请核对已有进度后继续，不要重复已完成的外部动作。');
-      this.enqueue(worker.id);
-      interrupted += 1;
+      if (isTerminalWorker(worker.status)) continue;
+      const task = this.store.getTaskByGroup(worker.groupId);
+      if (!task || isTerminalTask(task.status)) {
+        if (worker.status !== 'cancelled') this.store.setWorkerStatus(worker.id, 'cancelled', '任务已结束');
+        continue;
+      }
+
+      if (worker.status === 'running') {
+        this.store.setWorkerStatus(worker.id, 'queued');
+        this.pushSystemNotice(
+          worker.id,
+          '检测到上次进程在执行中断。请核对已有文件与消息，只补做未完成的部分，不要重复已完成的外部动作。',
+        );
+        interrupted += 1;
+        this.enqueue(worker.id);
+        continue;
+      }
+
+      if (worker.status === 'queued' || worker.status === 'idle') {
+        if (worker.status === 'idle') this.store.setWorkerStatus(worker.id, 'queued');
+        requeued += 1;
+        this.enqueue(worker.id);
+        continue;
+      }
+
+      // waiting
+      const waits = this.store.listActiveWaitsForWorker(worker.id);
+      if (waits.length === 0) {
+        this.store.setWorkerStatus(worker.id, 'queued');
+        this.pushSystemNotice(worker.id, '重启后未发现有效的等待记录，请继续推进当前工作。');
+        requeued += 1;
+        this.enqueue(worker.id);
+        continue;
+      }
+      waiting += 1;
+      // provider 等待由 tick 按 deadline 恢复，其余保持原状等外部事件。
     }
-    return { interruptedWorkers: interrupted };
+
+    return { interrupted, requeued, waiting, recovered: interrupted + requeued };
   }
 }
 

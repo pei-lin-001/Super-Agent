@@ -203,8 +203,10 @@ export async function startRepl(options: ReplOptions): Promise<void> {
 
   write(`Super-Agent 已启动（Node ${process.version}）。输入 /help 查看命令，直接输入内容交给 Router。`);
   const recovered = runtime.recover();
-  if (recovered.interruptedWorkers > 0) {
-    write(`[恢复] 检测到 ${recovered.interruptedWorkers} 个 Worker 上次执行中断，已转回等待并重新排队。`);
+  if (recovered.recovered > 0 || recovered.waiting > 0) {
+    write(
+      `[恢复] 执行中断 ${recovered.interrupted} 个、重新排队 ${recovered.requeued} 个、仍在等待 ${recovered.waiting} 个。`,
+    );
   }
   runtime.start();
   rl.prompt();

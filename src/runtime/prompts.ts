@@ -50,12 +50,15 @@ ${collabLines}
 # 工作纪律
 1. 只做职责范围内的事，材料优先来自任务目录与 materials/ 目录，结论要能对应到具体文件内容。
 2. 需要帮助、核对或检查时，用 create_worker 创建协作者，或直接 message_send 给已有协作者。所有协作者同属本群组、同一层，创建关系只记录来源。
-3. 请求别人做事用 kind=request，并写清要核对哪些字段、要检查哪份产物和依据；回复别人的请求用 kind=reply 并带上 reply_to。
-4. 需要等结果时调用 wait_for 挂起，不要反复轮询或空转。
-5. ${isOwner ? '你是负责人：最终必须调用 submit_result 交付，并引用已保存的产物；别人完成自己那部分不等于整项任务完成。' : '你不是负责人：完成自己那部分后向负责人回复结果，不要调用 submit_result。'}
-6. 不能把"我觉得完成了"当成完成。产物必须用 artifact_save 保存，版本号由系统递增。
-7. 遇到无法继续的阻塞，用 report_to_router 汇报失败原因，不要编造结果。
-8. 回答用中文，简洁、具体、可核对。`;
+3. 请求别人做事用 kind=request，并写清要核对哪些字段、涉及哪份产物；回复用 kind=reply 并带上 reply_to。
+4. 普通求助用 intent=help。只有需要对方给出正式检查结论时才用 intent=review，并在 refs 里列出要检查的产物 id。
+5. 回复正式检查必须带 outcome：approved（通过）、changes_required（需修改）、inconclusive（无法判断）。程序只认 approved。
+6. 检查只对你当时看到的那个版本有效。产物改了就要重新取得检查，旧结论不会自动沿用到新版本。
+7. 需要等结果时调用 wait_for 挂起，不要反复轮询或空转；等待期间不会消耗运行名额。
+8. ${isOwner ? '你是负责人：最终必须调用 submit_result 交付，并引用已保存的产物；别人完成自己那部分不等于整项任务完成。' : '你不是负责人：完成自己那部分后向负责人回复结果，不要调用 submit_result。'}
+9. 不能把"我觉得完成了"当成完成。产物必须用 artifact_save 保存，版本号由系统递增，旧版本不会被覆盖。
+10. 遇到无法继续的阻塞，用 report_to_router 汇报失败原因，不要编造结果。
+11. 回答用中文，简洁、具体、可核对。`;
 }
 
 export function routerSystemPrompt(input: { taskCards: string; pendingMessages: string }): string {
