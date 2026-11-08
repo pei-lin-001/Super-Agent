@@ -132,6 +132,7 @@ function mapJob(row: Row): ProcessJob {
     command: str(row['command']),
     args: args ? (JSON.parse(args) as string[]) : [],
     cwd: str(row['cwd']),
+    scope: row['scope'] === null || row['scope'] === undefined ? 'biz' : str(row['scope']),
     pid: row['pid'] === null || row['pid'] === undefined ? null : num(row['pid']),
     status: str(row['status']) as ProcessJob['status'],
     exitCode: row['exit_code'] === null || row['exit_code'] === undefined ? null : num(row['exit_code']),
@@ -248,6 +249,7 @@ export class Store {
   }
 
   close(): void {
+    this.closed = true;
     if (!this.db.isOpen) return;
     this.db.close();
   }
@@ -536,6 +538,12 @@ export class Store {
     for (const worker of this.listGroupWorkers(groupId)) this.bumpWorkerEpoch(worker.id);
   }
 
+  private closed = false;
+
+  get isClosed(): boolean {
+    return this.closed;
+  }
+
   setMaintenance(taskId: string, value: boolean): void {
     this.run('UPDATE task SET maintenance = ?, updated_at = ? WHERE id = ?', value ? 1 : 0, nowIso(), taskId);
   }
@@ -663,6 +671,60 @@ export class Store {
     this.run('UPDATE router_session SET status = ?, updated_at = ? WHERE id = ?', status, nowIso(), id);
   }
 
+  startModelCall(input: {
+    id: string;
+    purpose: 'router' | 'worker' | 'note' | 'watchdog' | 'context';
+    model: string;
+    taskId?: string | null;
+    workerId?: string | null;
+    sessionId?: string | null;
+  }): void {
+    this.run(
+      `INSERT INTO model_call (id, purpose, task_id, worker_id, session_id, model, status, started_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'running', ?)`,
+      input.id, input.purpose, input.taskId ?? null, input.workerId ?? null, input.sessionId ?? null, input.model, nowIso(),
+    );
+  }
+
+  finishModelCall(input: {
+    id: string;
+    status: 'ok' | 'failed' | 'cancelled' | 'interrupted';
+    usage?: { promptTokens: number; completionTokens: number } | null;
+    httpAttempts?: number | null;
+    error?: string | null;
+  }): void {
+    // usage 缺失记为未知（usage_known=0），不填 0；提供方明确返回的 0 会保留。
+    const known = input.usage ? 1 : 0;
+    this.run(
+      `UPDATE model_call SET status = ?, prompt_tokens = ?, completion_tokens = ?, usage_known = ?,
+         http_attempts = ?, error = ?, ended_at = ? WHERE id = ?`,
+      input.status,
+      input.usage?.promptTokens ?? null,
+      input.usage?.completionTokens ?? null,
+      known,
+      input.httpAttempts ?? null,
+      input.error ?? null,
+      nowIso(),
+      input.id,
+    );
+  }
+
+  modelCallStats(): { purpose: string; calls: number; ok: number; failed: number; usageKnown: number }[] {
+    return this.all(
+      `SELECT purpose, COUNT(*) AS calls,
+         SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END) AS ok,
+         SUM(CASE WHEN status IN ('failed','cancelled','interrupted') THEN 1 ELSE 0 END) AS failed,
+         SUM(usage_known) AS usageKnown
+       FROM model_call GROUP BY purpose ORDER BY purpose`,
+    ).map((row) => ({
+      purpose: str(row['purpose']),
+      calls: num(row['calls']),
+      ok: num(row['ok']),
+      failed: num(row['failed']),
+      usageKnown: num(row['usageKnown']),
+    }));
+  }
+
   getRouterAction(sessionId: string, actionKey: string): { tool: string; result: string } | null {
     const row = this.get('SELECT tool, result FROM router_action WHERE session_id = ? AND action_key = ?', sessionId, actionKey);
     return row ? { tool: str(row['tool']), result: str(row['result']) } : null;
@@ -758,10 +820,10 @@ export class Store {
   insertJob(job: ProcessJob): ProcessJob {
     this.run(
       `INSERT INTO process_job (id, task_id, worker_id, command, args_json, cwd, pid, status, exit_code,
-                                signal, stdout_path, stderr_path, timeout_ms, started_at, ended_at, error)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                                signal, scope, stdout_path, stderr_path, timeout_ms, started_at, ended_at, error)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       job.id, job.taskId, job.workerId, job.command, JSON.stringify(job.args), job.cwd, job.pid, job.status,
-      job.exitCode, job.signal, job.stdoutPath, job.stderrPath, job.timeoutMs, job.startedAt, job.endedAt, job.error,
+      job.exitCode, job.signal, job.scope ?? 'biz', job.stdoutPath, job.stderrPath, job.timeoutMs, job.startedAt, job.endedAt, job.error,
     );
     return job;
   }
@@ -787,8 +849,12 @@ export class Store {
     return this.all("SELECT * FROM process_job WHERE task_id = ? AND status = 'running'", taskId).map(mapJob);
   }
 
-  listAllRunningJobs(): ProcessJob[] {
-    return this.all("SELECT * FROM process_job WHERE status = 'running'").map(mapJob);
+  listRunningJobsByScope(scope: string): ProcessJob[] {
+    return this.all("SELECT * FROM process_job WHERE scope = ? AND status = 'running'", scope).map(mapJob);
+  }
+
+  listAllRunningJobs(scope = 'biz'): ProcessJob[] {
+    return this.all("SELECT * FROM process_job WHERE status = 'running' AND COALESCE(scope, 'biz') = ?", scope).map(mapJob);
   }
 
   createWait(wait: WaitRecord): WaitRecord {

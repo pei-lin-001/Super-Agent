@@ -1,6 +1,7 @@
 import type { Config } from '../config.ts';
 import { randomBytes } from 'node:crypto';
 import { nowIso } from '../domain/ids.ts';
+import { RecordingModel } from '../model/recorder.ts';
 import type { RuntimeEvent } from '../domain/types.ts';
 import type { ChatMessage, ModelClient, ToolSchema } from '../model/types.ts';
 import type { Runtime } from './runtime.ts';
@@ -169,7 +170,9 @@ export class Router {
     const sessionId = this.resumeSessionId ?? `rs_${randomBytes(4).toString('hex')}`;
     const maxRounds = Math.max(1, this.config.limits.maxRouterRounds);
     for (let step = 0; step < maxRounds; step += 1) {
-      const result = await this.model.chat({
+      const result = await new RecordingModel(this.model, this.runtime.store, 'router', {
+        sessionId,
+      }).chat({
         model: this.config.routerModel,
         messages,
         tools: this.readOnly ? [] : ROUTER_TOOLS,

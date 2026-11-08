@@ -51,7 +51,33 @@ export function isPidAlive(pid: number): boolean {
 }
 
 /** 判断进程是否确实是本项目的实例，而不是复用了同一个 PID 的无关进程。 */
+/** 进程身份：match（确认是我们）/ mismatch（确认不是）/ unknown（探测失败，不能下结论）。 */
+export type ProcessIdentity = 'match' | 'mismatch' | 'unknown';
+
+export function identifyProcess(pid: number, marker: string): ProcessIdentity {
+  try {
+    const cmdline = readFileSync(`/proc/${pid}/cmdline`, 'utf8');
+    return cmdline.includes(marker) ? 'match' : 'mismatch';
+  } catch {
+    // 没有 /proc：用 ps 再看一眼
+  }
+  try {
+    const out = execFileSync('ps', ['-p', String(pid), '-o', 'command='], { encoding: 'utf8' });
+    if (out.trim() === '') return 'mismatch';
+    return out.includes(marker) ? 'match' : 'mismatch';
+  } catch (error) {
+    // 命令本身不可用（无 ps、无权限）时不能断言对方已退出
+    const code = (error as { code?: string }).code;
+    if (code === 'ENOENT') return 'unknown';
+    return 'unknown';
+  }
+}
+
 export function looksLikeOurProcess(pid: number, marker: string): boolean {
+  return identifyProcess(pid, marker) === 'match';
+}
+
+export function looksLikeOurProcessLegacy(pid: number, marker: string): boolean {
   try {
     const cmdline = readFileSync(`/proc/${pid}/cmdline`, 'utf8');
     return cmdline.includes(marker);

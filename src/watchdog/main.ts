@@ -12,8 +12,9 @@ import { loadConfig } from '../config.ts';
 import { OpenAICompatibleModel } from '../model/openai.ts';
 import { Store } from '../storage/store.ts';
 import { mkdirSync as mkdir, writeFileSync as writeJson } from 'node:fs';
-import { instancePath, isPidAlive, looksLikeOurProcess, readInstance } from './observer.ts';
+import { identifyProcess, instancePath, isPidAlive, looksLikeOurProcess, readInstance } from './observer.ts';
 import { mainHealth, spawnMain } from './process.ts';
+import { ProcessService } from '../runtime/process.ts';
 import { WatchdogSession } from './session.ts';
 
 const config = loadConfig();
@@ -41,6 +42,11 @@ async function restartMain(): Promise<{ ok: boolean; message: string }> {
   return { ok: result.ok, message: result.message };
 }
 
+// 维护者自己的作业服务：scope=watchdog，日志在 `.jobs/watchdog/`，
+// 与业务作业完全分开恢复，不会把主系统 running 作业标成 unknown。
+const wdJobs = new ProcessService({ store, logRoot: join(config.workDir, '.jobs', 'watchdog'), scope: 'watchdog' });
+wdJobs.recover();
+
 const session = new WatchdogSession({
   store,
   config,
@@ -48,6 +54,22 @@ const session = new WatchdogSession({
   modelName: process.env['WATCHDOG_MODEL'] ?? config.workerModel,
   restartMain,
   health: () => mainHealth(config),
+  processes: {
+    start: (input) =>
+      wdJobs.start({
+        taskId: 'watchdog',
+        workerId: 'watchdog',
+        command: input.command,
+        args: input.args,
+        cwd: input.cwd,
+        stdin: null,
+        timeoutMs: input.timeoutMs,
+        logRoot: join(config.workDir, '.jobs', 'watchdog'),
+      }),
+    read: (id) => wdJobs.read(id, 'stdout', 0, 20_000),
+    get: (id) => store.getJob(id),
+    stop: (id) => wdJobs.stop(id, '维护者停止'),
+  },
 });
 
 mkdirSync(dirname(pidFile), { recursive: true });
@@ -56,32 +78,45 @@ mkdirSync(dirname(pidFile), { recursive: true });
 // 原子抢占：同时启动时只有一个能拿到写句柄（O_EXCL），不依赖"先读再写"的顺序。
 const lockPath = `${pidFile}.lock`;
 let acquired = false;
-for (let attempt = 0; attempt < 2 && !acquired; attempt += 1) {
+for (let attempt = 0; attempt < 8 && !acquired; attempt += 1) {
   try {
-    writeFileSync(lockPath, String(process.pid), { flag: 'wx' });
+    writeFileSync(lockPath, `${process.pid}\n`, { flag: 'wx' });
     acquired = true;
+    break;
   } catch {
-    // 锁文件已存在：确认持有者是否真的还活着，否则视为陈旧锁清理后重试。
-    let holder = 0;
-    try {
-      holder = Number(readFileSync(lockPath, 'utf8').trim());
-    } catch {
-      holder = 0;
-    }
-    const alive = Number.isInteger(holder) && holder >= 2 && isPidAlive(holder) && looksLikeOurProcess(holder, 'watchdog');
-    if (alive) {
-      console.log(`已有 Watchdog 在运行（pid=${holder}），本次不启动`);
-      store.close();
-      process.exit(3);
-    }
-    try {
-      rmSync(lockPath, { force: true });
-    } catch {
-      // 清理陈旧锁失败时直接退出，避免两个实例同时写库。
-      console.log('无法清理陈旧锁，本次不启动');
-      store.close();
-      process.exit(3);
-    }
+    // 锁已存在：判断持有者状态
+  }
+  let holder = 0;
+  try {
+    holder = Number(readFileSync(lockPath, 'utf8').trim());
+  } catch {
+    holder = 0;
+  }
+  if (!Number.isInteger(holder) || holder < 2) {
+    // 刚创建、内容还没写完：不能当成陈旧锁，稍等再看。
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    continue;
+  }
+  const alive = isPidAlive(holder);
+  const identity = alive ? identifyProcess(holder, 'watchdog') : 'mismatch';
+  if (identity === 'match') {
+    console.log(`已有 Watchdog 在运行（pid=${holder}），本次不启动`);
+    store.close();
+    process.exit(3);
+  }
+  if (identity === 'unknown') {
+    // 探测失败不等于对方已经退出：保守处理，不删锁、也不启动第二个。
+    console.log(`无法确认锁持有者 ${holder} 是否仍在运行，保守跳过本次启动`);
+    store.close();
+    process.exit(3);
+  }
+  try {
+    rmSync(lockPath, { force: true });
+  } catch {
+    // 清理陈旧锁失败时直接退出，避免两个实例同时写库。
+    console.log('无法清理陈旧锁，本次不启动');
+    store.close();
+    process.exit(3);
   }
 }
 if (!acquired) {
@@ -201,6 +236,25 @@ log(`Watchdog 启动：pid=${process.pid}｜间隔 ${Math.round(intervalMs / 100
 log('主系统状态：' + (readInstance(config) ? `实例文件存在（pid=${readInstance(config)!.pid}）` : '没有实例文件'));
 
 let running = false;
+let lastModelReview = 0;
+
+/**
+ * 是否现在需要模型审视：
+ * - 有到期的未解决事件 → 必须看；
+ * - 有活跃任务 → 按间隔周期性看（不能只靠规则命中）；
+ * - 否则跳过，避免空转。
+ */
+function dueForReview(): { run: boolean; reason: string } {
+  const now = Date.now();
+  const issues = store.listOpenIssues();
+  const due = issues.filter((issue) => !issue.checkAfter || Date.parse(issue.checkAfter) <= now);
+  if (due.length > 0) return { run: true, reason: `${due.length} 个事件到期待复查` };
+  const active = store.listTasks().some((item) => item.status === 'active' || item.status === 'waiting');
+  if (active && now - lastModelReview >= intervalMs) return { run: true, reason: '存在活跃任务，周期性审视' };
+  if (!active && now - lastModelReview >= intervalMs * 5) return { run: true, reason: '长时间未审视，做一次巡检' };
+  return { run: false, reason: '没有到期事件，也没有新的活跃任务' };
+}
+
 async function tick(): Promise<void> {
   if (running) return;
   if (existsSync(stopFile)) {
@@ -211,8 +265,14 @@ async function tick(): Promise<void> {
   try {
     // 提问与巡检串行：同一时刻只有一个维护会话在动。
     await runQuestionWorker();
+    const gate = dueForReview();
+    if (!gate.run) {
+      log(`跳过本轮巡检：${gate.reason}`);
+      return;
+    }
+    lastModelReview = Date.now();
     const result = await session.runOnce(Math.round(intervalMs / 60_000));
-    log(`巡检完成：${result.steps} 次模型调用${result.acted ? '，执行了维护动作' : ''}｜${result.summary.split('\n')[0]?.slice(0, 160) ?? ''}`);
+    log(`巡检完成（${gate.reason}）：${result.steps} 次模型调用${result.acted ? '，执行了维护动作' : ''}｜${result.summary.split('\n')[0]?.slice(0, 160) ?? ''}`);
   } catch (error) {
     log(`巡检失败：${(error as Error).message}（保留观察记录，继续按间隔重试）`);
     store.appendWdAction({
@@ -250,6 +310,7 @@ setInterval(() => {
 
 const shutdown = (): void => {
   log('Watchdog 退出');
+  wdJobs.dispose();
   store.close();
   process.exit(0);
 };

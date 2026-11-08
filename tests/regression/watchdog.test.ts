@@ -845,3 +845,114 @@ test('Router 动作去重：创建任务后再失败，续接不会重复建任�
     await harness.cleanup();
   }
 });
+
+test('调用统计：多次模型调用与对话条数分开记，usage 未知不记成 0', async () => {
+  const harness = await createHarness({ limits: { maxConcurrentRuns: 0 }, worker: () => mockReply({ text: 'ok' }) });
+  try {
+    harness.runtime.createTask({ title: '统计', goal: 'g', ownerRole: 'r', ownerBrief: 'b' });
+    let round = 0;
+    const session = new WatchdogSession({
+      store: harness.store,
+      config: harness.config,
+      model: new MockModel(() => {
+        round += 1;
+        if (round <= 3) {
+          return mockReply({ toolCalls: [{ name: 'check_main', arguments: {} }] });
+        }
+        return mockReply({ text: '结论' });
+      }),
+      modelName: 'mock',
+    });
+    await session.runOnce(1);
+
+    const stats = harness.store.modelCallStats();
+    const wd = stats.find((item) => item.purpose === 'watchdog');
+    assert.ok(wd, '必须记录 Watchdog 自己的调用');
+    assert.equal(wd.calls, 4, '4 次 chat 就应是 4 条调用记录');
+    assert.equal(wd.usageKnown, 0, '没有 usage 时记为未知，不是 0');
+    assert.equal(harness.store.listWdTurns(20).length, 1, '对话条数与调用次数不是一回事');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('调用统计：失败的模型调用也留下记录并标明状态', async () => {
+  const harness = await createHarness({ limits: { maxConcurrentRuns: 0 }, worker: () => mockReply({ text: 'ok' }) });
+  try {
+    harness.runtime.createTask({ title: '失败统计', goal: 'g', ownerRole: 'r', ownerBrief: 'b' });
+    const session = new WatchdogSession({
+      store: harness.store,
+      config: harness.config,
+      model: new MockModel(() => {
+        throw new Error('提供方不可用');
+      }),
+      modelName: 'mock',
+    });
+    await session.runOnce(1).catch(() => undefined);
+    const stats = harness.store.modelCallStats();
+    const wd = stats.find((item) => item.purpose === 'watchdog');
+    assert.ok(wd && wd.failed >= 1, '失败的调用必须被记录');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('维护者作业：与业务作业分开恢复，启动不会把业务 running 标成 unknown', async () => {
+  const harness = await createHarness({ limits: { maxConcurrentRuns: 0 }, worker: () => mockReply({ text: 'ok' }) });
+  try {
+    const { owner, task } = harness.runtime.createTask({ title: '隔离作业', goal: 'g', ownerRole: 'r', ownerBrief: 'b' });
+    const bizJob = harness.runtime.startJob({
+      worker: owner, taskId: task.id, command: 'python3', args: ['-c', 'import time;time.sleep(10)'],
+      cwd: harness.config.workDir, stdin: null, timeoutMs: 30_000,
+    });
+    assert.equal(harness.store.getJob(bizJob.id)?.status, 'running');
+
+    const { ProcessService } = await import('../../src/runtime/process.ts');
+    const wdJobs = new ProcessService({
+      store: harness.store,
+      logRoot: join(harness.config.workDir, '.jobs', 'watchdog'),
+      scope: 'watchdog',
+    });
+    wdJobs.recover();
+    assert.equal(harness.store.getJob(bizJob.id)?.status, 'running', '维护者恢复不能误标业务作业');
+
+    const wdJob = wdJobs.start({
+      taskId: 'watchdog', workerId: 'watchdog', command: 'python3', args: ['-c', 'print(1)'],
+      cwd: harness.config.workDir, stdin: null, timeoutMs: 10_000,
+      logRoot: join(harness.config.workDir, '.jobs', 'watchdog'),
+    });
+    assert.equal(harness.store.getJob(wdJob.id)?.scope, 'watchdog');
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    assert.equal(harness.store.getJob(wdJob.id)?.exitCode, 0);
+
+    const again = new ProcessService({
+      store: harness.store,
+      logRoot: join(harness.config.workDir, '.jobs', 'watchdog'),
+      scope: 'watchdog',
+    });
+    again.recover();
+    assert.equal(harness.store.getJob(bizJob.id)?.status, 'running', '再次恢复也不能碰业务作业');
+    wdJobs.dispose();
+    again.dispose();
+    harness.runtime.stopJob(bizJob.id, '测试结束');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('复查调度：未到期且无新情况时跳过一次模型审视', async () => {
+  const harness = await createHarness({ limits: { maxConcurrentRuns: 0 }, worker: () => mockReply({ text: 'ok' }) });
+  try {
+    // 无活跃任务时不应每轮都调模型
+    harness.store.upsertWdIssue({
+      id: 'wdi_later', taskId: null, title: '稍后复查',
+      note: '', checkAfter: new Date(Date.now() + 30 * 60_000).toISOString(),
+    });
+    const issues = harness.store.listOpenIssues();
+    const now = Date.now();
+    const due = issues.filter((issue) => !issue.checkAfter || Date.parse(issue.checkAfter) <= now);
+    assert.equal(due.length, 0, '未到期事件不应触发立即复查');
+  } finally {
+    await harness.cleanup();
+  }
+});

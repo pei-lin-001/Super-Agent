@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { nowIso } from '../domain/ids.ts';
 import { isTerminalTask } from '../domain/state.ts';
 import type { ChatMessage, ModelClient, ToolSchema } from '../model/types.ts';
+import { RecordingModel } from '../model/recorder.ts';
 import type { Store } from '../storage/store.ts';
 import type { Config } from '../config.ts';
 import { observe, renderObservation } from './observer.ts';
@@ -84,6 +85,31 @@ const WD_TOOLS: ToolSchema[] = [
     },
   },
   {
+    name: 'run_command',
+    description:
+      '在工作目录内执行一条命令（程序 + 参数数组，不经过 shell），用于查看进程、磁盘、日志等。' +
+      '超时上限 60 秒；这是维护者自己的作业，与业务作业分开管理。',
+    parameters: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: '程序名，例如 ps、ls、df' },
+        args: { type: 'array', items: { type: 'string' } },
+        cwd: { type: 'string', description: '相对工作目录的子路径，默认工作目录根' },
+        timeout_seconds: { type: 'number', description: '默认 30，上限 60' },
+      },
+      required: ['command'],
+    },
+  },
+  {
+    name: 'job_output',
+    description: '读取维护者自己启动的命令输出。',
+    parameters: {
+      type: 'object',
+      properties: { job_id: { type: 'string' } },
+      required: ['job_id'],
+    },
+  },
+  {
     name: 'record',
     description: '记录或关闭一个未解决事件。issue_id 为空表示新建；status=closed 表示已确认恢复。',
     parameters: {
@@ -112,6 +138,16 @@ export interface WatchdogDeps {
   health?: () => { state: string; pid: number | null; detail: string; heartbeatAgeMs: number | null };
   /** 读取 Watchdog 自己的运行配置（含在线调整的巡检间隔）。 */
   runtimeConfig?: { intervalMs: number };
+  /**
+   * 维护者自己的作业服务（scope=watchdog）。
+   * 与业务作业分开恢复，不会把主系统 running 作业标成 unknown。
+   */
+  processes?: {
+    start: (input: { command: string; args: string[]; cwd: string; timeoutMs: number }) => { id: string; status: string };
+    read: (id: string) => { text: string; hasMore: boolean; running: boolean } | null;
+    get: (id: string) => { status: string; exitCode: number | null } | null;
+    stop: (id: string) => void;
+  };
 }
 
 export interface WatchdogResult {
@@ -203,6 +239,7 @@ export class WatchdogSession {
   }
 
   private async executeTool(name: string, args: Record<string, unknown>): Promise<string> {
+    void 0;
     const store = this.deps.store;
     const str = (key: string): string => (typeof args[key] === 'string' ? (args[key] as string) : '');
     const num = (key: string, fallback: number): number =>
@@ -224,6 +261,35 @@ export class WatchdogSession {
     }
     if (name === 'read_file') {
       return this.readInsideRoot(str('path'), num('offset', 0), num('limit', 8000));
+    }
+    if (name === 'run_command') {
+      if (!this.deps.processes) return '当前环境没有配置维护者作业服务';
+      const command = str('command');
+      if (command.trim() === '') return '缺少 command';
+      const rawArgs = args['args'];
+      const list = Array.isArray(rawArgs) ? rawArgs.filter((item): item is string => typeof item === 'string') : [];
+      const cwdRel = str('cwd');
+      let cwd = this.deps.config.workDir;
+      if (cwdRel !== '') {
+        try {
+          cwd = resolveInside(this.deps.config.workDir, cwdRel);
+          assertInsideRoot(this.deps.config.workDir, cwd);
+        } catch (error) {
+          return `拒绝执行：${(error as Error).message}`;
+        }
+      }
+      const seconds = Math.min(Math.max(num('timeout_seconds', 30), 1), 60);
+      const job = this.deps.processes.start({ command, args: list, cwd, timeoutMs: seconds * 1000 });
+      const output = this.deps.processes.read(job.id);
+      return `作业 ${job.id}｜${job.status}\n${output?.text ?? '（暂无输出）'}`;
+    }
+    if (name === 'job_output') {
+      if (!this.deps.processes) return '当前环境没有配置维护者作业服务';
+      const id = str('job_id');
+      const job = this.deps.processes.get(id);
+      if (!job) return `找不到作业 ${id}`;
+      const output = this.deps.processes.read(id);
+      return `${id}｜${job.status}｜退出码 ${job.exitCode ?? '-'}\n${output?.text ?? '（暂无输出）'}`;
     }
     if (name === 'inspect_task') {
       return this.describeTask(str('task_id'), num('limit', 15));
@@ -399,7 +465,7 @@ export class WatchdogSession {
     let acted = false;
     const maxSteps = 8;
     for (let index = 0; index < maxSteps; index += 1) {
-      const result = await model.chat({
+      const result = await new RecordingModel(model, store, 'watchdog', { sessionId: null }).chat({
         model: modelName,
         messages,
         tools: WD_TOOLS,

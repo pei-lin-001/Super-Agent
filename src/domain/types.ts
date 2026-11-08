@@ -199,6 +199,8 @@ export type RuntimeEvent =
 export type JobStatus = 'running' | 'exited' | 'failed' | 'killed' | 'timeout' | 'unknown';
 
 export interface ProcessJob {
+  /** 作业归属：biz（业务）或 watchdog（维护），恢复时互不影响。 */
+  scope?: string;
   id: string;
   taskId: string;
   workerId: string;

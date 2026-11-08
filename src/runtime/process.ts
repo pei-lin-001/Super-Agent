@@ -38,6 +38,8 @@ export interface JobOutput {
 export interface ProcessServiceOptions {
   store: Store;
   logRoot: string;
+  /** 作业归属：biz（业务）或 watchdog（维护）。恢复只处理自己这一份。 */
+  scope?: string;
   /** 作业结束时回调，用于唤醒等待它的 Worker。 */
   onFinished?: (job: ProcessJob) => void;
 }
@@ -50,6 +52,8 @@ export interface ProcessServiceOptions {
 export class ProcessService {
   private readonly store: Store;
   private readonly logRoot: string;
+  /** 作业归属：业务进程与维护进程各管各的，恢复时不会互相误标。 */
+  private readonly scope: string;
   private readonly options: ProcessServiceOptions;
   private readonly alive = new Map<string, ChildProcess>();
   private readonly timers = new Map<string, NodeJS.Timeout>();
@@ -59,6 +63,7 @@ export class ProcessService {
     this.options = options;
     this.store = options.store;
     this.logRoot = options.logRoot;
+    this.scope = options.scope ?? 'biz';
     mkdirSync(this.logRoot, { recursive: true });
   }
 
@@ -83,6 +88,7 @@ export class ProcessService {
       workerId: input.workerId,
       command: input.command,
       args: input.args,
+      scope: this.scope,
       cwd: input.cwd,
       pid: null,
       status: 'running',
@@ -285,7 +291,7 @@ export class ProcessService {
    * 标记为 unknown，既不当成功也不当失败，也不按 PID 去杀。
    */
   recover(): number {
-    const jobs = this.store.listAllRunningJobs();
+    const jobs = this.store.listAllRunningJobs(this.scope);
     for (const job of jobs) {
       job.status = 'unknown';
       job.endedAt = nowIso();

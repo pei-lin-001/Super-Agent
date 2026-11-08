@@ -198,6 +198,7 @@ CREATE TABLE IF NOT EXISTS process_job (
   status           TEXT NOT NULL,
   exit_code        INTEGER,
   signal           TEXT,
+  scope            TEXT NOT NULL DEFAULT 'biz',
   stdout_path      TEXT NOT NULL,
   stderr_path      TEXT NOT NULL,
   timeout_ms       INTEGER NOT NULL,
@@ -227,6 +228,26 @@ CREATE TABLE IF NOT EXISTS wd_issue (
   last_seen   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_wd_issue_status ON wd_issue(status, check_after);
+
+CREATE TABLE IF NOT EXISTS model_call (
+  id           TEXT PRIMARY KEY,
+  purpose      TEXT NOT NULL,
+  task_id      TEXT,
+  worker_id    TEXT,
+  session_id   TEXT,
+  model        TEXT NOT NULL,
+  status       TEXT NOT NULL DEFAULT 'running',
+  http_attempts INTEGER,
+  prompt_tokens INTEGER,
+  completion_tokens INTEGER,
+  usage_known  INTEGER NOT NULL DEFAULT 0,
+  cancelled    INTEGER NOT NULL DEFAULT 0,
+  error        TEXT,
+  started_at   TEXT NOT NULL,
+  ended_at     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_model_call_started ON model_call(started_at);
+CREATE INDEX IF NOT EXISTS idx_model_call_purpose ON model_call(purpose, status);
 
 CREATE TABLE IF NOT EXISTS wd_question (
   id         TEXT PRIMARY KEY,

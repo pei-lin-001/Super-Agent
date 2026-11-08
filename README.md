@@ -434,6 +434,34 @@ rollback_override key=worker.check_rules version=1
 - 拉起有 120 秒冷却和 `work/.runtime/restart.json` 记录；启动失败保留 `work/.runtime/main.log`。
 - 停机标记在**动作执行前**重新检查，维护者明确停机时不会被自动拉起。
 
+### 调用统计
+
+`model_call` 表按**每次 chat 调用**记账，不用对话条数反推：
+
+| 字段 | 含义 |
+|---|---|
+| `purpose` | router / worker / note / watchdog / context |
+| `status` | running / ok / failed / cancelled / interrupted |
+| `usage_known` | 0 表示提供方没给 usage（**未知，不是 0**） |
+| `http_attempts` | 与重试次数分开计数 |
+
+```ts
+store.modelCallStats()  // 按用途聚合：调用数、成功、失败、有 usage 的条数
+```
+
+### 维护者作业与业务作业
+
+`process_job.scope` 区分 `biz` 与 `watchdog`：
+
+- Watchdog 用自己 `ProcessService(scope='watchdog')`，日志在 `.jobs/watchdog/`
+- `recover()` 只处理自己这一份——启动维护者不会把主系统 running 作业标成 unknown
+- 工具：`run_command`（程序+参数数组，cwd 限工作目录，超时上限 60 秒）、`job_output`
+
+### 巡检频率由证据决定
+
+`dueForReview()`：有到期事件 → 必须审视；有活跃任务 → 按间隔周期性审视；否则跳过并记录原因。
+巡检间隔可用 `watchdog.interval` 在线调整。
+
 ### 累计调用不再是失败条件
 
 | 原来 | 现在 |
@@ -484,7 +512,7 @@ REPL 命令：
 
 ```bash
 pnpm typecheck                              # 类型检查
-pnpm test                                   # 85 个测试，全部使用临时目录与模拟模型
+pnpm test                                   # 89 个测试，全部使用临时目录与模拟模型
 pnpm smoke:mini                             # 真实模型最小链路
 pnpm smoke:real                             # 真实模型综合协作场景
 node scripts/verify-run.ts <db> [taskId]    # 对已有运行记录重新做严格判定，不调用模型

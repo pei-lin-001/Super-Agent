@@ -30,6 +30,7 @@ import type {
   WorkerTurn,
 } from '../domain/types.ts';
 import { ModelError } from '../model/types.ts';
+import { RecordingModel } from '../model/recorder.ts';
 import type { ChatMessage, ModelClient, StepResult, ToolCall } from '../model/types.ts';
 import { artifactTools } from '../tools/artifacts.ts';
 import { collabTools } from '../tools/collab.ts';
@@ -1178,7 +1179,10 @@ export class Runtime implements ToolHost {
         for (const message of inbox) this.markConsumed(message.id);
       }
       const messages = await this.buildWorkerMessages(worker, task);
-      const result = await this.workerModel.chat({
+      const result = await new RecordingModel(this.workerModel, this.store, 'worker', {
+        taskId: task.id,
+        workerId,
+      }).chat({
         model: worker.model ?? this.config.workerModel,
         messages,
         tools: this.tools.schemas(),
