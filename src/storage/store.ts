@@ -18,6 +18,7 @@ import type {
   WaitReason,
   WaitRecord,
   Worker,
+  WorkerNote,
   WorkerStatus,
   WorkerTurn,
 } from '../domain/types.ts';
@@ -148,6 +149,24 @@ function mapReview(row: Row): Review {
     requestMessageId: str(row['request_message_id']),
     replyMessageId: strOrNull(row['reply_message_id']),
     outcome: (strOrNull(row['outcome']) ?? 'pending') as ReviewOutcome,
+    createdAt: str(row['created_at']),
+  };
+}
+
+function mapNote(row: Row): WorkerNote {
+  return {
+    id: str(row['id']),
+    workerId: str(row['worker_id']),
+    taskId: str(row['task_id']),
+    fromSeq: num(row['from_seq']),
+    toSeq: num(row['to_seq']),
+    coveredSeq: num(row['covered_seq']),
+    epoch: num(row['epoch']),
+    content: str(row['content']),
+    sourceTurns: num(row['source_turns']),
+    sourceChars: num(row['source_chars']),
+    failed: num(row['failed']) === 1,
+    failReason: strOrNull(row['fail_reason']),
     createdAt: str(row['created_at']),
   };
 }
@@ -590,6 +609,18 @@ export class Store {
     ).map(mapTurn).reverse();
   }
 
+  /** 全部历史的规模（字符数是估算口径，不是 token）。 */
+  workerTurnStats(workerId: string): { turns: number; chars: number } {
+    const row = this.get(
+      `SELECT COUNT(*) AS n,
+              COALESCE(SUM(LENGTH(COALESCE(content, ''))), 0) AS c,
+              COALESCE(SUM(LENGTH(COALESCE(tool_calls, ''))), 0) AS t
+         FROM worker_turn WHERE worker_id = ?`,
+      workerId,
+    );
+    return row ? { turns: num(row['n']), chars: num(row['c']) + num(row['t']) } : { turns: 0, chars: 0 };
+  }
+
   countWorkerTurns(workerId: string): number {
     const row = this.get('SELECT COUNT(*) AS n FROM worker_turn WHERE worker_id = ?', workerId);
     return row ? num(row['n']) : 0;
@@ -601,6 +632,77 @@ export class Store {
       workerId, limit,
     );
     return rows.map(mapTurn).reverse();
+  }
+
+  // ---------------- 工作记录 ----------------
+
+  insertWorkerNote(note: WorkerNote): void {
+    this.run(
+      `INSERT INTO worker_note
+         (id, worker_id, task_id, from_seq, to_seq, covered_seq, epoch, content, source_turns, source_chars, failed, fail_reason, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      note.id, note.workerId, note.taskId, note.fromSeq, note.toSeq, note.coveredSeq,
+      note.epoch, note.content, note.sourceTurns, note.sourceChars,
+      note.failed ? 1 : 0, note.failReason ?? null, note.createdAt,
+    );
+  }
+
+  /** 最新一条成功记录；失败记录不参与注入。 */
+  latestSuccessfulNote(workerId: string): WorkerNote | null {
+    const row = this.get(
+      'SELECT * FROM worker_note WHERE worker_id = ? AND failed = 0 ORDER BY created_at DESC LIMIT 1',
+      workerId,
+    );
+    return row ? mapNote(row) : null;
+  }
+
+  latestNote(workerId: string): WorkerNote | null {
+    const row = this.get('SELECT * FROM worker_note WHERE worker_id = ? ORDER BY created_at DESC LIMIT 1', workerId);
+    return row ? mapNote(row) : null;
+  }
+
+  listWorkerNotes(workerId: string, limit = 10): WorkerNote[] {
+    return this.all(
+      'SELECT * FROM worker_note WHERE worker_id = ? ORDER BY created_at DESC LIMIT ?',
+      workerId, limit,
+    ).map(mapNote);
+  }
+
+  /** 最近连续失败次数（遇到一条成功即停止）。 */
+  consecutiveNoteFailures(workerId: string): number {
+    const rows = this.all(
+      'SELECT failed FROM worker_note WHERE worker_id = ? ORDER BY created_at DESC LIMIT 10',
+      workerId,
+    );
+    let count = 0;
+    for (const row of rows) {
+      if (num(row['failed']) === 1) count += 1;
+      else break;
+    }
+    return count;
+  }
+
+  searchWorkerTurns(
+    workerId: string,
+    options: { fromSeq: number; toSeq: number; role: string | null; limit: number },
+  ): WorkerTurn[] {
+    const params: (string | number)[] = [workerId, options.fromSeq, options.toSeq];
+    let sql =
+      'SELECT * FROM worker_turn WHERE worker_id = ? AND seq >= ? AND seq <= ?';
+    if (options.role) {
+      sql += ' AND role = ?';
+      params.push(options.role);
+    }
+    sql += ' ORDER BY seq DESC LIMIT ?';
+    params.push(options.limit);
+    return this.all(sql, ...params).map(mapTurn).reverse();
+  }
+
+  listWorkerTurnsRange(workerId: string, fromSeq: number, toSeq: number): WorkerTurn[] {
+    return this.all(
+      'SELECT * FROM worker_turn WHERE worker_id = ? AND seq >= ? AND seq <= ? ORDER BY seq',
+      workerId, fromSeq, toSeq,
+    ).map(mapTurn);
   }
 
   appendRouterTurn(turn: RouterTurn): void {

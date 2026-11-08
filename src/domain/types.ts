@@ -185,3 +185,27 @@ export type RuntimeEvent =
   | { type: 'router.reply'; text: string }
   | { type: 'router.notice'; text: string }
   | { type: 'error'; text: string };
+
+/**
+ * Worker 的累计工作记录。每次整理生成一份新记录，覆盖到 coveredSeq。
+ * 失败记录只用于诊断：failed=1 时 content 为空，不参与注入，也不推进覆盖位置。
+ */
+export interface WorkerNote {
+  id: string;
+  workerId: string;
+  taskId: string;
+  /** 本次新增历史片段的起点序号。 */
+  fromSeq: number;
+  /** 本次新增历史片段的终点序号。 */
+  toSeq: number;
+  /** 累计覆盖终点，成功记录才有意义。 */
+  coveredSeq: number;
+  /** 生成时的任务要求版本。 */
+  epoch: number;
+  content: string;
+  sourceTurns: number;
+  sourceChars: number;
+  failed: boolean;
+  failReason: string | null;
+  createdAt: string;
+}

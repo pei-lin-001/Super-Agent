@@ -19,6 +19,20 @@ export interface Limits {
   waitTimeoutMs: number;
   modelRetry: number;
   maxNudges: number;
+  /** 近期历史窗口的字符预算（字符数，不是 token）。 */
+  contextWindowChars: number;
+  /** 组装后允许的额外配对扩展量。 */
+  pairingOvershootChars: number;
+  /** 触发一次整理所需的新增历史条数与字符数，两者同时满足。 */
+  noteTriggerTurns: number;
+  noteTriggerChars: number;
+  /** 单份工作记录的长度上限。 */
+  noteMaxChars: number;
+  /** 单次整理读入的历史字符上限。 */
+  noteInputChars: number;
+  /** 整理失败后的最小重试间隔与连续失败上限。 */
+  noteRetryMs: number;
+  noteMaxFailures: number;
 }
 
 export interface Config {
@@ -94,6 +108,14 @@ export function loadConfig(options: { requireModel?: boolean } = {}): Config {
       waitTimeoutMs: intEnv('WAIT_TIMEOUT_SECONDS', 300) * 1000,
       modelRetry: intEnv('MODEL_RETRY', 2),
       maxNudges: 3,
+      contextWindowChars: intEnv('CONTEXT_WINDOW_CHARS', 16_000),
+      pairingOvershootChars: intEnv('CONTEXT_PAIRING_OVERSHOOT_CHARS', 2_000),
+      noteTriggerTurns: intEnv('NOTE_TRIGGER_TURNS', 10),
+      noteTriggerChars: intEnv('NOTE_TRIGGER_CHARS', 3_000),
+      noteMaxChars: intEnv('NOTE_MAX_CHARS', 6_000),
+      noteInputChars: intEnv('NOTE_INPUT_CHARS', 24_000),
+      noteRetryMs: intEnv('NOTE_RETRY_MS', 120_000),
+      noteMaxFailures: intEnv('NOTE_MAX_FAILURES', 3),
     },
   };
 }

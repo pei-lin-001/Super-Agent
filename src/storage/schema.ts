@@ -123,6 +123,23 @@ CREATE TABLE IF NOT EXISTS router_turn (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS worker_note (
+  id           TEXT PRIMARY KEY,
+  worker_id    TEXT NOT NULL,
+  task_id      TEXT NOT NULL,
+  from_seq     INTEGER NOT NULL,
+  to_seq       INTEGER NOT NULL,
+  covered_seq  INTEGER NOT NULL,
+  epoch        INTEGER NOT NULL,
+  content      TEXT NOT NULL,
+  source_turns INTEGER NOT NULL,
+  source_chars INTEGER NOT NULL,
+  failed       INTEGER NOT NULL DEFAULT 0,
+  fail_reason  TEXT,
+  created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_note_worker ON worker_note(worker_id, created_at);
+
 CREATE TABLE IF NOT EXISTS event (
   id         TEXT PRIMARY KEY,
   task_id    TEXT,
