@@ -164,8 +164,8 @@ test('产物：越界路径与绝对路径被拒绝，不同版本各自独立�
     assert.throws(() => harness.runtime.saveArtifact(owner, '/tmp/escaped.txt', 'x'), /必须是相对路径/);
     assert.throws(() => harness.runtime.saveArtifact(owner, 'a/../../b.txt', 'x'), /不能包含 \.\./);
 
-    const v1 = harness.runtime.saveArtifact(owner, 'report.md', '# v1\n');
-    const v2 = harness.runtime.saveArtifact(owner, 'report.md', '# v2\n');
+    const v1 = harness.runtime.saveArtifact(owner, 'report.md', '# v1\n').artifact;
+    const v2 = harness.runtime.saveArtifact(owner, 'report.md', '# v2\n').artifact;
     assert.equal(v1.version, 1);
     assert.equal(v2.version, 2);
     assert.notEqual(v1.path, v2.path, '不同版本必须写到不同路径');
@@ -188,7 +188,7 @@ test('产物：fs_write 不能覆盖已登记的产物目录', async () => {
       ownerRole: '负责人',
       ownerBrief: '负责',
     });
-    const saved = harness.runtime.saveArtifact(owner, 'report.md', '# 已登记\n');
+    const saved = harness.runtime.saveArtifact(owner, 'report.md', '# 已登记\n').artifact;
     const context: ToolContext = {
       host: harness.runtime,
       worker: owner,
@@ -223,8 +223,8 @@ test('检查：一次请求覆盖多份产物，未覆盖全部产物时不能�
     const checker = harness.runtime.createCollaborator(owner, '检查者', '检查');
     assert.ok(checker.ok);
 
-    const a1 = harness.runtime.saveArtifact(owner, 'a.md', 'A');
-    const a2 = harness.runtime.saveArtifact(owner, 'b.md', 'B');
+    const a1 = harness.runtime.saveArtifact(owner, 'a.md', 'A').artifact;
+    const a2 = harness.runtime.saveArtifact(owner, 'b.md', 'B').artifact;
 
     const multi = harness.runtime.sendMessage({
       from: owner,
@@ -249,7 +249,7 @@ test('检查：一次请求覆盖多份产物，未覆盖全部产物时不能�
     assert.equal(reply.ok, true, reply.reason);
 
     // 另建一份未被检查的产物，提交必须被拒绝。
-    const c1 = harness.runtime.saveArtifact(owner, 'c.md', 'C');
+    const c1 = harness.runtime.saveArtifact(owner, 'c.md', 'C').artifact;
     const rejected = await harness.runtime.submitResult(owner, '交付', ['a.md', 'b.md', 'c.md']);
     assert.equal(rejected.ok, false);
     assert.match(rejected.reason ?? '', /c\.md v1/);
@@ -270,7 +270,7 @@ test('检查：不通过、无法判断、旧版本、旧要求都不能放行',
       ownerBrief: '负责',
     });
     const checker = harness.runtime.createCollaborator(owner, '检查者', '检查');
-    const artifact = harness.runtime.saveArtifact(owner, 'report.md', 'v1');
+    const artifact = harness.runtime.saveArtifact(owner, 'report.md', 'v1').artifact;
 
     const request = harness.runtime.sendMessage({
       from: owner,
@@ -301,7 +301,7 @@ test('检查：不通过、无法判断、旧版本、旧要求都不能放行',
     assert.match(changed.reason ?? '', /report\.md v1/);
 
     // 改成 v2 但沿用旧结论
-    const v2 = harness.runtime.saveArtifact(owner, 'report.md', 'v2 已补来源');
+    const v2 = harness.runtime.saveArtifact(owner, 'report.md', 'v2 已补来源').artifact;
     assert.equal(v2.version, 2);
     const stale = await harness.runtime.submitResult(owner, '交付', ['report.md']);
     assert.equal(stale.ok, false);
@@ -371,7 +371,7 @@ test('检查：普通求助不产生检查记录，回复也不需要结论', as
       ownerBrief: '负责',
     });
     const helper = harness.runtime.createCollaborator(owner, '协作者', '协助');
-    const artifact = harness.runtime.saveArtifact(owner, 'report.md', 'v1');
+    const artifact = harness.runtime.saveArtifact(owner, 'report.md', 'v1').artifact;
     const request = harness.runtime.sendMessage({
       from: owner,
       to: helper.workerId!,
