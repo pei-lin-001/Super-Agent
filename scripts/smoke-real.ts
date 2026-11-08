@@ -2,6 +2,7 @@
  * 真实模型冒烟：用配置里的真实模型跑一遍综合场景。
  * 运行：node --env-file-if-exists=.env.local scripts/smoke-real.ts
  */
+import { randomBytes } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { loadConfig } from '../src/config.ts';
@@ -9,6 +10,7 @@ import { OpenAICompatibleModel } from '../src/model/openai.ts';
 import { Router } from '../src/runtime/router.ts';
 import { Runtime } from '../src/runtime/runtime.ts';
 import { Store } from '../src/storage/store.ts';
+import { isolateRun, judgeTask, report } from './smoke-lib.ts';
 
 const MATERIALS: Record<string, string> = {
   'sales-q3.md': `# 2026 年 Q3 销售数据
@@ -41,7 +43,10 @@ function log(message: string): void {
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function main(): Promise<void> {
-  const config = loadConfig();
+  const base = loadConfig();
+  const runId = `real-${new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)}-${randomBytes(2).toString('hex')}`;
+  const config = isolateRun(base, runId);
+  log(`本次运行：${runId}｜数据库 ${config.dbPath}`);
   await mkdir(config.materialsDir, { recursive: true });
   for (const [name, content] of Object.entries(MATERIALS)) {
     const path = join(config.materialsDir, name);
@@ -97,6 +102,7 @@ async function main(): Promise<void> {
   const router = new Router(runtime, routerModel, config);
   runtime.attachRouter(router);
 
+  let createdTaskId: string | null = null;
   const unsubscribe = runtime.on((event) => {
     switch (event.type) {
       case 'router.reply':
@@ -106,6 +112,7 @@ async function main(): Promise<void> {
         log(`提示：${event.text}`);
         break;
       case 'task.created':
+        createdTaskId = event.taskId;
         log(`任务建立：${event.taskId} ${event.title}`);
         break;
       case 'task.status':
@@ -127,7 +134,9 @@ async function main(): Promise<void> {
 
   runtime.start();
   const recovered = runtime.recover();
-  if (recovered.interruptedWorkers > 0) log(`恢复：${recovered.interruptedWorkers} 个中断的 Worker 已重新排队`);
+  if (recovered.recovered > 0 || recovered.waiting > 0) {
+    log(`恢复：中断 ${recovered.interrupted}、重排 ${recovered.requeued}、仍在等待 ${recovered.waiting}`);
+  }
 
   const started = Date.now();
   log('发送主请求');
@@ -144,12 +153,14 @@ async function main(): Promise<void> {
   log(`第二条请求已回复，等待 ${((Date.now() - secondStart) / 1000).toFixed(1)}s`);
 
   const deadline = Date.now() + 600_000;
+  let timedOut = false;
   while (Date.now() < deadline) {
     const tasks = store.listTasks();
     const open = tasks.filter((task) => task.status === 'active' || task.status === 'waiting' || task.status === 'pending');
     if (tasks.length > 0 && open.length === 0 && runtime.stats().running === 0) break;
     await sleep(1000);
   }
+  if (store.listTasks().some((task) => ['active', 'waiting', 'pending'].includes(task.status))) timedOut = true;
   await runtime.waitForIdle(30_000);
 
   log('==== 结果 ====');
@@ -169,23 +180,29 @@ async function main(): Promise<void> {
     }
   }
 
-  const taskWithArtifacts = store.listTasks().filter((task) => store.listArtifacts(task.id).length > 0);
-  const reportTask = taskWithArtifacts.at(-1);
-  const artifacts = reportTask ? store.listArtifacts(reportTask.id) : [];
-  const latest = artifacts.at(-1);
-  if (latest) {
-    const content = await readFile(join(config.workDir, latest.path), 'utf8');
-    console.log(`\n==== 产物正文（${latest.name} v${latest.version}）====\n${content.slice(0, 2000)}`);
-  } else {
-    console.log('\n==== 没有产生任何产物 ====');
-  }
-
   unsubscribe();
   await runtime.stop();
+
+  if (!createdTaskId) {
+    store.close();
+    report({ ok: false, code: 1, lines: ['Router 没有建立任何任务'] });
+  }
+  const targetTaskId = createdTaskId;
+  const verdict = timedOut
+    ? { ok: false, code: 2, lines: ['等待超时：600 秒内任务没有结束'] }
+    : judgeTask(store, config, targetTaskId);
+  verdict.lines.push('—— 过程证据 ——');
+  for (const task of store.listTasks()) {
+    verdict.lines.push(`任务 ${task.id}｜${task.status}｜${task.title}`);
+  }
+  for (const worker of store.listWorkers()) {
+    verdict.lines.push(`Worker ${worker.id}｜${worker.status}｜${worker.stepCount} 步｜${worker.lastError ?? '-'}`);
+  }
   store.close();
+  report(verdict);
 }
 
 main().catch((error: unknown) => {
-  console.error('冒烟失败：', error instanceof Error ? error.stack ?? error.message : error);
-  process.exitCode = 1;
+  console.error('冒烟异常退出：', error instanceof Error ? error.stack ?? error.message : error);
+  process.exit(3);
 });

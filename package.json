@@ -13,6 +13,7 @@
     "dev": "node --env-file-if-exists=.env.local --watch src/main.ts",
     "typecheck": "tsc --noEmit",
     "test": "node --test --test-concurrency=1 \"tests/**/*.test.ts\"",
+    "smoke:mini": "node --env-file-if-exists=.env.local scripts/smoke-mini.ts",
     "smoke:real": "node --env-file-if-exists=.env.local scripts/smoke-real.ts",
     "format": "prettier --write ."
   },
