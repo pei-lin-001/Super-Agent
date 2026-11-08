@@ -287,6 +287,14 @@ artifact_version | outcome          | epoch
 于是误报未通过。判定改为只看**交付消息实际引用的产物 id**后，`scripts/verify-run.ts` 对同一份数据库
 重新判定为通过。这属于验收脚本的判据错误，不是程序行为错误——DB 里 v3 的 approved 与 completed 都是真实产生的。
 
+修复判据后又完整跑了一次，脚本自身判定通过（`real-20261108101716-0c8b`，退出码 0）：
+
+```
+任务 completed，交付引用 report.md v2
+检查者 w2_7fd4ce28 回复 approved，并把检查意见另存为 review-report-v2.md
+负责人 w1_8cf28148 交付的 result 消息明确写着「仅对 v2 有效」
+```
+
 ## 12. 真实模型下的行为
 
 Ollama Cloud 在模型未就绪或请求过密时会返回 `finish_reason: "load"`，此时响应里没有文本也没有工具调用。
