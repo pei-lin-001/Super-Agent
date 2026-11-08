@@ -28,7 +28,7 @@ test('重启恢复：running 转回 waiting 并继续完成，中断被明确记
       ownerRole: '负责人',
       ownerBrief: '保存产物并交付',
     });
-    assert.equal(store1.getWorker(owner.id)!.status, 'idle');
+    assert.equal(store1.getWorker(owner.id)!.status, 'queued');
     // 模拟进程在 Worker 执行中崩溃
     store1.db.prepare("UPDATE worker SET status = 'running' WHERE id = ?").run(owner.id);
     store1.db
@@ -56,7 +56,7 @@ test('重启恢复：running 转回 waiting 并继续完成，中断被明确记
     runtime2.attachRouter(router2);
 
     const recovered = runtime2.recover();
-    assert.equal(recovered.interruptedWorkers, 1);
+    assert.equal(recovered.interrupted, 1);
 
     const interruptedNotices = store2
       .listGroupMessages(store2.getTask(taskId)!.groupId)

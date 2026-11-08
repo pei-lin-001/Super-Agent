@@ -11,16 +11,25 @@ function firstMatch(pattern: RegExp, text: string | null | undefined): string {
   return pattern.exec(text ?? '')?.[1] ?? '';
 }
 
+/** 历史 inbox 会保留多条消息，取最后一条才是这次要处理的那条。 */
+function lastMatch(pattern: RegExp, text: string | null | undefined): string {
+  const all = [...(text ?? '').matchAll(new RegExp(pattern.source, 'g'))];
+  return all.at(-1)?.[1] ?? '';
+}
+
 /**
  * 综合协作场景：
- * Router 建任务（要求检查）→ A 创建 B 核对数据 → A 等待 → B 回复 → A 生成 v1
- * → A 尝试提前提交被拒 → A 创建 C 检查 → C 指出问题 → A 改出 v2 → A 交付。
+ * Router 建任务（要求检查）→ A 创建 B 核对 → A 等待 → B 回复 → A 生成 v1
+ * → A 创建 C 检查 v1 → C 判定「需修改」→ A 改出 v2
+ * → A 用 v2 直接提交被拒（v1 的检查结论不能覆盖 v2）
+ * → A 请 C 复检 v2 → C 通过 → A 交付成功。
  */
-test('协作：自主创建协作者、直接沟通、检查引发修改、负责人交付', async () => {
+test('协作：自主创建协作者、直接沟通、检查引发修改、旧检查不能放行新版本', async () => {
   let aStep = 0;
   let collaboratorB = '';
-  let artifactV1 = '';
   let checkerC = '';
+  let artifactV1 = '';
+  let artifactV2 = '';
   let requestToB = '';
   let requestToC = '';
 
@@ -44,7 +53,7 @@ test('协作：自主创建协作者、直接沟通、检查引发修改、负�
               arguments: {
                 to: collaboratorB,
                 kind: 'request',
-                intent: 'verify',
+                intent: 'help',
                 body: '请核对 materials/a.md 里的营收和增长率，指出不一致的地方，并说明依据。',
                 refs: ['materials/a.md'],
               },
@@ -80,11 +89,7 @@ test('协作：自主创建协作者、直接沟通、检查引发修改、负�
         });
       }
       case 5: {
-        assert.match(
-          toolResult(request) ?? '',
-          /提交被拒绝/,
-          '未经过检查就提交应被程序拒绝',
-        );
+        assert.match(toolResult(request) ?? '', /提交被拒绝/, '未经过检查就提交应被程序拒绝');
         return mockReply({
           toolCalls: [
             { name: 'create_worker', arguments: { role: '检查', brief: '按完成条件检查 report.md，指出遗漏与依据' } },
@@ -101,7 +106,7 @@ test('协作：自主创建协作者、直接沟通、检查引发修改、负�
                 to: checkerC,
                 kind: 'request',
                 intent: 'review',
-                body: '请按完成条件检查这份报告，指出遗漏和错误，并给出依据。',
+                body: '请按完成条件正式检查这份报告，给出明确结论。',
                 refs: [artifactV1],
               },
             },
@@ -113,8 +118,10 @@ test('协作：自主创建协作者、直接沟通、检查引发修改、负�
         return mockReply({
           toolCalls: [{ name: 'wait_for', arguments: { from: checkerC, kinds: ['reply'], timeout_seconds: 5 } }],
         });
-      case 8:
-        assert.ok(inboxOf(request).includes('缺少数据来源'), `A 应看到检查意见，实际：${inboxOf(request).slice(0, 300)}`);
+      case 8: {
+        const inbox = inboxOf(request);
+        assert.ok(inbox.includes('缺少数据来源'), `A 应看到检查结论，实际收到：${inbox.slice(0, 300)}`);
+        assert.ok(inbox.includes('changes_required'), 'A 应看到结构化结论 changes_required');
         return mockReply({
           toolCalls: [
             {
@@ -126,15 +133,51 @@ test('协作：自主创建协作者、直接沟通、检查引发修改、负�
             },
           ],
         });
-      case 9:
+      }
+      case 9: {
+        artifactV2 = firstMatch(/id=(art_[0-9a-f]+)/, toolResult(request));
+        assert.ok(artifactV2.startsWith('art_'), `应拿到 v2 产物 id，实际：${toolResult(request)}`);
+        return mockReply({
+          toolCalls: [
+            { name: 'submit_result', arguments: { summary: '报告 v2 完成，沿用刚才的检查结论', artifacts: ['report.md'] } },
+          ],
+        });
+      }
+      case 10: {
+        const rejected = toolResult(request) ?? '';
+        if (!rejected.includes('提交被拒绝')) console.error('DEBUG case10 rejected:', JSON.stringify(rejected).slice(0, 500));
+        assert.match(rejected, /提交被拒绝/, '改了产物之后沿用旧检查结论，应被拒绝');
+        assert.match(rejected, /report\.md v2/, '拒绝原因应指出具体版本');
+        return mockReply({
+          toolCalls: [
+            {
+              name: 'message_send',
+              arguments: {
+                to: checkerC,
+                kind: 'request',
+                intent: 'review',
+                body: '已按意见补充来源，请复检 v2 并给出结论。',
+                refs: [artifactV2],
+              },
+            },
+          ],
+        });
+      }
+      case 11:
+        return mockReply({
+          toolCalls: [{ name: 'wait_for', arguments: { from: checkerC, kinds: ['reply'], timeout_seconds: 5 } }],
+        });
+      case 12: {
+        assert.ok(inboxOf(request).includes('approved'), 'A 应看到复检通过的结构化结论');
         return mockReply({
           toolCalls: [
             {
               name: 'submit_result',
-              arguments: { summary: '报告已按检查意见补充数据来源并交付。', artifacts: ['report.md'] },
+              arguments: { summary: '报告已按检查意见补充数据来源，并取得新版本检查通过。', artifacts: ['report.md'] },
             },
           ],
         });
+      }
       default:
         return mockReply({ text: '已交付。' });
     }
@@ -165,27 +208,59 @@ test('协作：自主创建协作者、直接沟通、检查引发修改、负�
   };
 
   let cStep = 0;
+  let cReplyTo = '';
+  let cOwner = '';
   const checkerScript = (_step: number, request: ChatRequest) => {
     const index = cStep++;
+    const inbox = inboxOf(request);
+
     if (index === 0) {
-      return mockReply({ toolCalls: [{ name: 'fs_read', arguments: { path: 'artifacts/report.md' } }] });
+      return mockReply({ toolCalls: [{ name: 'artifact_read', arguments: { name: 'report.md', version: 1 } }] });
     }
-    if (index >= 2) return mockReply({ text: '检查完成，已把意见回复负责人。' });
-    const replyTo = firstMatch(/\[(msg_[0-9a-f]+)\]/, inboxOf(request));
-    const owner = firstMatch(/来自 (w\d+_[0-9a-f]+)/, inboxOf(request));
-    return mockReply({
-      toolCalls: [
-        {
-          name: 'message_send',
-          arguments: {
-            to: owner,
-            kind: 'reply',
-            reply_to: replyTo,
-            body: '检查意见：结论缺少数据来源，无法核对；请补充来源后再交付。',
+    if (index === 1) {
+      const replyTo = firstMatch(/\[(msg_[0-9a-f]+)\]/, inbox);
+      return mockReply({
+        toolCalls: [
+          {
+            name: 'message_send',
+            arguments: {
+              to: firstMatch(/来自 (w\d+_[0-9a-f]+)/, inbox),
+              kind: 'reply',
+              reply_to: replyTo,
+              outcome: 'changes_required',
+              body: '检查结论：结论缺少数据来源，无法核对；请补充来源后再交付。',
+            },
           },
-        },
-      ],
-    });
+        ],
+      });
+    }
+    if (index === 2) {
+      return mockReply({ text: '检查结论已回复，等待下一步。' });
+    }
+    if (index === 3) {
+      assert.ok(inbox.includes('复检'), `C 应收到复检请求，实际：${inbox.slice(0, 200)}`);
+      // 历史 inbox 里可能有上一次请求，取最后一条才是本次复检。
+      cReplyTo = lastMatch(/\[(msg_[0-9a-f]+)\]/, inbox);
+      cOwner = lastMatch(/来自 (w\d+_[0-9a-f]+)/, inbox);
+      return mockReply({ toolCalls: [{ name: 'artifact_read', arguments: { name: 'report.md', version: 2 } }] });
+    }
+    if (index === 4) {
+      return mockReply({
+        toolCalls: [
+          {
+            name: 'message_send',
+            arguments: {
+              to: cOwner,
+              kind: 'reply',
+              reply_to: cReplyTo,
+              outcome: 'approved',
+              body: '复检结论：v2 已补充来源标注，approved。',
+            },
+          },
+        ],
+      });
+    }
+    return mockReply({ text: '检查完毕。' });
   };
 
   let routerStep = 0;
@@ -226,8 +301,11 @@ test('协作：自主创建协作者、直接沟通、检查引发修改、负�
     await harness.runtime.waitForIdle(15_000);
 
     const task = harness.store.listTasks()[0]!;
-    assert.equal(task.status, 'completed');
-
+    assert.equal(
+      harness.store.getTask(task.id)!.status,
+      'completed',
+      `任务应完成，实际 ${harness.store.getTask(task.id)!.status}：${harness.store.getTask(task.id)!.closeReason ?? ''}`,
+    );
     const workers = harness.runtime.listGroupWorkers(task.groupId);
     assert.equal(workers.length, 3, '应为负责人 + 核对者 + 检查者三个同层 Worker');
     const owner = workers.find((worker) => worker.id === task.ownerWorkerId)!;
@@ -238,19 +316,25 @@ test('协作：自主创建协作者、直接沟通、检查引发修改、负�
     const messages = harness.store.listGroupMessages(task.groupId);
     const requests = messages.filter((message) => message.kind === 'request');
     const replies = messages.filter((message) => message.kind === 'reply');
-    assert.equal(requests.length, 2);
-    assert.equal(replies.length, 2);
+    // 三次请求：普通核对 1 次 + 正式检查 2 次（v1 判定需修改，v2 复检通过）。
+    assert.equal(requests.length, 3);
+    assert.equal(replies.length, 3);
     assert.ok(replies.every((reply) => reply.replyTo && requests.some((request) => request.id === reply.replyTo)));
     assert.ok(replies.every((reply) => reply.status === 'consumed'), '回复应被接收者实际读到');
 
     const reviews = harness.store.listReviews(task.id);
-    assert.equal(reviews.length, 1, '检查请求应登记为 review');
-    assert.equal(reviews[0]!.status, 'answered');
-    assert.equal(reviews[0]!.artifactVersion, 1);
+    assert.equal(reviews.length, 2, '只有 intent=review 的请求才登记检查记录');
+    assert.deepEqual(reviews.map((review) => review.artifactVersion), [1, 2]);
+    assert.deepEqual(reviews.map((review) => review.outcome), ['changes_required', 'approved']);
+    assert.equal(reviews[0]!.epoch, 0);
 
     const artifacts = harness.store.listArtifacts(task.id);
     assert.equal(artifacts.length, 2);
     assert.deepEqual(artifacts.map((artifact) => artifact.version), [1, 2]);
+    // 版本各自独立落盘：v1 内容不会被 v2 覆盖。
+    const v1Content = await readFile(join(harness.config.workDir, artifacts[0]!.path), 'utf8');
+    assert.match(v1Content, /季度报告 v1/, 'v1 文件必须保持原内容');
+    assert.ok(artifacts[0]!.path !== artifacts[1]!.path, '不同版本必须写到不同路径');
 
     const finalContent = await readFile(join(harness.config.workDir, artifacts[1]!.path), 'utf8');
     assert.match(finalContent, /来源：materials\/a\.md/, '检查意见应引发实际修改');
