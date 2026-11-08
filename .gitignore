@@ -1,0 +1,20 @@
+node_modules/
+dist/
+coverage/
+.turbo/
+test-results/
+playwright-report/
+blob-report/
+.env
+.env.*
+!.env.example
+.DS_Store
+*.log
+
+data/
+
+# 外部参考仓库保留自己的 Git 历史
+/research/repos/
+
+# 评测每次运行产生新的结果文件，历史记录仍保留在版本库中
+/evals/results/
