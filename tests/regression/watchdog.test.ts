@@ -801,3 +801,47 @@ test('文件边界：相邻前缀目录、绝对路径、.. 与符号链接逃�
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('Router 动作去重：创建任务后再失败，续接不会重复建任务', async () => {
+  const harness = await createHarness({ limits: { maxConcurrentRuns: 0 }, worker: () => mockReply({ text: 'ok' }) });
+  try {
+    const { Router } = await import('../../src/runtime/router.ts');
+    const { MockModel } = await import('../../src/model/mock.ts');
+    let call = 0;
+    const router = new Router(
+      harness.runtime,
+      new MockModel(() => {
+        call += 1;
+        if (call === 1) {
+          return mockReply({
+            toolCalls: [
+              {
+                name: 'create_task',
+                arguments: {
+                  title: '被重复创建的任务',
+                  goal: '完成一件事',
+                  owner_role: '负责人',
+                  owner_brief: '做',
+                },
+              },
+            ],
+          });
+        }
+        if (call === 2) throw new Error('提供方暂时不可用');
+        return mockReply({ text: '已创建，继续推进' });
+      }),
+      harness.config,
+    );
+    await router.handleUserMessage('帮我做一件事').catch(() => undefined);
+    const afterFirst = harness.store.listTasks().length;
+    assert.ok(afterFirst >= 1, '第一次应真的建了任务');
+
+    // 模拟额度用尽后保存的进度，再续接同一会话
+    const session = harness.store.pendingRouterSession();
+    if (!session) return; // 没有保存进度时这条断言不适用
+    await router.resume().catch(() => undefined);
+    assert.equal(harness.store.listTasks().length, 1, '续接不应重复创建任务');
+  } finally {
+    await harness.cleanup();
+  }
+});

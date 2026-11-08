@@ -86,6 +86,7 @@ export class Router {
 
   private readonly readOnly: boolean;
   private resumeMessages: ChatMessage[] | null = null;
+  private resumeSessionId: string | null = null;
   private lastRunFailed = false;
 
   constructor(runtime: Runtime, model: ModelClient, config: Config, options: { readOnly?: boolean } = {}) {
@@ -165,7 +166,7 @@ export class Router {
     this.publish({ type: 'router.start' });
 
     // 调度轮数是本次运行的额度，不是失败条件：用完就保存进度，下次 tick 接着做。
-    const sessionId = `rs_${randomBytes(4).toString('hex')}`;
+    const sessionId = this.resumeSessionId ?? `rs_${randomBytes(4).toString('hex')}`;
     const maxRounds = Math.max(1, this.config.limits.maxRouterRounds);
     for (let step = 0; step < maxRounds; step += 1) {
       const result = await this.model.chat({
@@ -197,8 +198,24 @@ export class Router {
         return;
       }
 
-      for (const call of result.toolCalls) {
+      for (let index = 0; index < result.toolCalls.length; index += 1) {
+        const call = result.toolCalls[index]!;
+        // 内部动作使用稳定标识：同一会话里同一个调用恢复后返回原结果，
+        // 不会因为重试而重复建任务、重复追加要求。
+        const actionKey = `${step}:${index}:${call.name}`;
+        const cached = this.runtime.store.getRouterAction(sessionId, actionKey);
+        if (cached) {
+          messages.push({ role: 'tool', content: cached.result, toolCallId: call.id });
+          continue;
+        }
         const content = await this.executeTool(call.name, call.arguments);
+        this.runtime.store.saveRouterAction({
+          id: `ra_${randomBytes(4).toString('hex')}`,
+          sessionId,
+          actionKey,
+          tool: call.name,
+          result: content,
+        });
         messages.push({ role: 'tool', content, toolCallId: call.id });
       }
     }
@@ -227,7 +244,9 @@ export class Router {
       (message): message is ChatMessage => typeof message === 'object' && message !== null && message.role !== 'system',
     );
     const local = this.resumeMessages;
+    const localSession = this.resumeSessionId;
     this.resumeMessages = restored;
+    this.resumeSessionId = session.id;
     this.lastRunFailed = false;
     try {
       await this.handleUserMessage('（继续上次未完成的协调工作，不要重复已经完成的操作）');
@@ -239,6 +258,7 @@ export class Router {
       throw error;
     } finally {
       this.resumeMessages = local;
+      this.resumeSessionId = localSession;
     }
   }
 

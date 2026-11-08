@@ -153,6 +153,16 @@ CREATE TABLE IF NOT EXISTS router_session (
 );
 CREATE INDEX IF NOT EXISTS idx_router_session_status ON router_session(status);
 
+CREATE TABLE IF NOT EXISTS router_action (
+  id         TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  action_key TEXT NOT NULL,
+  tool       TEXT NOT NULL,
+  result     TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_router_action_key ON router_action(session_id, action_key);
+
 CREATE TABLE IF NOT EXISTS behavior_override (
   id         TEXT PRIMARY KEY,
   key        TEXT NOT NULL,

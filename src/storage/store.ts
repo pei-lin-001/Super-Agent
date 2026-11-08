@@ -663,6 +663,18 @@ export class Store {
     this.run('UPDATE router_session SET status = ?, updated_at = ? WHERE id = ?', status, nowIso(), id);
   }
 
+  getRouterAction(sessionId: string, actionKey: string): { tool: string; result: string } | null {
+    const row = this.get('SELECT tool, result FROM router_action WHERE session_id = ? AND action_key = ?', sessionId, actionKey);
+    return row ? { tool: str(row['tool']), result: str(row['result']) } : null;
+  }
+
+  saveRouterAction(input: { id: string; sessionId: string; actionKey: string; tool: string; result: string }): void {
+    this.run(
+      `INSERT OR IGNORE INTO router_action (id, session_id, action_key, tool, result, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+      input.id, input.sessionId, input.actionKey, input.tool, input.result, nowIso(),
+    );
+  }
+
   activeOverride(key: string): { version: number; content: string } | null {
     const row = this.get(
       'SELECT version, content FROM behavior_override WHERE key = ? AND active = 1 ORDER BY version DESC LIMIT 1',
