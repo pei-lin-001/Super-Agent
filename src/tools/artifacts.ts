@@ -21,7 +21,13 @@ export const artifactTools: ToolDefinition[] = [
       const name = argString(args, 'name');
       const raw = args['content'];
       if (typeof raw !== 'string') throw new Error('参数 content 必须是字符串');
-      const artifact = context.host.saveArtifact(context.worker, name, raw);
+      const { artifact, reused } = context.host.saveArtifact(context.worker, name, raw);
+      if (reused) {
+        return ok(
+          `内容与当前最新版本完全相同，已复用 ${artifact.name} v${artifact.version}（id=${artifact.id}），没有创建新版本。` +
+            '复用不会自动获得检查通过；如果要求检查，仍需针对这个版本取得结论。',
+        );
+      }
       return ok(
         `已保存产物 ${artifact.name} v${artifact.version}（id=${artifact.id}，${artifact.bytes} 字节，sha256=${artifact.sha256.slice(0, 12)}…）`,
       );

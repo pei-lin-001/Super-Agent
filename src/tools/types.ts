@@ -1,4 +1,15 @@
-import type { Artifact, MessageKind, MessageRefs, ReviewOutcome, Task, Worker } from '../domain/types.ts';
+import { ToolError } from './paths.ts';
+import type {
+  Artifact,
+  Message,
+  MessageKind,
+  MessageRefs,
+  ReviewOutcome,
+  Task,
+  Worker,
+  WorkerNote,
+  WorkerTurn,
+} from '../domain/types.ts';
 
 export interface CreateCollaboratorResult {
   ok: boolean;
@@ -67,11 +78,19 @@ export interface ToolHost {
   registerWait(worker: Worker, options: WaitOptions): WaitResult;
   submitResult(worker: Worker, summary: string, artifactNames: string[]): Promise<SubmitResult>;
   report(worker: Worker, kind: 'progress' | 'fail' | 'question', body: string, refs?: MessageRefs): ReportResult;
-  saveArtifact(worker: Worker, name: string, content: string): Artifact;
+  saveArtifact(worker: Worker, name: string, content: string): { artifact: Artifact; reused: boolean };
   listArtifacts(taskId: string): Artifact[];
   getArtifact(id: string): Artifact | null;
   readArtifactVersion(taskId: string, name: string, version?: number | null): Promise<{ artifact: Artifact; content: string }>;
   isCancelled(taskId: string): boolean;
+  /** 只能查自己的历史；调用方已在工具层限定为当前 Worker。 */
+  searchWorkerTurns(
+    workerId: string,
+    options: { fromSeq: number; toSeq: number; role: string | null; limit: number },
+  ): WorkerTurn[];
+  listWorkerTurnsRange(workerId: string, fromSeq: number, toSeq: number): WorkerTurn[];
+  getMessageForWorker(workerId: string, messageId: string): Message | null;
+  listWorkerNotes(workerId: string): WorkerNote[];
 }
 
 export interface ToolContext {
@@ -112,6 +131,13 @@ export function argOptionalString(args: Record<string, unknown>, name: string): 
   if (value === undefined || value === null || value === '') return null;
   if (typeof value !== 'string') throw new Error(`参数 ${name} 必须是字符串`);
   return value;
+}
+
+export function argNumber(args: Record<string, unknown>, name: string): number {
+  const value = args[name];
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value))) return Number(value);
+  throw new ToolError(`参数 ${name} 必须是数字`);
 }
 
 export function argOptionalNumber(args: Record<string, unknown>, name: string): number | null {
