@@ -85,6 +85,8 @@ export class Router {
   private readonly config: Config;
 
   private readonly readOnly: boolean;
+  private continuePending = false;
+  private resumeMessages: ChatMessage[] | null = null;
 
   constructor(runtime: Runtime, model: ModelClient, config: Config, options: { readOnly?: boolean } = {}) {
     this.runtime = runtime;
@@ -132,14 +134,15 @@ export class Router {
       )
       .join('\n');
 
+    const history = this.resumeMessages
+      ? this.resumeMessages
+      : this.runtime.store.listRouterTurns(20).map((turn): ChatMessage => ({ role: turn.role, content: turn.content }));
     const messages: ChatMessage[] = [
       {
         role: 'system',
         content: routerSystemPrompt({ taskCards: this.renderTaskCards(), pendingMessages: pending }),
       },
-      ...this.runtime.store.listRouterTurns(20).map(
-        (turn): ChatMessage => ({ role: turn.role, content: turn.content }),
-      ),
+      ...history,
     ];
 
     if (userText !== null) {
@@ -156,7 +159,10 @@ export class Router {
 
     this.publish({ type: 'router.start' });
 
-    for (let step = 0; step < 6; step += 1) {
+    // 调度轮数是本次运行的额度，不是失败条件：用完就保存进度，下次 tick 接着做。
+    const sessionId = `rs_${randomBytes(4).toString('hex')}`;
+    const maxRounds = Math.max(1, this.config.limits.maxRouterRounds);
+    for (let step = 0; step < maxRounds; step += 1) {
       const result = await this.model.chat({
         model: this.config.routerModel,
         messages,
@@ -192,7 +198,35 @@ export class Router {
       }
     }
 
-    this.publish({ type: 'router.notice', text: 'Router 达到单轮步数上限，已结束本轮。' });
+    // 保存未完成的协调过程，下一轮继续；不依赖新的用户消息，也不重复已完成动作。
+    this.runtime.store.saveRouterSession({
+      id: sessionId,
+      taskId: null,
+      messages: messages.filter((message) => message.role !== 'system'),
+      reason: `达到单轮调度额度 ${maxRounds}`,
+    });
+    this.runtime.store.appendEvent(null, null, 'router.suspended', `达到单轮调度额度 ${maxRounds}，已保存进度`);
+    this.publish({ type: 'router.notice', text: `Router 达到单轮调度额度 ${maxRounds}，已保存进度，稍后继续。` });
+    this.continuePending = true;
+  }
+
+  /** 有保存的协调过程时，由调度器继续推进，而不是等用户再说话。 */
+  hasPendingSession(): boolean {
+    return this.continuePending;
+  }
+
+  async resume(): Promise<void> {
+    const session = this.runtime.store.pendingRouterSession();
+    if (!session) {
+      this.continuePending = false;
+      return;
+    }
+    const restored = (session.messages as ChatMessage[]).filter((message) => message.role !== 'system');
+    this.runtime.store.closeRouterSession(session.id, 'abandoned');
+    this.continuePending = false;
+    this.resumeMessages = restored;
+    await this.handleUserMessage('（继续上次未完成的协调工作，不要重复已经完成的操作）');
+    this.resumeMessages = null;
   }
 
   private consume(messageId: string): void {

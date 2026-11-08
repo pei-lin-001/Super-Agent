@@ -26,6 +26,8 @@ export function workerSystemPrompt(input: {
   noteStaleEpoch: number | null;
   noteCoveredSeq: number;
   windowSummary: string;
+  /** 维护者在线调整的行为覆盖（已激活版本），只影响措辞与工作方式，不改程序约束。 */
+  override?: { content: string; version: number } | null;
 }): string {
   const { task, worker, collaborators, isOwner, taskFacts, artifactTable, noteText, noteStaleEpoch } = input;
   const collabLines =
@@ -54,6 +56,7 @@ export function workerSystemPrompt(input: {
 - 任务：${task.title}
 - 背景材料与约束：${task.brief || '（无）'}
 
+${input.override ? `# 维护者调整（v${input.override.version}，仅调整工作方式，不改变程序约束）\n${input.override.content}\n` : ''}
 # 任务状态（程序记录，以此为准）
 ${taskFacts}
 

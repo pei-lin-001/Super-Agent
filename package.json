@@ -10,11 +10,13 @@
   },
   "scripts": {
     "start": "node --env-file-if-exists=.env.local src/main.ts",
+    "watchdog": "node --env-file-if-exists=.env.local src/watchdog/main.ts",
     "dev": "node --env-file-if-exists=.env.local --watch src/main.ts",
     "typecheck": "tsc --noEmit",
     "test": "node --test --test-concurrency=1 \"tests/**/*.test.ts\"",
     "smoke:mini": "node --env-file-if-exists=.env.local scripts/smoke-mini.ts",
     "smoke:real": "node --env-file-if-exists=.env.local scripts/smoke-real.ts",
+    "smoke:toolkit": "node --env-file-if-exists=.env.local scripts/smoke-toolkit.ts",
     "format": "prettier --write ."
   },
   "devDependencies": {

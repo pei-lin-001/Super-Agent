@@ -12,13 +12,19 @@ export interface Limits {
   maxWorkersPerGroup: number;
   maxTotalWorkers: number;
   maxStepsPerRun: number;
+  /** 累计调用软阈值：>0 时只记录预算事件并继续，不再直接失败（0=不提醒）。 */
   maxStepsPerWorker: number;
   maxStepsPerGroup: number;
   maxRequestHops: number;
   messageTtlMinutes: number;
   waitTimeoutMs: number;
   modelRetry: number;
+  /** 连续只输出文本、不调用工具的容忍次数；超过后交给 Watchdog 诊断，不再直接失败。 */
   maxNudges: number;
+  /** Router 单次运行的调度轮数上限，超出后保存进度并在下次 tick 继续。 */
+  maxRouterRounds: number;
+  /** Watchdog 巡检间隔（毫秒）。 */
+  watchdogIntervalMs: number;
   /** 近期历史窗口的字符预算（字符数，不是 token）。 */
   contextWindowChars: number;
   /** 组装后允许的额外配对扩展量。 */
@@ -101,13 +107,16 @@ export function loadConfig(options: { requireModel?: boolean } = {}): Config {
       maxWorkersPerGroup: intEnv('MAX_WORKERS_PER_GROUP', 6),
       maxTotalWorkers: intEnv('MAX_TOTAL_WORKERS', 12),
       maxStepsPerRun: intEnv('MAX_STEPS_PER_RUN', 8),
-      maxStepsPerWorker: intEnv('MAX_STEPS_PER_WORKER', 24),
-      maxStepsPerGroup: intEnv('MAX_STEPS_PER_GROUP', 160),
+      // 旧环境变量仍被读取，但语义已改为软阈值：达到只记录预算事件，不再让 Worker 失败。
+      maxStepsPerWorker: intEnv('MAX_STEPS_PER_WORKER', 0),
+      maxStepsPerGroup: intEnv('MAX_STEPS_PER_GROUP', 0),
       maxRequestHops: intEnv('MAX_REQUEST_HOPS', 4),
       messageTtlMinutes: intEnv('MESSAGE_TTL_MINUTES', 30),
       waitTimeoutMs: intEnv('WAIT_TIMEOUT_SECONDS', 300) * 1000,
       modelRetry: intEnv('MODEL_RETRY', 2),
       maxNudges: 3,
+      maxRouterRounds: intEnv('MAX_ROUTER_ROUNDS', 6),
+      watchdogIntervalMs: intEnv('WATCHDOG_INTERVAL_MS', 60_000),
       contextWindowChars: intEnv('CONTEXT_WINDOW_CHARS', 16_000),
       pairingOvershootChars: intEnv('CONTEXT_PAIRING_OVERSHOOT_CHARS', 2_000),
       noteTriggerTurns: intEnv('NOTE_TRIGGER_TURNS', 10),

@@ -31,6 +31,8 @@ const BASE_LIMITS: Limits = {
   waitTimeoutMs: 400,
   modelRetry: 0,
   maxNudges: 3,
+  maxRouterRounds: 6,
+  watchdogIntervalMs: 60_000,
   contextWindowChars: 16_000,
   pairingOvershootChars: 2_000,
   noteTriggerTurns: 10,

@@ -80,6 +80,10 @@ export interface CreateTaskInput {
 export interface RouterBridge {
   notify(): void;
   handleUserMessage(text: string): Promise<void>;
+  /** 有达到单轮额度后保存的协调进度。 */
+  hasPendingSession?(): boolean;
+  /** 继续上次保存的协调进度。 */
+  resume?(): Promise<void>;
 }
 
 export class Runtime implements ToolHost {
@@ -1060,6 +1064,9 @@ export class Runtime implements ToolHost {
    * 这样既保证「跑完再来」，又保证同一 Worker 同时只有一个执行过程。
    */
   enqueue(workerId: string): void {
+    const target = this.store.getWorker(workerId);
+    const targetTask = target ? this.store.getTaskByGroup(target.groupId) : null;
+    if (targetTask && Number(targetTask.maintenance ?? 0) === 1) return;
     if (this.stopped) return;
     const worker = this.store.getWorker(workerId);
     if (!worker || isTerminalWorker(worker.status)) return;
@@ -1125,14 +1132,8 @@ export class Runtime implements ToolHost {
         this.store.setWorkerStatus(workerId, 'cancelled', `任务已 ${task.status}`);
         return;
       }
-      if (worker.stepCount >= this.config.limits.maxStepsPerWorker) {
-        await this.failWorker(workerId, `步数达到上限 ${this.config.limits.maxStepsPerWorker}`);
-        return;
-      }
-      if (this.store.groupStepTotal(worker.groupId) >= this.config.limits.maxStepsPerGroup) {
-        await this.failTask(task.id, `群组步数达到上限 ${this.config.limits.maxStepsPerGroup}`);
-        return;
-      }
+      // 累计调用不再作为失败条件。阈值 >0 时只记录一次预算事件，任务继续推进。
+      this.noteBudget(worker, task);
 
       this.ensureOpeningTurn(workerId);
       const inbox = this.store.listInbox(workerId);
@@ -1210,11 +1211,129 @@ export class Runtime implements ToolHost {
     }
   }
 
+  /**
+   * 预算提醒：达到软阈值只写事件，不改变执行。
+   * 真正的资源约束是并发、执行时限和每轮调度额度。
+   */
+  private noteBudget(worker: Worker, task: Task): void {
+    const workerLimit = this.config.limits.maxStepsPerWorker;
+    if (workerLimit > 0 && worker.stepCount >= workerLimit) {
+      this.store.appendEvent(task.id, worker.id, 'budget.worker', `已执行 ${worker.stepCount} 步（提醒阈值 ${workerLimit}）`);
+    }
+    const groupLimit = this.config.limits.maxStepsPerGroup;
+    if (groupLimit > 0) {
+      const total = this.store.groupStepTotal(worker.groupId);
+      if (total >= groupLimit) {
+        this.store.appendEvent(task.id, worker.id, 'budget.group', `群组已执行 ${total} 步（提醒阈值 ${groupLimit}）`);
+      }
+    }
+  }
+
+  /** Router 有保存的协调进度时自动继续，不等用户再说话。 */
+  private pumpRouter(): void {
+    const router = this.router;
+    if (!router || this.stopped) return;
+    if (!router.hasPendingSession?.()) return;
+    void router.resume?.().catch((error: unknown) => {
+      this.store.appendEvent(null, null, 'router.resume_failed', (error as Error).message);
+    });
+  }
+
+  /**
+   * 执行控制命令。命令由外部维护者写入，主系统在自己的调度里执行，
+   * 这样维护动作走的是既有不变量，而不是直接改数据库。
+   */
+  private drainControls(): void {
+    if (this.stopped) return;
+    for (const command of this.store.listPendingControls()) {
+      try {
+        const payload = command.payload ? (JSON.parse(command.payload) as Record<string, unknown>) : {};
+        const result = this.applyControl(command.command, payload);
+        this.store.finishControl(command.id, result.ok ? 'done' : 'failed', result.message);
+        this.store.appendEvent(null, null, 'control.applied', `${command.command}: ${result.message}`);
+      } catch (error) {
+        this.store.finishControl(command.id, 'failed', (error as Error).message);
+      }
+    }
+  }
+
+  private applyControl(command: string, payload: Record<string, unknown>): { ok: boolean; message: string } {
+    const str = (key: string): string => (typeof payload[key] === 'string' ? (payload[key] as string) : '');
+    switch (command) {
+      case 'pause_task': {
+        const taskId = str('taskId');
+        const task = this.store.getTask(taskId);
+        if (!task) return { ok: false, message: `任务不存在：${taskId}` };
+        if (isTerminalTask(task.status)) return { ok: false, message: `任务已 ${task.status}` };
+        this.store.setMaintenance(taskId, true);
+        this.store.appendEvent(taskId, null, 'task.maintenance', str('reason') || '维护挂起');
+        for (const job of this.store.listRunningJobs(taskId)) {
+          this.store.appendEvent(taskId, job.workerId, 'job.kept', `${job.id} 维护挂起期间保留运行`);
+        }
+        return { ok: true, message: `任务 ${taskId} 已挂起，正在运行的作业保留` };
+      }
+      case 'resume_task': {
+        const taskId = str('taskId');
+        const task = this.store.getTask(taskId);
+        if (!task) return { ok: false, message: `任务不存在：${taskId}` };
+        this.store.setMaintenance(taskId, false);
+        this.store.appendEvent(taskId, null, 'task.resumed', str('reason') || '维护恢复');
+        for (const worker of this.store.listGroupWorkers(task.groupId)) {
+          if (worker.status === 'waiting') {
+            for (const wait of this.store.listActiveWaitsForWorker(worker.id)) {
+              if (wait.reason === 'maintenance') this.store.resolveWait(wait.id);
+            }
+          }
+          if (!isTerminalWorker(worker.status) && worker.status !== 'running') this.enqueue(worker.id);
+        }
+        return { ok: true, message: `任务 ${taskId} 已恢复调度` };
+      }
+      case 'nudge_worker': {
+        const workerId = str('workerId');
+        const worker = this.store.getWorker(workerId);
+        if (!worker) return { ok: false, message: `Worker 不存在：${workerId}` };
+        if (isTerminalWorker(worker.status)) return { ok: false, message: `Worker 已 ${worker.status}` };
+        this.pushSystemNotice(workerId, str('text') || '维护者提醒：请核对当前方向是否仍在推进任务目标。', {
+          wake: 'force',
+        });
+        return { ok: true, message: `已提醒 ${workerId}` };
+      }
+      case 'set_override': {
+        const key = str('key');
+        if (key === '') return { ok: false, message: '缺少 key' };
+        const { version } = this.store.insertOverride({
+          id: `ov_${newMessageId().slice(4)}`,
+          key,
+          content: str('content'),
+          reason: str('reason') || '未说明',
+          author: str('author') || 'watchdog',
+        });
+        this.store.appendEvent(null, null, 'behavior.override', `${key} v${version} 已生效（下一次构建提示词时读取）`);
+        return { ok: true, message: `${key} v${version} 已激活` };
+      }
+      case 'rollback_override': {
+        const key = str('key');
+        const version = Number(payload['version'] ?? 0);
+        const ok = this.store.rollbackOverride(key, version);
+        return ok
+          ? { ok: true, message: `${key} 已回滚到 v${version}` }
+          : { ok: false, message: `找不到 ${key} v${version}` };
+      }
+      default:
+        return { ok: false, message: `未知控制命令：${command}` };
+    }
+  }
+
   /** 为未执行的调用补一条明确的 tool 记录，不伪造成功。 */
   private recordUnexecuted(worker: Worker, calls: ToolCall[], reason: string): void {
     for (const call of calls) {
       this.recordToolTurn(worker, call, `[未执行] ${call.name}：${reason}`);
     }
+  }
+
+  /** 当前生效的行为覆盖；每次构建提示词时读取，改了下一轮就生效。 */
+  private currentOverride(): { content: string; version: number } | null {
+    return this.store.activeOverride('worker.check_rules');
   }
 
   private planFor(worker: Worker): HistoryPlan {
@@ -1287,6 +1406,7 @@ export class Runtime implements ToolHost {
       noteStaleEpoch: note && note.epoch !== task.reviewEpoch ? note.epoch : null,
       noteCoveredSeq: note?.coveredSeq ?? 0,
       windowSummary: `近期窗口含 ${plan.turns.length} 条，历史共 ${plan.totalTurns} 条（约 ${plan.totalChars} 字符）`,
+      override: this.currentOverride(),
     });
     const history = this.buildHistory(worker, plan);
     // 无论窗口怎么裁，请求里都必须有一条 user 轮次，否则提供方可能返回空结果。
@@ -1477,11 +1597,16 @@ export class Runtime implements ToolHost {
   }
 
   /** 供测试与外部组件投递系统通知。 */
-  notifySystem(workerId: string, body: string): void {
-    this.pushSystemNotice(workerId, body);
+  notifySystem(workerId: string, body: string, options: { wake?: 'none' | 'force' } = {}): void {
+    this.pushSystemNotice(workerId, body, options);
   }
 
-  private pushSystemNotice(workerId: string, body: string): void {
+  /**
+   * 投递系统通知。默认只投递，不解除等待：
+   * 退避中的等待、作业等待、维护挂起都不应因为一条通知就恢复。
+   * 只有明确「依赖对象已消失」时才用 wake='force'。
+   */
+  private pushSystemNotice(workerId: string, body: string, options: { wake?: 'none' | 'force' } = {}): void {
     const worker = this.store.getWorker(workerId);
     if (!worker) return;
     const task = this.store.getTaskByGroup(worker.groupId);
@@ -1506,8 +1631,7 @@ export class Runtime implements ToolHost {
       consumedAt: null,
       error: null,
     });
-    // 通知代表状态变化。等待中的 Worker 必须醒来看一眼，
-    // 否则它等的对象（比如已经失败的协作者）永远不会再回话。
+    if (options.wake !== 'force') return;
     const current = this.store.getWorker(workerId);
     if (!current || current.status !== 'waiting') return;
     for (const wait of this.store.listActiveWaitsForWorker(workerId)) {
@@ -1570,7 +1694,9 @@ export class Runtime implements ToolHost {
     }
     const owner = task.ownerWorkerId ? this.store.getWorker(task.ownerWorkerId) : null;
     if (owner && !isTerminalWorker(owner.status)) {
-      this.pushSystemNotice(owner.id, `协作者 ${workerId} 失败：${reason}。请决定是否重试、改派或自己完成。`);
+      this.pushSystemNotice(owner.id, `协作者 ${workerId} 失败：${reason}。请决定是否重试、改派或自己完成。`, {
+        wake: 'force',
+      });
       this.enqueue(owner.id);
     }
   }
@@ -1596,6 +1722,8 @@ export class Runtime implements ToolHost {
   }
 
   tick(): void {
+    this.drainControls();
+    this.pumpRouter();
     const now = Date.now();
     for (const wait of this.store.listActiveWaits()) {
       if (new Date(wait.deadlineAt).getTime() > now) continue;
@@ -1612,6 +1740,7 @@ export class Runtime implements ToolHost {
         this.pushSystemNotice(
           worker.id,
           `等待作业超时，作业可能仍在运行。用 proc_read 查看当前输出，或再次 proc_wait。`,
+          { wake: 'force' },
         );
         this.enqueue(worker.id);
         continue;

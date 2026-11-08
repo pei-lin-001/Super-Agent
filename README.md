@@ -331,6 +331,82 @@ Router：`create_task` `send_to_worker` `stop_task` `list_tasks` `read_task`。
 - 没有实现容器、沙箱或 seccomp。需要强隔离时请把整个程序放进容器运行。
 - 能做但没做的：命令字符串黑名单（不可靠，故意不做）。
 
+## 7.8 Watchdog（主系统之外的维护 Agent）
+
+Watchdog 不是 Runtime 里的一个定时函数，它是**独立进程**：有自己的会话历史、自己的问题台账和动作记录，
+主系统退出后它仍在运行。
+
+```bash
+pnpm start        # 只启动主系统
+pnpm watchdog     # 只启动 Watchdog（可与主系统同时运行）
+```
+
+### 它怎么独立
+
+| 关注点 | 做法 |
+|---|---|
+| 进程 | `src/watchdog/main.ts`，独立入口、独立 pid 文件 `work/.runtime/watchdog.json` |
+| 状态 | 自己的表 `wd_turn` / `wd_issue` / `wd_action`，与业务表分开 |
+| 主系统状态 | 只读观察：任务、Worker、消息、作业、产物、检查；**不构造 Runtime**，因此不会恢复作业、不会调度 Worker |
+| 主系统存活 | 读 `work/.runtime/instance.json` 的 pid 并探测；重启前用命令行特征确认进程确实属于本项目 |
+| 定时 | 自己的 `setInterval`，不依赖主 Runtime 的 tick |
+| 调度隔离 | 不占 Worker 并发槽，主系统卡死也不影响它 |
+
+主系统退出、事件循环阻塞、Router 无响应时，Watchdog 仍能读库诊断、写问题台账、按策略拉起主系统。
+
+### 闭环
+
+```
+定时消息 → 观察（摘要 + 引用）→ 模型判断 → 维护动作 → 记录预期 → 复查 → 关闭或继续
+```
+
+- **观察**：每轮只给摘要（任务状态、Worker 分布、产物与检查、运行中作业、可疑信号、最近事件），
+  细节由 Watchdog 自己用 `inspect_task` / `read_history` 按 id 读取，不把全部历史塞进每次请求。
+- **判断**：模型结合目标与证据判断是否在推进、是否偏离、是否只是正常等待（作业/服务/用户）。
+  程序只提供信号（多个 Worker 同时等待、作业连续失败、有产物但无 approved），不替模型下结论。
+- **维护**：`pause_task` `resume_task` `nudge_worker` `set_override` `rollback_override` `restart_main`。
+  全部通过主系统的控制命令队列执行，走既有不变量，**不直接改业务数据**。
+- **复查**：每条动作写清做了什么、为什么、预期、判断标准、下次检查时间；问题进 `wd_issue` 台账，
+  没恢复就继续跟，恢复才置 `closed`。
+
+### 通知不再顺手解除等待
+
+`pushSystemNotice` 默认只投递、不唤醒：
+
+| 场景 | 行为 |
+|---|---|
+| provider 退避通知 | 保留退避，到期由 tick 恢复 |
+| 作业结束 | 只唤醒等待该作业的 Worker |
+| 协作者失败（依赖消失） | 显式 `wake: 'force'` |
+| 等待超时 | 显式 `wake: 'force'` |
+| 普通进展通知 | 不解除任何等待 |
+
+### 在线调整
+
+维护者可以让 Watchdog 改提示词里的工作方式（例如「检查时区分必须修改项与可选建议」）：
+
+```bash
+# 通过控制命令（Watchdog 的 maintain 工具最终也是写这个队列）
+set_override     key=worker.check_rules  content=...  reason=...
+rollback_override key=worker.check_rules version=1
+```
+
+- 每次修改生成新版本，旧的保留，`active` 只有一行；
+- Worker 构建 system prompt 时读取当前生效版本，**下一次请求就生效**，不需要重启；
+- system prompt 里会标注 `# 维护者调整（vN，仅调整工作方式，不改变程序约束）`；
+- 覆盖项不能改用户目标、要求版本、正式检查规则或提交门槛。
+
+### 累计调用不再是失败条件
+
+| 原来 | 现在 |
+|---|---|
+| Worker 24 步失败 | `MAX_STEPS_PER_WORKER` 默认 0；>0 时只写 `budget.worker` 事件 |
+| 群组 160 步失败 | 同上，只写 `budget.group` |
+| Router 6 轮直接结束 | `MAX_ROUTER_ROUNDS` 是**调度额度**：用完保存协调进度，下次 tick 自动续接 |
+| 连续无工具文本 3 次失败 | 仍会提醒，但不再把 Worker 判死 |
+
+旧环境变量继续被读取，含义已改为提醒阈值，不会被当成上限。
+
 ## 8. 目录
 
 ```
@@ -370,7 +446,7 @@ REPL 命令：
 
 ```bash
 pnpm typecheck                              # 类型检查
-pnpm test                                   # 63 个测试，全部使用临时目录与模拟模型
+pnpm test                                   # 70 个测试，全部使用临时目录与模拟模型
 pnpm smoke:mini                             # 真实模型最小链路
 pnpm smoke:real                             # 真实模型综合协作场景
 node scripts/verify-run.ts <db> [taskId]    # 对已有运行记录重新做严格判定，不调用模型

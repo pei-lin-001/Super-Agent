@@ -4,6 +4,8 @@ import { Router } from './runtime/router.ts';
 import { Runtime } from './runtime/runtime.ts';
 import { Store } from './storage/store.ts';
 import { startRepl } from './ui/repl.ts';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 
 async function main(): Promise<void> {
   let config;
@@ -20,6 +22,22 @@ async function main(): Promise<void> {
   }
 
   const store = new Store(config.dbPath);
+  // 实例文件：Watchdog 靠它判断主系统是活着还是已经退出。
+  const instancePath = join(config.workDir, '.runtime', 'instance.json');
+  mkdirSync(dirname(instancePath), { recursive: true });
+  writeFileSync(
+    instancePath,
+    JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), dbPath: config.dbPath }, null, 2),
+    'utf8',
+  );
+  const clearInstance = (): void => {
+    try {
+      writeFileSync(instancePath, JSON.stringify({ pid: 0, startedAt: new Date().toISOString(), dbPath: config.dbPath }), 'utf8');
+    } catch {
+      // 退出路径不因为写文件失败而阻塞。
+    }
+  };
+  process.on('exit', clearInstance);
   const workerModel = new OpenAICompatibleModel({
     baseUrl: config.baseUrl,
     apiKey: config.apiKey,

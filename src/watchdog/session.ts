@@ -1,0 +1,268 @@
+import { randomBytes } from 'node:crypto';
+import { nowIso } from '../domain/ids.ts';
+import { isTerminalTask } from '../domain/state.ts';
+import type { ChatMessage, ModelClient, ToolSchema } from '../model/types.ts';
+import type { Store } from '../storage/store.ts';
+import type { Config } from '../config.ts';
+import { observe, renderObservation } from './observer.ts';
+import { observationPrompt, WATCHDOG_SYSTEM } from './prompts.ts';
+
+const WD_TOOLS: ToolSchema[] = [
+  {
+    name: 'inspect_task',
+    description: '读取一个任务的详细证据：Worker 分支、最近消息、最近工具调用与结果、作业、产物与检查。',
+    parameters: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string' },
+        worker_id: { type: 'string', description: '只读某个 Worker 的历史' },
+        limit: { type: 'number', description: '返回条数，默认 15' },
+      },
+      required: ['task_id'],
+    },
+  },
+  {
+    name: 'read_history',
+    description: '读取某个 Worker 的近期原始历史（含工具调用与结果），用于判断是否在原地打转。',
+    parameters: {
+      type: 'object',
+      properties: {
+        worker_id: { type: 'string' },
+        limit: { type: 'number', description: '默认 20 条' },
+      },
+      required: ['worker_id'],
+    },
+  },
+  {
+    name: 'maintain',
+    description:
+      '执行维护动作。action 取值：pause_task / resume_task / nudge_worker / set_override / rollback_override / restart_main。' +
+      '动作走主系统维护接口，不直接改业务数据。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string' },
+        task_id: { type: 'string' },
+        worker_id: { type: 'string' },
+        text: { type: 'string', description: '给 Worker 的纠偏信息或挂起原因' },
+        key: { type: 'string', description: '覆盖项，例如 worker.check_rules' },
+        content: { type: 'string' },
+        reason: { type: 'string' },
+        version: { type: 'number' },
+      },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'record',
+    description: '记录或关闭一个未解决事件。issue_id 为空表示新建；status=closed 表示已确认恢复。',
+    parameters: {
+      type: 'object',
+      properties: {
+        issue_id: { type: 'string' },
+        task_id: { type: 'string' },
+        title: { type: 'string' },
+        status: { type: 'string', enum: ['open', 'closed'] },
+        note: { type: 'string' },
+        check_after_minutes: { type: 'number', description: '多少分钟后再复查' },
+      },
+      required: ['title'],
+    },
+  },
+];
+
+export interface WatchdogDeps {
+  store: Store;
+  config: Config;
+  model: ModelClient;
+  modelName: string;
+  /** 主系统重启：由外部提供，避免这里直接绑死进程管理细节。 */
+  restartMain?: () => Promise<{ ok: boolean; message: string }>;
+}
+
+export interface WatchdogResult {
+  acted: boolean;
+  summary: string;
+  steps: number;
+}
+
+export class WatchdogSession {
+  private readonly deps: WatchdogDeps;
+
+  constructor(deps: WatchdogDeps) {
+    this.deps = deps;
+  }
+
+  private issueId(): string {
+    return `wdi_${randomBytes(4).toString('hex')}`;
+  }
+
+  private describeTask(taskId: string, limit: number): string {
+    const store = this.deps.store;
+    const task = store.getTask(taskId);
+    if (!task) return `任务不存在：${taskId}`;
+    const lines: string[] = [];
+    lines.push(`# ${task.title}（${task.id}）状态 ${task.status}｜要求版本 ${task.reviewEpoch}`);
+    lines.push(`目标：${task.goal}`);
+    lines.push(`完成条件：${task.doneCriteria || '(未填写)'}`);
+    for (const worker of store.listGroupWorkers(task.groupId)) {
+      lines.push(`\n## Worker ${worker.id}（${worker.role}）${worker.status}｜${worker.stepCount} 步`);
+      const turns = store.listWorkerTurns(worker.id, limit);
+      for (const turn of turns.slice(-limit)) {
+        const calls = turn.toolCalls ? ` 调用:${(turn.toolCalls as { name: string }[]).map((call) => call.name).join(',')}` : '';
+        const body = (turn.content ?? '').replace(/\s+/g, ' ').slice(0, 200);
+        lines.push(`  turn#${turn.seq} ${turn.role}${calls} ${body}`);
+      }
+    }
+    const jobs = store.listJobs(task.id).slice(-8);
+    if (jobs.length > 0) {
+      lines.push('\n## 作业');
+      for (const job of jobs) lines.push(`  ${job.id} ${job.status} exit=${job.exitCode ?? '-'} ${job.command}`);
+    }
+    return lines.join('\n');
+  }
+
+  private async executeTool(name: string, args: Record<string, unknown>): Promise<string> {
+    const store = this.deps.store;
+    const str = (key: string): string => (typeof args[key] === 'string' ? (args[key] as string) : '');
+    const num = (key: string, fallback: number): number =>
+      typeof args[key] === 'number' ? (args[key] as number) : fallback;
+
+    if (name === 'inspect_task') {
+      return this.describeTask(str('task_id'), num('limit', 15));
+    }
+    if (name === 'read_history') {
+      const turns = store.listWorkerTurns(str('worker_id'), num('limit', 20));
+      if (turns.length === 0) return '（没有历史）';
+      return turns
+        .map((turn) => {
+          const calls = turn.toolCalls
+            ? ` 调用:${(turn.toolCalls as { name: string; arguments: string }[])
+                .map((call) => `${call.name}(${call.arguments.slice(0, 120)})`)
+                .join(' ')}`
+            : '';
+          return `turn#${turn.seq} ${turn.role}${calls}\n${(turn.content ?? '').slice(0, 400)}`;
+        })
+        .join('\n---\n');
+    }
+    if (name === 'maintain') {
+      const action = str('action');
+      if (action === 'restart_main') {
+        if (!this.deps.restartMain) return '当前环境没有配置主系统重启能力';
+        const result = await this.deps.restartMain();
+        return result.message;
+      }
+      const payload: Record<string, unknown> = {
+        taskId: str('task_id'),
+        workerId: str('worker_id'),
+        text: str('text') || str('reason'),
+        key: str('key'),
+        content: str('content'),
+        reason: str('reason'),
+        author: 'watchdog',
+        version: num('version', 0),
+      };
+      store.insertControlCommand({
+        id: `cc_${randomBytes(4).toString('hex')}`,
+        command: action,
+        payload: JSON.stringify(payload),
+        source: 'watchdog',
+      });
+      return `已提交维护命令 ${action}，由主系统在下一次调度中执行；执行结果需要后续复查确认。`;
+    }
+    if (name === 'record') {
+      const status = str('status') || 'open';
+      const issueId = str('issue_id') || this.issueId();
+      if (status === 'closed') {
+        store.closeWdIssue(issueId, str('note') || '已恢复');
+        return `事件 ${issueId} 已标记解决`;
+      }
+      const minutes = num('check_after_minutes', 10);
+      const checkAfter = new Date(Date.now() + minutes * 60_000).toISOString();
+      store.upsertWdIssue({
+        id: issueId,
+        taskId: str('task_id') || null,
+        title: str('title'),
+        note: str('note') || '',
+        checkAfter,
+      });
+      return `事件 ${issueId} 已记录，${minutes} 分钟后复查`;
+    }
+    return `未知工具：${name}`;
+  }
+
+  async runOnce(intervalMinutes: number): Promise<WatchdogResult> {
+    const { store, config, model, modelName } = this.deps;
+    const observation = observe(store, config);
+    const issues = store
+      .listOpenIssues()
+      .map((issue) => `- ${issue.id}｜${issue.title}｜尝试 ${issue.attempts} 次｜${issue.note ?? ''}｜复查于 ${issue.checkAfter ?? '-'}`)
+      .join('\n');
+    const actions = store
+      .listWdActions(6)
+      .map((action) => `- ${action.createdAt} ${action.action}｜${action.reason}｜结果：${action.result}`)
+      .join('\n');
+
+    const messages: ChatMessage[] = [
+      { role: 'system', content: WATCHDOG_SYSTEM },
+      ...store.listWdTurns(10).map((turn): ChatMessage => ({ role: turn.role, content: turn.content })),
+      {
+        role: 'user',
+        content: observationPrompt({
+          observation: renderObservation(observation),
+          issues,
+          lastActions: actions,
+          now: nowIso(),
+          intervalMinutes,
+        }),
+      },
+    ];
+
+    let steps = 0;
+    let acted = false;
+    const maxSteps = 8;
+    for (let index = 0; index < maxSteps; index += 1) {
+      const result = await model.chat({
+        model: modelName,
+        messages,
+        tools: WD_TOOLS,
+        reasoningEffort: config.reasoningEffort,
+      });
+      steps += 1;
+      messages.push({
+        role: 'assistant',
+        content: result.text,
+        ...(result.toolCalls.length > 0 ? { toolCalls: result.toolCalls } : {}),
+      });
+      if (result.toolCalls.length === 0) {
+        const answer = result.text?.trim() ?? '';
+        if (answer !== '') {
+          store.appendWdTurn({ id: `wdt_${randomBytes(4).toString('hex')}`, role: 'assistant', content: answer });
+          store.appendWdAction({
+            id: `wda_${randomBytes(4).toString('hex')}`,
+            issueId: null,
+            action: 'inspect',
+            reason: '定时巡检',
+            expected: '',
+            result: answer.slice(0, 400),
+          });
+        }
+        return { acted, summary: answer, steps };
+      }
+      for (const call of result.toolCalls) {
+        let output: string;
+        try {
+          const parsed = JSON.parse(call.arguments || '{}') as Record<string, unknown>;
+          output = await this.executeTool(call.name, parsed);
+          if (call.name === 'maintain' || call.name === 'record') acted = true;
+        } catch (error) {
+          output = `执行失败：${(error as Error).message}`;
+        }
+        messages.push({ role: 'tool', content: output, toolCallId: call.id });
+      }
+    }
+    const summary = '本轮达到工具调用上限，已记录当前观察';
+    store.appendWdTurn({ id: `wdt_${randomBytes(4).toString('hex')}`, role: 'assistant', content: summary });
+    return { acted, summary, steps };
+  }
+}

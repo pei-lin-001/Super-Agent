@@ -452,8 +452,11 @@ test('大输出：完整日志可从作业里按 offset 读回，错误码不会
   }
 });
 
-test('唤醒：等待中的 Worker 收到系统通知后会被唤醒，不会一直挂着', async () => {
-  const harness = await createHarness({ worker: () => ({ text: 'ok', toolCalls: [], finishReason: 'stop' }) as never });
+test('唤醒：普通通知不解除等待，依赖对象消失才强制唤醒', async () => {
+  const harness = await createHarness({
+    worker: () => ({ text: 'ok', toolCalls: [], finishReason: 'stop' }) as never,
+    limits: { maxConcurrentRuns: 0 },
+  });
   try {
     const { task, owner } = harness.runtime.createTask({
       title: '唤醒', goal: 'g', ownerRole: '负责人', ownerBrief: 'b',
@@ -464,12 +467,15 @@ test('唤醒：等待中的 Worker 收到系统通知后会被唤醒，不会一
     harness.store.setWorkerStatus(owner.id, 'waiting');
     assert.equal(harness.store.listActiveWaitsForWorker(owner.id).length, 1);
 
-    // 协作者失败：系统通知必须叫醒等待者，而不是让它一直等一个不会再回话的人
-    harness.runtime.notifySystem(owner.id, `协作者 ${helper.workerId} 失败：步数达到上限 24`);
+    // 普通通知：只投递，不解除等待（退避、作业等待、维护挂起都不能被顺手解除）
+    harness.runtime.notifySystem(owner.id, '这只是进展提醒');
     await new Promise((resolve) => setTimeout(resolve, 50));
-    assert.equal(harness.store.listActiveWaitsForWorker(owner.id).length, 0, '等待应被解除');
-    // 被唤醒后不再停留在 waiting，而是重新进入调度
-    assert.notEqual(harness.store.getWorker(owner.id)?.status, 'waiting');
+    assert.equal(harness.store.listActiveWaitsForWorker(owner.id).length, 1, '普通通知不应解除等待');
+
+    // 依赖对象消失：必须强制唤醒，否则会一直等一个不会再回话的协作者
+    harness.runtime.notifySystem(owner.id, `协作者 ${helper.workerId} 失败：步数达到上限`, { wake: 'force' });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(harness.store.listActiveWaitsForWorker(owner.id).length, 0, '依赖失败应解除等待');
     void task;
   } finally {
     await harness.cleanup();

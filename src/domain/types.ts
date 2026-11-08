@@ -37,7 +37,7 @@ export type MessageKind =
 export type ReviewOutcome = 'pending' | 'approved' | 'changes_required' | 'inconclusive';
 
 /** 等待原因，决定恢复时如何处理。 */
-export type WaitReason = 'reply' | 'provider' | 'user' | 'job';
+export type WaitReason = 'reply' | 'provider' | 'user' | 'job' | 'maintenance';
 
 export interface Task {
   id: string;
@@ -50,6 +50,8 @@ export interface Task {
   requireReview: boolean;
   /** 要求版本号：用户每次补充要求时递增，旧检查不再算数。 */
   reviewEpoch: number;
+  /** 维护挂起：不调度该任务，直到显式恢复。 */
+  maintenance?: number;
   ownerWorkerId: string | null;
   status: TaskStatus;
   closeReason: string | null;

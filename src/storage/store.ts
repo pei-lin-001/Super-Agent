@@ -56,6 +56,7 @@ function mapTask(row: Row): Task {
     doneCriteria: str(row['done_criteria']),
     requireReview: num(row['require_review']) === 1,
     reviewEpoch: num(row['review_epoch'] ?? 0),
+    maintenance: num(row['maintenance'] ?? 0),
     ownerWorkerId: strOrNull(row['owner_worker_id']),
     status: str(row['status']) as TaskStatus,
     closeReason: strOrNull(row['close_reason']),
@@ -230,6 +231,7 @@ export class Store {
       }
     };
     ensureColumn('task', 'review_epoch', 'review_epoch INTEGER NOT NULL DEFAULT 0');
+    ensureColumn('task', 'maintenance', 'maintenance INTEGER NOT NULL DEFAULT 0');
     ensureColumn('message', 'dedupe_key', 'dedupe_key TEXT');
     ensureColumn('message', 'broadcast_id', 'broadcast_id TEXT');
     ensureColumn('wait_record', 'reason', "reason TEXT NOT NULL DEFAULT 'reply'");
@@ -521,6 +523,183 @@ export class Store {
   }
 
   // ---------------- wait ----------------
+
+  setMaintenance(taskId: string, value: boolean): void {
+    this.run('UPDATE task SET maintenance = ?, updated_at = ? WHERE id = ?', value ? 1 : 0, nowIso(), taskId);
+  }
+
+  // ---------------- Watchdog 会话 / 问题 / 动作 ----------------
+
+  appendWdTurn(turn: { id: string; role: 'user' | 'assistant'; content: string }): void {
+    this.run('INSERT INTO wd_turn (id, role, content, created_at) VALUES (?, ?, ?, ?)', turn.id, turn.role, turn.content, nowIso());
+  }
+
+  listWdTurns(limit = 20): { role: 'user' | 'assistant'; content: string; createdAt: string }[] {
+    const rows = this.all('SELECT * FROM wd_turn ORDER BY created_at DESC LIMIT ?', limit);
+    return rows
+      .map((row) => ({ role: str(row['role']) as 'user' | 'assistant', content: str(row['content']), createdAt: str(row['created_at']) }))
+      .reverse();
+  }
+
+  upsertWdIssue(input: {
+    id: string;
+    taskId: string | null;
+    title: string;
+    note: string;
+    checkAfter: string | null;
+  }): void {
+    const now = nowIso();
+    const existing = this.get('SELECT id, attempts FROM wd_issue WHERE id = ?', input.id);
+    if (existing) {
+      this.run(
+        `UPDATE wd_issue SET title = ?, note = ?, check_after = ?, last_seen = ?, attempts = ? WHERE id = ?`,
+        input.title, input.note, input.checkAfter, now, num(existing['attempts']) + 1, input.id,
+      );
+      return;
+    }
+    this.run(
+      `INSERT INTO wd_issue (id, task_id, title, status, attempts, note, check_after, first_seen, last_seen)
+       VALUES (?, ?, ?, 'open', 0, ?, ?, ?, ?)`,
+      input.id, input.taskId, input.title, input.note, input.checkAfter, now, now,
+    );
+  }
+
+  listOpenIssues(): { id: string; taskId: string | null; title: string; attempts: number; note: string | null; checkAfter: string | null }[] {
+    return this.all("SELECT * FROM wd_issue WHERE status = 'open' ORDER BY last_seen ASC").map((row) => ({
+      id: str(row['id']),
+      taskId: strOrNull(row['task_id']),
+      title: str(row['title']),
+      attempts: num(row['attempts']),
+      note: strOrNull(row['note']),
+      checkAfter: strOrNull(row['check_after']),
+    }));
+  }
+
+  closeWdIssue(id: string, note: string): void {
+    this.run("UPDATE wd_issue SET status = 'closed', note = ?, last_seen = ? WHERE id = ?", note, nowIso(), id);
+  }
+
+  appendWdAction(input: { id: string; issueId: string | null; action: string; reason: string; expected: string; result: string }): void {
+    this.run(
+      `INSERT INTO wd_action (id, issue_id, action, reason, expected, result, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      input.id, input.issueId, input.action, input.reason, input.expected, input.result, nowIso(),
+    );
+  }
+
+  listWdActions(limit = 20): { action: string; reason: string; result: string; createdAt: string }[] {
+    return this.all('SELECT * FROM wd_action ORDER BY created_at DESC LIMIT ?', limit).map((row) => ({
+      action: str(row['action']),
+      reason: str(row['reason']),
+      result: str(row['result']),
+      createdAt: str(row['created_at']),
+    }));
+  }
+
+  // ---------------- Router 会话续接 / 行为覆盖 / 控制命令 ----------------
+
+  saveRouterSession(session: { id: string; taskId: string | null; messages: unknown; reason: string | null }): void {
+    const now = nowIso();
+    this.run(
+      `INSERT INTO router_session (id, task_id, messages, reason, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'pending', ?, ?)
+       ON CONFLICT(id) DO UPDATE SET messages = excluded.messages, reason = excluded.reason,
+         status = 'pending', updated_at = excluded.updated_at`,
+      session.id, session.taskId, JSON.stringify(session.messages), session.reason, now, now,
+    );
+  }
+
+  pendingRouterSession(): { id: string; taskId: string | null; messages: unknown; reason: string | null } | null {
+    const row = this.get("SELECT * FROM router_session WHERE status = 'pending' ORDER BY updated_at DESC LIMIT 1");
+    if (!row) return null;
+    return {
+      id: str(row['id']),
+      taskId: strOrNull(row['task_id']),
+      messages: JSON.parse(str(row['messages'])),
+      reason: strOrNull(row['reason']),
+    };
+  }
+
+  closeRouterSession(id: string, status: 'done' | 'abandoned'): void {
+    this.run('UPDATE router_session SET status = ?, updated_at = ? WHERE id = ?', status, nowIso(), id);
+  }
+
+  activeOverride(key: string): { version: number; content: string } | null {
+    const row = this.get(
+      'SELECT version, content FROM behavior_override WHERE key = ? AND active = 1 ORDER BY version DESC LIMIT 1',
+      key,
+    );
+    return row ? { version: num(row['version']), content: str(row['content']) } : null;
+  }
+
+  insertOverride(input: {
+    id: string;
+    key: string;
+    content: string;
+    reason: string;
+    author: string;
+  }): { version: number } {
+    const row = this.get('SELECT MAX(version) AS v FROM behavior_override WHERE key = ?', input.key);
+    const version = num(row?.['v'] ?? 0) + 1;
+    this.run('UPDATE behavior_override SET active = 0 WHERE key = ?', input.key);
+    this.run(
+      `INSERT INTO behavior_override (id, key, version, content, reason, author, active, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, 1, ?)`,
+      input.id, input.key, version, input.content, input.reason, input.author, nowIso(),
+    );
+    return { version };
+  }
+
+  listOverrides(key: string): { version: number; content: string; reason: string; author: string; active: number; createdAt: string }[] {
+    return this.all('SELECT * FROM behavior_override WHERE key = ? ORDER BY version DESC', key).map((row) => ({
+      version: num(row['version']),
+      content: str(row['content']),
+      reason: str(row['reason']),
+      author: str(row['author']),
+      active: num(row['active']),
+      createdAt: str(row['created_at']),
+    }));
+  }
+
+  rollbackOverride(key: string, version: number): boolean {
+    const row = this.get('SELECT id FROM behavior_override WHERE key = ? AND version = ?', key, version);
+    if (!row) return false;
+    this.run('UPDATE behavior_override SET active = 0 WHERE key = ?', key);
+    this.run('UPDATE behavior_override SET active = 1 WHERE id = ?', str(row['id']));
+    return true;
+  }
+
+  insertControlCommand(input: { id: string; command: string; payload: string | null; source: string }): void {
+    const now = nowIso();
+    this.run(
+      `INSERT INTO control_command (id, command, payload, status, result, source, created_at, updated_at)
+       VALUES (?, ?, ?, 'pending', NULL, ?, ?, ?)`,
+      input.id, input.command, input.payload, input.source, now, now,
+    );
+  }
+
+  listPendingControls(limit = 20): { id: string; command: string; payload: string | null; source: string; createdAt: string }[] {
+    return this.all("SELECT * FROM control_command WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?", limit).map((row) => ({
+      id: str(row['id']),
+      command: str(row['command']),
+      payload: strOrNull(row['payload']),
+      source: str(row['source']),
+      createdAt: str(row['created_at']),
+    }));
+  }
+
+  finishControl(id: string, status: 'done' | 'failed', result: string): void {
+    this.run('UPDATE control_command SET status = ?, result = ?, updated_at = ? WHERE id = ?', status, result, nowIso(), id);
+  }
+
+  listRecentControls(limit = 20): { id: string; command: string; status: string; result: string | null; createdAt: string }[] {
+    return this.all('SELECT * FROM control_command ORDER BY created_at DESC LIMIT ?', limit).map((row) => ({
+      id: str(row['id']),
+      command: str(row['command']),
+      status: str(row['status']),
+      result: strOrNull(row['result']),
+      createdAt: str(row['created_at']),
+    }));
+  }
 
   // ---------------- 进程作业 ----------------
 

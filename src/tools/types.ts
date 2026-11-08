@@ -44,7 +44,7 @@ export interface SendMessageResult {
 
 export interface WaitOptions {
   /** 等待原因；provider 表示等模型提供方恢复，job 表示等进程作业结束。 */
-  reason?: 'reply' | 'provider' | 'user' | 'job' | null;
+  reason?: 'reply' | 'provider' | 'user' | 'job' | 'maintenance' | null;
   /** 等某个进程作业结束时填写。 */
   jobId?: string | null;
   replyTo?: string | null;

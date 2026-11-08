@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS task (
   done_criteria    TEXT NOT NULL DEFAULT '',
   require_review   INTEGER NOT NULL DEFAULT 0,
   review_epoch     INTEGER NOT NULL DEFAULT 0,
+  maintenance      INTEGER NOT NULL DEFAULT 0,
   owner_worker_id  TEXT,
   status           TEXT NOT NULL,
   close_reason     TEXT,
@@ -141,6 +142,41 @@ CREATE TABLE IF NOT EXISTS worker_note (
 );
 CREATE INDEX IF NOT EXISTS idx_note_worker ON worker_note(worker_id, created_at);
 
+CREATE TABLE IF NOT EXISTS router_session (
+  id           TEXT PRIMARY KEY,
+  task_id      TEXT,
+  messages     TEXT NOT NULL,
+  reason       TEXT,
+  status       TEXT NOT NULL DEFAULT 'pending',
+  created_at   TEXT NOT NULL,
+  updated_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_router_session_status ON router_session(status);
+
+CREATE TABLE IF NOT EXISTS behavior_override (
+  id         TEXT PRIMARY KEY,
+  key        TEXT NOT NULL,
+  version    INTEGER NOT NULL,
+  content    TEXT NOT NULL,
+  reason     TEXT NOT NULL,
+  author     TEXT NOT NULL,
+  active     INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_override_key ON behavior_override(key, version);
+
+CREATE TABLE IF NOT EXISTS control_command (
+  id         TEXT PRIMARY KEY,
+  command    TEXT NOT NULL,
+  payload    TEXT,
+  status     TEXT NOT NULL DEFAULT 'pending',
+  result     TEXT,
+  source     TEXT NOT NULL DEFAULT 'watchdog',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_control_status ON control_command(status, created_at);
+
 CREATE TABLE IF NOT EXISTS process_job (
   id               TEXT PRIMARY KEY,
   task_id          TEXT NOT NULL,
@@ -161,6 +197,36 @@ CREATE TABLE IF NOT EXISTS process_job (
 );
 CREATE INDEX IF NOT EXISTS idx_job_task ON process_job(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_job_status ON process_job(status);
+
+CREATE TABLE IF NOT EXISTS wd_turn (
+  id         TEXT PRIMARY KEY,
+  role       TEXT NOT NULL,
+  content    TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS wd_issue (
+  id          TEXT PRIMARY KEY,
+  task_id     TEXT,
+  title       TEXT NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'open',
+  attempts    INTEGER NOT NULL DEFAULT 0,
+  note        TEXT,
+  check_after TEXT,
+  first_seen  TEXT NOT NULL,
+  last_seen   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wd_issue_status ON wd_issue(status, check_after);
+
+CREATE TABLE IF NOT EXISTS wd_action (
+  id         TEXT PRIMARY KEY,
+  issue_id   TEXT,
+  action     TEXT NOT NULL,
+  reason     TEXT,
+  expected   TEXT,
+  result     TEXT,
+  created_at TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS event (
   id         TEXT PRIMARY KEY,
