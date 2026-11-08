@@ -6,7 +6,7 @@
  * 主系统退出后它仍在运行，并能按需拉起主系统。
  */
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { loadConfig } from '../config.ts';
 import { OpenAICompatibleModel } from '../model/openai.ts';
@@ -64,6 +64,21 @@ const session = new WatchdogSession({
 });
 
 mkdirSync(dirname(pidFile), { recursive: true });
+
+// 单实例：同一时间只允许一个有效维护者，避免重复巡检与恢复风暴。
+const existing = (() => {
+  try {
+    return JSON.parse(readFileSync(pidFile, 'utf8')) as { pid: number };
+  } catch {
+    return null;
+  }
+})();
+if (existing && existing.pid !== process.pid && isPidAlive(existing.pid) && looksLikeOurProcess(existing.pid, 'watchdog')) {
+  console.log(`已有 Watchdog 在运行（pid=${existing.pid}），本次不启动`);
+  store.close();
+  process.exit(3);
+}
+
 writeFileSync(pidFile, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }, null, 2), 'utf8');
 
 const log = (message: string): void => {

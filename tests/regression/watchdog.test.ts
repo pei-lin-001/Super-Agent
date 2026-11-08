@@ -284,3 +284,32 @@ test('在线生效：覆盖项真的进入 Worker 的 system prompt，回滚后�
     await harness.cleanup();
   }
 });
+
+test('单实例：第二个 Watchdog 不会启动，避免重复巡检与恢复风暴', async () => {
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join: joinPath } = await import('node:path');
+  const dir = await mkdtemp(joinPath(tmpdir(), 'wd-lock-'));
+  const env = {
+    ...process.env,
+    DB_PATH: joinPath(dir, 'agent.db'),
+    WORK_DIR: joinPath(dir, 'work'),
+    WATCHDOG_NO_TICK: '1',
+    WATCHDOG_INTERVAL_MS: '3600000',
+    OLLAMA_BASE_URL: 'http://127.0.0.1:9/v1',
+    OLLAMA_API_KEY: 'test-key',
+    MODEL_NAME: 'mock-model',
+  };
+  const { spawn } = await import('node:child_process');
+  const first = spawn(process.execPath, ['src/watchdog/main.ts'], { cwd: process.cwd(), env, stdio: 'ignore' });
+  try {
+    await waitFor(() => existsSync(joinPath(dir, 'work', '.runtime', 'watchdog.json')), 20_000);
+    const second = spawn(process.execPath, ['src/watchdog/main.ts'], { cwd: process.cwd(), env, stdio: 'ignore' });
+    const code = await new Promise<number | null>((resolve) => second.on('exit', resolve));
+    assert.equal(code, 3, '第二个实例应主动退出');
+  } finally {
+    first.kill('SIGTERM');
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await rm(dir, { recursive: true, force: true });
+  }
+});

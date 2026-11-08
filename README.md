@@ -341,6 +341,20 @@ pnpm start        # 只启动主系统
 pnpm watchdog     # 只启动 Watchdog（可与主系统同时运行）
 ```
 
+### 一次真实巡检的结果（不是演示）
+
+对一次真实的工具链运行（检查者已 87 步仍在跑）执行 `WATCHDOG_ONCE=1 pnpm watchdog`：
+
+- 7 次模型调用后给出结论：**「不是任务偏离，而是复核环节在原地空转」**
+- 依据：检查者写了约 19 个 `review_checks_*.py`，反复复验同一批已确定事实（同一指纹、多次 `pytest -q` 都是 2 passed），
+  始终没有提交正式检查结论，任务停在 `approved 0 / pending 2`
+- 动作：`nudge_worker` 要求本轮内二选一（提交 rejected 带最小修正 / 提交 approved 附口径限定），并禁止再新增校验脚本
+- 记录：事件 `wdi_0741eb29`，10 分钟后复查，并写明「未改善则升级为 `pause_task`」
+- 隔离：同一时间主系统的 89 个作业状态没有发生变化
+
+控制命令写入 `control_command` 后由主系统的调度循环执行；那次运行是验收脚本（没有常驻 tick），
+所以命令停在 `pending` 没有被执行——这是真实限制，不是被隐藏的。
+
 ### 它怎么独立
 
 | 关注点 | 做法 |
@@ -446,7 +460,7 @@ REPL 命令：
 
 ```bash
 pnpm typecheck                              # 类型检查
-pnpm test                                   # 70 个测试，全部使用临时目录与模拟模型
+pnpm test                                   # 71 个测试，全部使用临时目录与模拟模型
 pnpm smoke:mini                             # 真实模型最小链路
 pnpm smoke:real                             # 真实模型综合协作场景
 node scripts/verify-run.ts <db> [taskId]    # 对已有运行记录重新做严格判定，不调用模型

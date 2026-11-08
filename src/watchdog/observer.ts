@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Config } from '../config.ts';
@@ -56,9 +57,7 @@ export function looksLikeOurProcess(pid: number, marker: string): boolean {
     return cmdline.includes(marker);
   } catch {
     try {
-      const out = require('node:child_process').execFileSync('ps', ['-p', String(pid), '-o', 'command='], {
-        encoding: 'utf8',
-      }) as string;
+      const out = execFileSync('ps', ['-p', String(pid), '-o', 'command='], { encoding: 'utf8' });
       return out.includes(marker);
     } catch {
       return false;
