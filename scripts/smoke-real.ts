@@ -152,7 +152,9 @@ async function main(): Promise<void> {
   await router.handleUserMessage('顺便用一句话说明：这个系统里 Router 和 Worker 各负责什么？');
   log(`第二条请求已回复，等待 ${((Date.now() - secondStart) / 1000).toFixed(1)}s`);
 
-  const deadline = Date.now() + 600_000;
+  const waitLimitMs = Number(process.env['SMOKE_TIMEOUT_MS'] ?? 600_000);
+  log(`等待上限：${Math.round(waitLimitMs / 1000)} 秒`);
+  const deadline = Date.now() + waitLimitMs;
   let timedOut = false;
   while (Date.now() < deadline) {
     const tasks = store.listTasks();
@@ -189,7 +191,7 @@ async function main(): Promise<void> {
   }
   const targetTaskId = createdTaskId;
   const verdict = timedOut
-    ? { ok: false, code: 2, lines: ['等待超时：600 秒内任务没有结束'] }
+    ? { ok: false, code: 2, lines: [`等待超时：${Math.round(waitLimitMs / 1000)} 秒内任务没有结束`] }
     : judgeTask(store, config, targetTaskId);
   verdict.lines.push('—— 过程证据 ——');
   for (const task of store.listTasks()) {
