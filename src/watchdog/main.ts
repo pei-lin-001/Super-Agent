@@ -101,6 +101,12 @@ async function tick(): Promise<void> {
 }
 
 // 只验证进程独立性与状态隔离时，可以跳过首次巡检（用于进程存活测试）。
+if (process.env['WATCHDOG_ONCE'] === '1') {
+  // 一次性巡检：给验收脚本用，跑完就退出。
+  await tick();
+  store.close();
+  process.exit(0);
+}
 if (process.env['WATCHDOG_NO_TICK'] !== '1') void tick();
 setInterval(() => void tick(), intervalMs);
 
