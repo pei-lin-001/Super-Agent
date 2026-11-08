@@ -200,6 +200,9 @@ async function main(): Promise<void> {
   for (const worker of store.listWorkers()) {
     verdict.lines.push(`Worker ${worker.id}｜${worker.status}｜${worker.stepCount} 步｜${worker.lastError ?? '-'}`);
   }
+  verdict.lines.push(
+    `模型调用：worker ${workerModel.httpAttempts} 次 HTTP 尝试，router ${routerModel.httpAttempts} 次（与请求体转储数不同）`,
+  );
   store.close();
   report(verdict);
 }

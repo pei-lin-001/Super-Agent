@@ -115,6 +115,10 @@ Message: queued → delivered → consumed
 
 ### 检查（review）规则
 
+正式检查请求在投递前就会被校验：`intent=review` 必须带 `refs.artifacts`，且每条都必须是**本任务**已登记的产物 id。
+只写 `refs.files: ["report.md"]` 这种路径不算检查对象，请求当场拒绝、不投递、不产生空检查记录。
+错误信息会直接告诉模型先用 `artifact_save` 保存，再把 `art_xxx` 放进 `refs`。
+
 - 只有 `intent=review` 的 request 才产生检查记录；`intent=help` 只是求助。
 - 检查记录以「一次请求 × 一份产物」为粒度，一次请求检查多份产物会有多行，同一事务写入。
 - 回复检查必须给 `outcome`：`approved` / `changes_required` / `inconclusive`。程序只认 `approved`，
@@ -270,7 +274,7 @@ REPL 命令：
 
 ```bash
 pnpm typecheck                              # 类型检查
-pnpm test                                   # 49 个测试，全部使用临时目录与模拟模型
+pnpm test                                   # 50 个测试，全部使用临时目录与模拟模型
 pnpm smoke:mini                             # 真实模型最小链路
 pnpm smoke:real                             # 真实模型综合协作场景
 node scripts/verify-run.ts <db> [taskId]    # 对已有运行记录重新做严格判定，不调用模型
@@ -343,6 +347,25 @@ Router 建任务 task_c50c5d0d → Worker w1_b8c2cc9d
 同一次运行还暴露一个模型行为问题：它连续 `artifact_save` 了 11 个版本才提交。程序允许（每版独立落盘），
 但这属于提示词层面待收敛的部分，记在已知限制里。
 
+**一次验收运行里观测到的实际浪费（`real-20261108114205-ec16`）**
+
+这条链不是「检查者步数偏紧」这么简单，数据库里有明确的返工：
+
+| 现象 | 证据 | 代价 |
+|---|---|---|
+| 检查请求只写了文件路径 | `msg_1d5d5797` 的 `refs.artifacts=[]`，只有 `files:[report.md, materials/…]` | 检查记录为空，直到提交被拒才发现 |
+| 补发一次才登记成功 | `msg_b035bfdd` 才带上 `art_3f38cd88` | 多一轮请求与回复 |
+| 检查对象版本漂移 | 请求引用 `review-notes.md v1`（`art_52b86978`），实际最终是 v3（`art_d3f14b3d`） | v1 那次检查作废，要重新检查 v3 |
+| 检查记录本身反复改版 | `review-notes.md` v1 4945B → v2 6517B → v3 8671B | 每改一次，被引用版本就变一次 |
+| 最终有效组合只剩一条 | 5 条 review 记录里，只有 `msg_38256d61` 同时覆盖交付的两个版本 | 前 4 条都是过程记录 |
+
+所以本轮先修入口校验，不去动步数上限。检查者 `w2` 撞上 24 步，是在承担这些返工之后才发生的；
+在入口校验生效前，用提高预算来「解决」它只会掩盖原因。
+
+**统计口径**：`83 条请求`指**请求体转储数**（每次 `chat()` 调用一次），不是 HTTP 请求数。
+`load` 等待与 5xx 重试都会在内部产生额外的 HTTP 尝试，脚本现在分别打印
+`worker/router 的 httpAttempts`。两者不能混用。
+
 **模块 2 完整协作验收：通过。** `real-20261108114205-ec16`
 
 配置（压力测试调整项，非默认值）：`CONTEXT_WINDOW_CHARS=16000`（默认值）、
@@ -384,7 +407,9 @@ Router 对外汇报（对同一份运行记录追问「现在进展如何」）�
 > **未完成部分**：交付层面没有。剩下的是材料本身的信息缺口，报告里已如实列为「待确认」……
 > **需要你决定的**：口径可比性、币种与含税、统计口径一致性、华南下滑的客户级证据、财务指标缺失。
 
-`node scripts/router-check.ts <db>` 可以对任意运行记录复跑这一步。
+`node scripts/router-check.ts <db>` 可以对任意运行记录复跑这一步：它先把数据库复制到临时目录，
+Router 以只读模式运行（不提供 `create_task` / `send_to_worker`），结束后比对原库的 sha256 与 mtime，
+确认未被修改；拿不到本轮回复就以退出码 1 结束。
 
 **模块 2 上下文整理：在真实模型下实际发生并验证。** `pnpm smoke:mini`（`CONTEXT_WINDOW_CHARS=800`）
 

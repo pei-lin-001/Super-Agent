@@ -112,6 +112,8 @@ function sleep(ms: number): Promise<void> {
 export class OpenAICompatibleModel implements ModelClient {
   readonly kind = 'real' as const;
   readonly label: string;
+  /** 实际发出的 HTTP 尝试次数（含 load 与 5xx 的内部重试），与 chat() 调用次数不同。 */
+  httpAttempts = 0;
   private readonly options: OpenAICompatibleOptions;
   private readonly fetchImpl: typeof fetch;
 
@@ -157,6 +159,7 @@ export class OpenAICompatibleModel implements ModelClient {
     let lastError: unknown = null;
 
     while (attempt < maxAttempts) {
+      this.httpAttempts += 1;
       await gate.acquire();
       try {
         const response = await this.fetchImpl(url, {
