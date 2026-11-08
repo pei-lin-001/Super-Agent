@@ -38,7 +38,9 @@ export const collabTools: ToolDefinition[] = [
   {
     name: 'message_send',
     description:
-      '给同组 Worker 发消息。kind=request 用于求助/核对/检查；kind=reply 回复某条请求，必须带 reply_to；update/stop 仅任务负责人可用。',
+      '给同组 Worker 发消息。kind=request 用于求助/核对/检查；kind=reply 回复某条请求，必须带 reply_to；update/stop 仅任务负责人可用。'
+      + '当 intent=review 时表示正式检查：必须给出 refs 里的产物，回复时用 outcome 给出 approved / changes_required / inconclusive 结论。'
+      + '普通求助用 intent=help，不会产生检查记录。',
     parameters: {
       type: 'object',
       properties: {
@@ -52,8 +54,13 @@ export const collabTools: ToolDefinition[] = [
         reply_to: { type: 'string', description: 'reply 时必填：被回复的消息 id' },
         intent: {
           type: 'string',
-          enum: ['help', 'verify', 'review'],
-          description: 'request 的具体意图',
+          enum: ['help', 'review'],
+          description: 'request 的用途：help 普通求助；review 正式检查（回复必须给 outcome）',
+        },
+        outcome: {
+          type: 'string',
+          enum: ['approved', 'changes_required', 'inconclusive'],
+          description: '回复正式检查时的结论，只在 reply 上使用',
         },
         dedupe_key: {
           type: 'string',
@@ -73,6 +80,7 @@ export const collabTools: ToolDefinition[] = [
       const body = argString(args, 'body');
       const replyTo = argOptionalString(args, 'reply_to');
       const intent = argOptionalString(args, 'intent');
+      const outcome = argOptionalString(args, 'outcome') as 'approved' | 'changes_required' | 'inconclusive' | null;
       const refs = argStringArray(args, 'refs');
       const dedupeKey = argOptionalString(args, 'dedupe_key');
       if (!WORKER_SENDABLE.includes(kind)) {
@@ -86,10 +94,12 @@ export const collabTools: ToolDefinition[] = [
         replyTo,
         refs: refs.length > 0 ? { files: refs } : null,
         intent,
+        outcome,
         dedupeKey,
       });
       if (!result.ok) return { type: 'failed', content: `发送失败：${result.reason ?? '未知原因'}` };
-      return ok(`已投递消息 ${result.messageId}（${context.worker.id} → ${to}，kind=${kind}）`);
+      const ids = result.messageIds ?? (result.messageId ? [result.messageId] : []);
+      return ok(`已投递消息 ${ids.join(', ')}（${context.worker.id} → ${to}，kind=${kind}，接收者 ${ids.length} 个）`);
     },
   },
   {

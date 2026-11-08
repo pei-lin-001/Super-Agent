@@ -1,4 +1,4 @@
-import { argString, type ToolDefinition, type ToolOutcome } from './types.ts';
+import { argOptionalNumber, argOptionalString, argString, type ToolDefinition, type ToolOutcome } from './types.ts';
 
 function ok(content: string): ToolOutcome {
   return { type: 'ok', content };
@@ -25,6 +25,35 @@ export const artifactTools: ToolDefinition[] = [
       return ok(
         `已保存产物 ${artifact.name} v${artifact.version}（id=${artifact.id}，${artifact.bytes} 字节，sha256=${artifact.sha256.slice(0, 12)}…）`,
       );
+    },
+  },
+  {
+    name: 'artifact_read',
+    description:
+      '按名字与版本读取已登记产物（版本默认最新）。返回内容与总长度；内容过长时用 offset 继续读取。',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: '产物文件名，例如 report.md' },
+        version: { type: 'number', description: '版本号；省略表示最新版本' },
+        offset: { type: 'number', description: '字符偏移，默认 0' },
+        limit: { type: 'number', description: '本次读取字符数，默认 8000' },
+      },
+      required: ['name'],
+    },
+    async run(args, context) {
+      const name = argString(args, 'name');
+      const version = argOptionalNumber(args, 'version') ?? null;
+      const offset = Math.max(0, argOptionalNumber(args, 'offset') ?? 0);
+      const limit = Math.max(1, Math.min(20_000, argOptionalNumber(args, 'limit') ?? 8000));
+      const { artifact, content } = await context.host.readArtifactVersion(context.task.id, name, version);
+      const slice = content.slice(offset, offset + limit);
+      const end = offset + slice.length;
+      const suffix =
+        end < content.length
+          ? `\n…（${artifact.name} v${artifact.version} 共 ${content.length} 字符，已读到 ${end}；继续请用 offset=${end}）`
+          : '';
+      return ok(`# ${artifact.name} v${artifact.version}（${content.length} 字符）\n${slice}${suffix}`);
     },
   },
   {

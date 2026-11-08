@@ -1,9 +1,17 @@
 import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, resolve } from 'node:path';
-import { resolveInside } from './paths.ts';
-import { argOptionalString, argString, type ToolContext, type ToolDefinition, type ToolOutcome } from './types.ts';
+import { assertInsideRoot, normalizeRelativePath, resolveInside } from './paths.ts';
+import {
+  argOptionalNumber,
+  argOptionalString,
+  argString,
+  type ToolContext,
+  type ToolDefinition,
+  type ToolOutcome,
+} from './types.ts';
 
-const MAX_READ_BYTES = 60_000;
+const MAX_READ_BYTES = 2_000_000;
+const DEFAULT_READ_LIMIT = 8000;
 const MAX_LIST_ENTRIES = 200;
 const MAX_SEARCH_RESULTS = 80;
 const MAX_SEARCH_FILES = 300;
@@ -59,19 +67,31 @@ export const fileTools: ToolDefinition[] = [
     },
   },
   {
-    name: 'fs_read',
-    description: '读取文本文件内容。路径相对任务目录；以 materials/ 开头表示只读材料目录。',
-    parameters: {
-      type: 'object',
-      properties: { path: { type: 'string', description: '相对路径' } },
-      required: ['path'],
-    },
-    async run(args, context) {
-      const logical = argString(args, 'path');
-      const absolute = resolveReadPath(context, logical);
-      const text = await readTextFile(absolute);
-      return ok(text.length > MAX_READ_BYTES ? `${text.slice(0, MAX_READ_BYTES)}\n…（已截断）` : text);
-    },
+      name: 'fs_read',
+      description:
+        '读取文本文件内容。路径相对任务目录；以 materials/ 开头表示只读材料目录。' +
+        '内容较长时按 offset/limit 分段返回，返回尾部会提示下一次的 offset。',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: '相对路径' },
+          offset: { type: 'number', description: '字符偏移，默认 0' },
+          limit: { type: 'number', description: '本次读取字符数，默认 8000' },
+        },
+        required: ['path'],
+      },
+      async run(args, context) {
+        const logical = argString(args, 'path');
+        const offset = Math.max(0, argOptionalNumber(args, 'offset') ?? 0);
+        const limit = Math.max(1, Math.min(40_000, argOptionalNumber(args, 'limit') ?? DEFAULT_READ_LIMIT));
+        const absolute = resolveReadPath(context, logical);
+        const text = await readTextFile(absolute);
+        const slice = text.slice(offset, offset + limit);
+        const end = offset + slice.length;
+        const suffix =
+          end < text.length ? `\n…（共 ${text.length} 字符，已读到 ${end}；继续请用 offset=${end}）` : '';
+        return ok(`${slice}${suffix}`);
+      },
   },
   {
     name: 'fs_write',
@@ -86,12 +106,20 @@ export const fileTools: ToolDefinition[] = [
     },
     async run(args, context) {
       const logical = argString(args, 'path');
-      if (logical.startsWith('materials')) throw new Error('materials 目录只读');
+      const normalized = normalizeRelativePath(logical, '写入路径');
+      if (normalized === 'materials' || normalized.startsWith('materials/')) {
+        throw new Error('materials 目录只读');
+      }
+      if (normalized === 'artifacts' || normalized.startsWith('artifacts/')) {
+        throw new Error('产物目录由 artifact_save 管理，不能用 fs_write 直接覆盖已登记的版本');
+      }
       const content = argString({ ...args, content: args['content'] ?? '' }, 'content');
-      const absolute = resolveInside(taskDir(context), logical);
+      const root = taskDir(context);
+      const absolute = resolveInside(root, normalized);
       await mkdir(dirname(absolute), { recursive: true });
+      assertInsideRoot(root, dirname(absolute));
       await writeFile(absolute, content, 'utf8');
-      return ok(`已写入 ${logical}（${Buffer.byteLength(content, 'utf8')} 字节）`);
+      return ok(`已写入 ${normalized}（${Buffer.byteLength(content, 'utf8')} 字节）`);
     },
   },
   {

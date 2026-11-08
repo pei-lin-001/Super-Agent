@@ -1,4 +1,4 @@
-import type { Artifact, MessageKind, MessageRefs, Task, Worker } from '../domain/types.ts';
+import type { Artifact, MessageKind, MessageRefs, ReviewOutcome, Task, Worker } from '../domain/types.ts';
 
 export interface CreateCollaboratorResult {
   ok: boolean;
@@ -13,7 +13,10 @@ export interface SendMessageInput {
   body: string;
   replyTo?: string | null;
   refs?: MessageRefs | null;
+  /** request 的用途：help（普通求助）或 review（正式检查，必须给出结论）。 */
   intent?: string | null;
+  /** reply 的检查结论；只有 reply 允许携带。 */
+  outcome?: ReviewOutcome | null;
   /** 同一群组内重复提交相同键时只保留第一条。 */
   dedupeKey?: string | null;
 }
@@ -21,10 +24,14 @@ export interface SendMessageInput {
 export interface SendMessageResult {
   ok: boolean;
   messageId?: string;
+  /** 广播会为每个接收者各生成一条消息。 */
+  messageIds?: string[];
   reason?: string;
 }
 
 export interface WaitOptions {
+  /** 等待原因；provider 表示等模型提供方恢复，恢复时按持久化记录重排。 */
+  reason?: 'reply' | 'provider' | 'user' | null;
   replyTo?: string | null;
   from?: string | null;
   kinds?: MessageKind[] | null;
@@ -62,6 +69,8 @@ export interface ToolHost {
   report(worker: Worker, kind: 'progress' | 'fail' | 'question', body: string, refs?: MessageRefs): ReportResult;
   saveArtifact(worker: Worker, name: string, content: string): Artifact;
   listArtifacts(taskId: string): Artifact[];
+  getArtifact(id: string): Artifact | null;
+  readArtifactVersion(taskId: string, name: string, version?: number | null): Promise<{ artifact: Artifact; content: string }>;
   isCancelled(taskId: string): boolean;
 }
 
@@ -103,6 +112,14 @@ export function argOptionalString(args: Record<string, unknown>, name: string): 
   if (value === undefined || value === null || value === '') return null;
   if (typeof value !== 'string') throw new Error(`参数 ${name} 必须是字符串`);
   return value;
+}
+
+export function argOptionalNumber(args: Record<string, unknown>, name: string): number | null {
+  const value = args[name];
+  if (value === undefined || value === null || value === '') return null;
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value))) return Number(value);
+  throw new Error(`参数 ${name} 必须是数字`);
 }
 
 export function argStringArray(args: Record<string, unknown>, name: string): string[] {
