@@ -1,6 +1,8 @@
 import { ToolError } from './paths.ts';
+import type { JobOutput } from '../runtime/process.ts';
 import type {
   Artifact,
+  ProcessJob,
   Message,
   MessageKind,
   MessageRefs,
@@ -41,8 +43,10 @@ export interface SendMessageResult {
 }
 
 export interface WaitOptions {
-  /** 等待原因；provider 表示等模型提供方恢复，恢复时按持久化记录重排。 */
-  reason?: 'reply' | 'provider' | 'user' | null;
+  /** 等待原因；provider 表示等模型提供方恢复，job 表示等进程作业结束。 */
+  reason?: 'reply' | 'provider' | 'user' | 'job' | null;
+  /** 等某个进程作业结束时填写。 */
+  jobId?: string | null;
   replyTo?: string | null;
   from?: string | null;
   kinds?: MessageKind[] | null;
@@ -91,6 +95,26 @@ export interface ToolHost {
   listWorkerTurnsRange(workerId: string, fromSeq: number, toSeq: number): WorkerTurn[];
   getMessageForWorker(workerId: string, messageId: string): Message | null;
   listWorkerNotes(workerId: string): WorkerNote[];
+
+  // ---- 命令执行与作业 ----
+  startJob(input: {
+    worker: Worker;
+    taskId: string;
+    command: string;
+    args: string[];
+    cwd: string;
+    stdin: string | null;
+    timeoutMs: number;
+    signal?: AbortSignal | null;
+  }): ProcessJob;
+  readJob(jobId: string, stream: 'stdout' | 'stderr', offset: number, limit: number): JobOutput | null;
+  getJob(jobId: string): ProcessJob | null;
+  listJobs(taskId: string): ProcessJob[];
+  stopJob(jobId: string, reason: string): ProcessJob | null;
+  /** 登记一次「等作业结束」，返回是否已经结束。 */
+  waitJob(worker: Worker, jobId: string, timeoutMs: number): { immediate: boolean; job: ProcessJob | null };
+  /** 把磁盘上的真实文件登记为产物（按字节快照）。 */
+  importArtifact(worker: Worker, name: string, absolutePath: string): { artifact: Artifact; reused: boolean };
 }
 
 export interface ToolContext {
@@ -99,6 +123,8 @@ export interface ToolContext {
   task: Task;
   workDir: string;
   materialsDir: string;
+  /** 任务取消、Worker 停止或执行超时时触发；长操作必须响应它。 */
+  signal?: AbortSignal | null;
 }
 
 export type ToolOutcome =
@@ -106,7 +132,14 @@ export type ToolOutcome =
   | {
       type: 'wait';
       content: string;
-      wait: { replyTo: string | null; from: string | null; kinds: MessageKind[] | null; timeoutMs: number };
+      wait: {
+        replyTo: string | null;
+        from: string | null;
+        kinds: MessageKind[] | null;
+        timeoutMs: number;
+        /** 等进程作业结束时填写；与消息匹配互斥。 */
+        jobId?: string | null;
+      };
     }
   | { type: 'finish'; content: string }
   | { type: 'failed'; content: string };

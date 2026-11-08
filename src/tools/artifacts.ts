@@ -34,6 +34,35 @@ export const artifactTools: ToolDefinition[] = [
     },
   },
   {
+    name: 'artifact_import',
+    description:
+      '把任务目录里的真实文件登记为正式产物（按字节快照）。用于脚本生成的 CSV/JSON/代码/图片/PDF 等。' +
+      '登记后源文件再变化也不会改变已登记的版本；后续检查、提交都针对这个快照。',
+    parameters: {
+      type: 'object',
+      properties: {
+        source: { type: 'string', description: '源文件路径（相对任务目录）' },
+        name: { type: 'string', description: '产物文件名，默认取源文件名' },
+      },
+      required: ['source'],
+    },
+    run(args, context) {
+      const source = argString(args, 'source');
+      const name = argOptionalString(args, 'name') ?? source.split('/').at(-1) ?? source;
+      const { artifact, reused } = context.host.importArtifact(context.worker, name, source);
+      if (reused) {
+        return ok(
+          `文件内容与当前最新版本完全相同，已复用 ${artifact.name} v${artifact.version}（id=${artifact.id}），没有创建新版本。` +
+            '复用不会自动获得检查通过。',
+        );
+      }
+      return ok(
+        `已登记产物 ${artifact.name} v${artifact.version}（id=${artifact.id}，${artifact.bytes} 字节，` +
+          `sha256=${artifact.sha256.slice(0, 12)}…）`,
+      );
+    },
+  },
+  {
     name: 'artifact_read',
     description:
       '按名字与版本读取已登记产物（版本默认最新）。返回内容与总长度；内容过长时用 offset 继续读取。',
