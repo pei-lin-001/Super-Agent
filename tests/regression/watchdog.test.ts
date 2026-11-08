@@ -1043,3 +1043,38 @@ test('Router 决策身份：新决策里同名同参数的操作照常执行', a
     await harness.cleanup();
   }
 });
+
+test('重复 tick：并发调用 resume 不会重复执行同一份进度', async () => {
+  const harness = await createHarness({ limits: { maxConcurrentRuns: 0 }, worker: () => mockReply({ text: 'ok' }) });
+  try {
+    const { Router } = await import('../../src/runtime/router.ts');
+    const { MockModel } = await import('../../src/model/mock.ts');
+    let call = 0;
+    const router = new Router(
+      harness.runtime,
+      new MockModel(() => {
+        call += 1;
+        return call === 1
+          ? mockReply({
+              toolCalls: [
+                {
+                  name: 'create_task',
+                  // 故意很慢的操作不会有，这里用正常操作验证并发去重
+                  arguments: { title: '只应创建一次', goal: 'g', owner_role: 'r', owner_brief: 'b' },
+                },
+              ],
+            })
+          : mockReply({ text: '完成' });
+      }),
+      { ...harness.config, limits: { ...harness.config.limits, maxRouterRounds: 1 } },
+    );
+    await router.handleUserMessage('开始').catch(() => undefined);
+    assert.ok(harness.store.pendingRouterSession(), '应留下待续接会话');
+
+    // 模拟定时器连续触发：多个 resume 同时进来
+    await Promise.all([router.resume(), router.resume(), router.resume()].map((p) => p.catch(() => undefined)));
+    assert.equal(harness.store.listTasks().length, 1, '并发续接不能重复建任务');
+  } finally {
+    await harness.cleanup();
+  }
+});

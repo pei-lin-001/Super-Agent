@@ -568,7 +568,7 @@ export class Store {
 
   // ---------------- Watchdog 会话 / 问题 / 动作 ----------------
 
-  appendWdTurn(turn: { id: string; role: 'user' | 'assistant'; content: string }): void {
+  appendWdTurn(turn: { id: string; role: 'user' | 'assistant' | 'tool'; content: string }): void {
     this.run('INSERT INTO wd_turn (id, role, content, created_at) VALUES (?, ?, ?, ?)', turn.id, turn.role, turn.content, nowIso());
   }
 

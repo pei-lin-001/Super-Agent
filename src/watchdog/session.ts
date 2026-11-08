@@ -399,6 +399,7 @@ export class WatchdogSession {
     store.appendWdTurn({ id: `wdt_${randomBytes(4).toString('hex')}`, role: 'user', content: question });
     // 不设调用次数上限：维护者要调查多久就多久，直到它自己认为证据够了。
     // 结束条件由模型给出（不再调用工具），不由程序的计数决定。
+    const repeats = new Map<string, number>();
     for (;;) {
       const result = await new RecordingModel(model, store, 'watchdog', { sessionId: null }).chat({
         model: modelName,
@@ -413,12 +414,24 @@ export class WatchdogSession {
         return answer;
       }
       for (const call of result.toolCalls) {
+        const key = `${call.name}|${call.arguments}`;
+        const seen = (repeats.get(key) ?? 0) + 1;
+        repeats.set(key, seen);
         let output: string;
         try {
           output = await this.executeTool(call.name, JSON.parse(call.arguments || '{}') as Record<string, unknown>);
         } catch (error) {
           output = `执行失败：${(error as Error).message}`;
         }
+        // 同一调用重复出现时把事实告诉模型：不是禁止，而是让它知道这条证据已经拿过了。
+        if (seen > 1) {
+          output += `\n\n（同一条调用第 ${seen} 次出现，上面的结果与之前一致。如果证据已经够，直接给结论。）`;
+        }
+        store.appendWdTurn({
+          id: `wdt_${randomBytes(4).toString('hex')}`,
+          role: 'tool',
+          content: `${call.name}: ${output.slice(0, 300)}`,
+        });
         messages.push({ role: 'tool', content: output, toolCallId: call.id });
       }
     }

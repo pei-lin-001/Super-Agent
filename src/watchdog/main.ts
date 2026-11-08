@@ -214,7 +214,9 @@ if (askIndex !== -1) {
 
   if (ownerAlive) {
     // 已经有维护者在跑：当客户端轮询，不抢执行资格。
-    const deadline = Date.now() + 180_000;
+    // 等待时长可配：真实模型调查一个问题可能要很久，超时只是"先返回 ID"，不是失败。
+    const waitMs = Number(process.env['WATCHDOG_ASK_WAIT_MS'] ?? 180_000);
+    const deadline = Date.now() + (Number.isFinite(waitMs) && waitMs > 0 ? waitMs : 180_000);
     while (Date.now() < deadline) {
       const record = store.getWdQuestion(questionId);
       if (record && record.status !== 'pending') {
