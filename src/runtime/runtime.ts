@@ -301,6 +301,27 @@ export class Runtime implements ToolHost {
       }
     }
 
+    if (intent === 'review') {
+      // 正式检查必须有可登记的检查对象：本任务的产物 id。只写文件路径不算检查依据。
+      const normalized = this.normalizeRefs(input.refs ?? null, task.id);
+      const requested = normalized?.artifacts ?? [];
+      if (requested.length === 0) {
+        return {
+          ok: false,
+          reason:
+            '正式检查必须用 refs.artifacts 指定本任务的产物 id（形如 art_xxxxxxxx）；只写文件路径不会被登记为检查对象。' +
+            '先用 artifact_save 保存产物，再把它的 id 放进 refs。',
+        };
+      }
+      for (const ref of requested) {
+        const artifact = this.store.getArtifact(ref.artifactId);
+        if (!artifact) return { ok: false, reason: `检查对象不存在：${ref.artifactId}` };
+        if (artifact.taskId !== task.id) {
+          return { ok: false, reason: `检查对象 ${ref.artifactId} 不属于本任务，不能作为检查依据` };
+        }
+      }
+    }
+
     const broadcast = input.to === 'group' || input.to === from.groupId;
     let recipients: Worker[];
     if (broadcast) {

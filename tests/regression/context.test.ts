@@ -324,7 +324,7 @@ test('检索：按消息 id 读全文，支持分页', async () => {
     const helper = harness.runtime.createCollaborator(owner, '协作者', '协助');
     const body = `${'检查意见开头。'.repeat(100)}核心问题：来源未标注。${'结尾内容。'.repeat(100)}`;
     const message = harness.runtime.sendMessage({
-      from: owner, to: helper.workerId!, kind: 'request', intent: 'review', body,
+      from: owner, to: helper.workerId!, kind: 'request', intent: 'help', body,
     });
     const { historyTools } = await import('../../src/tools/history.ts');
     const readTool = historyTools.find((tool) => tool.name === 'message_read')!;
@@ -438,6 +438,57 @@ test('提示词：长任务触发整理后，system 里包含工作记录、产�
     const note = harness.store.latestSuccessfulNote(owner.id);
     assert.ok(note, '整理记录已落库');
     assert.equal(note!.taskId, task.id);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('检查入口：没有有效产物 id 的正式检查当场拒绝，不产生检查记录', async () => {
+  const harness = await staticHarness();
+  try {
+    const { task, owner } = harness.runtime.createTask({
+      title: '入口校验', goal: 'g', requireReview: true, ownerRole: '负责人', ownerBrief: 'b',
+    });
+    const checker = harness.runtime.createCollaborator(owner, '检查者', '检查');
+    const artifact = harness.runtime.saveArtifact(owner, 'report.md', 'v1').artifact;
+
+    // 只写文件路径：真实运行里出现过，之前会返回“已投递”但没有任何检查记录
+    const byPath = harness.runtime.sendMessage({
+      from: owner, to: checker.workerId!, kind: 'request', intent: 'review',
+      body: '请检查 report.md', refs: { files: ['report.md'] },
+    });
+    assert.equal(byPath.ok, false);
+    assert.match(byPath.reason ?? '', /refs\.artifacts/);
+    assert.equal(harness.store.listReviews(task.id).length, 0, '不应产生检查记录');
+
+    // 不存在的产物 id
+    const missing = harness.runtime.sendMessage({
+      from: owner, to: checker.workerId!, kind: 'request', intent: 'review',
+      body: '请检查', refs: { artifacts: [{ artifactId: 'art_not_exist', name: 'x', version: 1 }] },
+    });
+    assert.equal(missing.ok, false);
+    assert.match(missing.reason ?? '', /检查对象不存在/);
+
+    // 别的任务的产物
+    const otherTask = harness.runtime.createTask({ title: '别的任务', goal: 'g', ownerRole: '负责人', ownerBrief: 'b' });
+    const otherArtifact = harness.runtime.saveArtifact(otherTask.owner, 'other.md', 'x').artifact;
+    const foreign = harness.runtime.sendMessage({
+      from: owner, to: checker.workerId!, kind: 'request', intent: 'review',
+      body: '请检查', refs: { artifacts: [{ artifactId: otherArtifact.id, name: 'other.md', version: 1 }] },
+    });
+    assert.equal(foreign.ok, false);
+    assert.match(foreign.reason ?? '', /不属于本任务/);
+
+    // 没有消息被投递出去
+    assert.equal(harness.store.listInbox(checker.workerId!).length, 0, '被拒绝的请求不应进入收件箱');
+
+    // 正确写法仍然可用
+    const ok = harness.runtime.sendMessage({
+      from: owner, to: checker.workerId!, kind: 'request', intent: 'review',
+      body: '请检查', refs: { artifacts: [{ artifactId: artifact.id, name: artifact.name, version: artifact.version }] },
+    });
+    assert.equal(ok.ok, true, ok.reason);
+    assert.equal(harness.store.listReviewsByRequest(ok.messageId!).length, 1);
   } finally {
     await harness.cleanup();
   }
