@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Config, Limits } from '../src/config.ts';
 import type { ChatRequest, ModelClient, StepResult } from '../src/model/types.ts';
-import { MockModel, type MockHandler } from '../src/model/mock.ts';
+import { MockModel, mockReply, type MockHandler } from '../src/model/mock.ts';
 import { Router } from '../src/runtime/router.ts';
 import { Runtime } from '../src/runtime/runtime.ts';
 import { Store } from '../src/storage/store.ts';
@@ -31,6 +31,14 @@ const BASE_LIMITS: Limits = {
   waitTimeoutMs: 400,
   modelRetry: 0,
   maxNudges: 3,
+  contextWindowChars: 16_000,
+  pairingOvershootChars: 2_000,
+  noteTriggerTurns: 10,
+  noteTriggerChars: 3_000,
+  noteMaxChars: 6_000,
+  noteInputChars: 24_000,
+  noteRetryMs: 120_000,
+  noteMaxFailures: 3,
 };
 
 export function testConfig(dir: string, overrides: Partial<Limits> = {}): Config {
@@ -128,13 +136,23 @@ export function workerIdOf(request: ChatRequest): string {
   return match?.[1]?.trim() ?? '';
 }
 
+/** 工作记录整理请求与普通任务请求分开应答。 */
+export function isNoteRequest(request: ChatRequest): boolean {
+  return systemText(request).includes('工作记录整理器');
+}
+
 /** 按职责分派剧本，每个职责独立计数。 */
 export function scripted(
   handlers: Record<string, (step: number, request: ChatRequest) => StepResult | Promise<StepResult>>,
+  options: { note?: (request: ChatRequest) => StepResult | Promise<StepResult> } = {},
 ): MockHandler {
   const counters = new Map<string, number>();
   const roles = Object.keys(handlers);
   return ({ request }) => {
+    if (isNoteRequest(request)) {
+      if (options.note) return options.note(request);
+      return mockReply({ text: '## 已完成\n（默认工作记录）' });
+    }
     const role = roleOf(request);
     const key = roles.find((candidate) => role === candidate) ?? roles.find((candidate) => role.includes(candidate));
     if (!key) {
