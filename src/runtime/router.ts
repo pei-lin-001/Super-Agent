@@ -84,10 +84,13 @@ export class Router {
   private readonly model: ModelClient;
   private readonly config: Config;
 
-  constructor(runtime: Runtime, model: ModelClient, config: Config) {
+  private readonly readOnly: boolean;
+
+  constructor(runtime: Runtime, model: ModelClient, config: Config, options: { readOnly?: boolean } = {}) {
     this.runtime = runtime;
     this.model = model;
     this.config = config;
+    this.readOnly = options.readOnly ?? false;
   }
 
   handleUserMessage(content: string): Promise<void> {
@@ -157,7 +160,7 @@ export class Router {
       const result = await this.model.chat({
         model: this.config.routerModel,
         messages,
-        tools: ROUTER_TOOLS,
+        tools: this.readOnly ? [] : ROUTER_TOOLS,
         reasoningEffort: this.config.reasoningEffort,
       });
       messages.push({
@@ -202,6 +205,9 @@ export class Router {
   }
 
   private async executeTool(name: string, rawArguments: string): Promise<string> {
+    if (this.readOnly && (name === 'create_task' || name === 'send_to_worker')) {
+      return '只读模式：本次只做汇报，不能建立任务、修改要求或向 Worker 发消息。请基于现有事实回答用户。';
+    }
     let args: Record<string, unknown>;
     try {
       const parsed: unknown = rawArguments.trim() === '' ? {} : JSON.parse(rawArguments);
