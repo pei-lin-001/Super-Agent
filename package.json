@@ -1,0 +1,23 @@
+{
+  "name": "super-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Router–Worker 双层个人 Agent 系统",
+  "packageManager": "pnpm@11.21.0",
+  "engines": {
+    "node": ">=26"
+  },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env.local src/main.ts",
+    "dev": "node --env-file-if-exists=.env.local --watch src/main.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --test-concurrency=1 \"tests/**/*.test.ts\"",
+    "smoke:real": "node --env-file-if-exists=.env.local scripts/smoke-real.ts",
+    "format": "prettier --write ."
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "typescript": "^5.9.3"
+  }
+}
