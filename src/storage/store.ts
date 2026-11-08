@@ -217,6 +217,11 @@ export class Store {
   constructor(path: string) {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
+    // 多进程同时访问同一个库（主系统 + 维护者 + 命令行客户端）：
+    // WAL 让读写不互相阻塞，busy_timeout 让短时的写冲突自动重试而不是直接失败。
+    this.db.exec('PRAGMA journal_mode = WAL');
+    this.db.exec('PRAGMA busy_timeout = 5000');
+    this.db.exec('PRAGMA synchronous = NORMAL');
     this.db.exec(SCHEMA_SQL);
     this.migrate();
   }

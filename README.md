@@ -444,6 +444,16 @@ rollback_override key=worker.check_rules version=1
 
 工具调用的身份来自**已保存的决策记录**（`router_decision.id + 调用位置`），不来自每轮从 0 开始的循环位置。参数摘要不参与去重：两次参数完全相同的请求可以是两个合法操作。
 
+### 多进程共用同一个库
+
+`Store` 打开时设置 `journal_mode=WAL`、`busy_timeout=5000`：主系统、维护者、命令行客户端会同时读写，
+不加这两项，并发提交问题会直接 `database is locked`。
+
+### 维护者不限调用次数
+
+`ask()` 和 `runOnce()` 都不设步数上限：调查多久由模型判断，结束条件是"不再调用工具"。
+停机标记只阻止自动拉起主系统，不影响回答人的提问。
+
 ### 调用统计
 
 `model_call` 表按**每次 chat 调用**记账，不用对话条数反推：
@@ -522,7 +532,7 @@ REPL 命令：
 
 ```bash
 pnpm typecheck                              # 类型检查
-pnpm test                                   # 92 个测试
+pnpm test                                   # 100 个测试
 node scripts/accept-crash.ts                # 崩溃恢复验收（真实杀进程 + 本地受控模型），全部使用临时目录与模拟模型
 pnpm smoke:mini                             # 真实模型最小链路
 pnpm smoke:real                             # 真实模型综合协作场景

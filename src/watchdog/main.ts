@@ -152,6 +152,23 @@ function holdLock(): void {
 // 维护者提问入口：写持久问题队列，由唯一的维护者串行处理。
 // 已有 Watchdog 在跑时，这里只当客户端，不会因为单实例约束被拒绝。
 // 没有 Watchdog 在跑时，本次进程接管唯一的维护资格来处理问题。
+// --answer：纯查询。不抢锁、不恢复作业、不启动模型会话，也不因为已有维护者而退出。
+const answerIndex = process.argv.indexOf('--answer');
+if (answerIndex !== -1) {
+  const id = process.argv[answerIndex + 1] ?? '';
+  const record = store.getWdQuestion(id);
+  if (!record) {
+    console.log(`找不到问题 ${id}`);
+    store.close();
+    process.exit(1);
+  }
+  console.log(`${record.status}｜${record.question}`);
+  if (record.answer) console.log(`回答：${record.answer}`);
+  if (record.error) console.log(`失败：${record.error}`);
+  store.close();
+  process.exit(0);
+}
+
 const askIndex = process.argv.indexOf('--ask');
 const questionId = `wdq_${Date.now().toString(36)}${Math.random().toString(16).slice(2, 6)}`;
 
@@ -291,14 +308,15 @@ function dueForReview(): { run: boolean; reason: string } {
 
 async function tick(): Promise<void> {
   if (running) return;
-  if (existsSync(stopFile)) {
-    log('发现停机标记，等待恢复维护（不会自动重启主系统）');
-    return;
-  }
   running = true;
   try {
     // 提问与巡检串行：同一时刻只有一个维护会话在动。
+    // 提问优先于停机标记：停机只表示"不要自动拉起主系统"，不影响回答人的问题。
     await runQuestionWorker();
+    if (existsSync(stopFile)) {
+      log('发现停机标记，等待恢复维护（不会自动重启主系统）');
+      return;
+    }
     const gate = dueForReview();
     if (!gate.run) {
       log(`跳过本轮巡检：${gate.reason}`);
