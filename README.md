@@ -512,7 +512,8 @@ REPL 命令：
 
 ```bash
 pnpm typecheck                              # 类型检查
-pnpm test                                   # 89 个测试，全部使用临时目录与模拟模型
+pnpm test                                   # 89 个测试
+node scripts/accept-crash.ts                # 崩溃恢复验收（真实杀进程 + 本地受控模型），全部使用临时目录与模拟模型
 pnpm smoke:mini                             # 真实模型最小链路
 pnpm smoke:real                             # 真实模型综合协作场景
 node scripts/verify-run.ts <db> [taskId]    # 对已有运行记录重新做严格判定，不调用模型

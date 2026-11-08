@@ -169,8 +169,14 @@ if (askIndex !== -1) {
       return null;
     }
   })();
+  // 注意：本进程可能已经写过 pid 文件，不能把自己当成"另一个维护者"。
   const ownerAlive =
-    existing !== null && Number.isInteger(existing) && existing >= 2 && isPidAlive(existing) && looksLikeOurProcess(existing, 'watchdog');
+    existing !== null &&
+    existing !== process.pid &&
+    Number.isInteger(existing) &&
+    existing >= 2 &&
+    isPidAlive(existing) &&
+    looksLikeOurProcess(existing, 'watchdog');
 
   if (ownerAlive) {
     // 已经有维护者在跑：等它处理，不启动第二个。
