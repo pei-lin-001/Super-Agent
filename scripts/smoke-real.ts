@@ -1,0 +1,191 @@
+/**
+ * 真实模型冒烟：用配置里的真实模型跑一遍综合场景。
+ * 运行：node --env-file-if-exists=.env.local scripts/smoke-real.ts
+ */
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { loadConfig } from '../src/config.ts';
+import { OpenAICompatibleModel } from '../src/model/openai.ts';
+import { Router } from '../src/runtime/router.ts';
+import { Runtime } from '../src/runtime/runtime.ts';
+import { Store } from '../src/storage/store.ts';
+
+const MATERIALS: Record<string, string> = {
+  'sales-q3.md': `# 2026 年 Q3 销售数据
+
+- 华北区营收：1280 万元，环比增长 12%
+- 华东区营收：2160 万元，环比增长 9%
+- 华南区营收：1740 万元，环比下降 3%
+- 合计营收：5180 万元
+- 新签客户：47 家
+`,
+  'ops-q3.md': `# 2026 年 Q3 运营数据
+
+- 活跃客户数：1820 家（Q2 为 1655 家）
+- 平均交付周期：18 天（Q2 为 24 天）
+- 客户满意度：4.4 / 5（Q2 为 4.6 / 5）
+- 工单积压：312 单，其中超期 58 单
+`,
+  'notes.md': `# 内部备注
+
+- 华南区下滑主要来自两个大客户续约延后。
+- 满意度下降与交付周期缩短并存，需要核对统计口径是否一致。
+- 华东区 9% 的增长口径与 Q2 口径不同，统计时注意。
+`,
+};
+
+function log(message: string): void {
+  console.log(`[${new Date().toISOString().slice(11, 19)}] ${message}`);
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function main(): Promise<void> {
+  const config = loadConfig();
+  await mkdir(config.materialsDir, { recursive: true });
+  for (const [name, content] of Object.entries(MATERIALS)) {
+    const path = join(config.materialsDir, name);
+    try {
+      await readFile(path);
+    } catch {
+      await writeFile(path, content, 'utf8');
+      log(`已写入材料 ${name}`);
+    }
+  }
+
+  const loggingFetch: typeof fetch = async (input, init) => {
+    const response = await fetch(input, init);
+    const copy = response.clone();
+    void copy.text().then((text) => {
+      try {
+        const json = JSON.parse(text) as {
+          choices?: { finish_reason?: string; message?: { content?: string; tool_calls?: unknown[] } }[];
+          usage?: unknown;
+        };
+        const choice = json.choices?.[0];
+        log(
+          `模型响应 finish=${choice?.finish_reason} content=${(choice?.message?.content ?? '').length} tools=${choice?.message?.tool_calls?.length ?? 0} usage=${JSON.stringify(json.usage)}`,
+        );
+      } catch {
+        log(`模型响应非 JSON：${text.slice(0, 200)}`);
+      }
+    });
+    return response;
+  };
+
+  const store = new Store(config.dbPath);
+  const workerModel = new OpenAICompatibleModel({
+    baseUrl: config.baseUrl,
+    apiKey: config.apiKey,
+    timeoutMs: config.timeoutMs,
+    retry: config.limits.modelRetry,
+    reasoningEffort: config.reasoningEffort,
+    maxTokens: config.maxTokens,
+    fetchImpl: loggingFetch,
+  });
+  const routerModel = new OpenAICompatibleModel({
+    baseUrl: config.baseUrl,
+    apiKey: config.apiKey,
+    timeoutMs: config.timeoutMs,
+    retry: config.limits.modelRetry,
+    reasoningEffort: config.reasoningEffort,
+    maxTokens: config.maxTokens,
+    fetchImpl: loggingFetch,
+  });
+  config.limits.maxConcurrentRuns = Math.min(config.limits.maxConcurrentRuns, 1);
+  const runtime = new Runtime({ store, config, workerModel });
+  const router = new Router(runtime, routerModel, config);
+  runtime.attachRouter(router);
+
+  const unsubscribe = runtime.on((event) => {
+    switch (event.type) {
+      case 'router.reply':
+        log(`Router：${event.text}`);
+        break;
+      case 'router.notice':
+        log(`提示：${event.text}`);
+        break;
+      case 'task.created':
+        log(`任务建立：${event.taskId} ${event.title}`);
+        break;
+      case 'task.status':
+        log(`任务状态：${event.taskId} → ${event.status}`);
+        break;
+      case 'worker.created':
+        log(`Worker：${event.workerId}（${event.role}${event.parentId ? `，来源 ${event.parentId}` : ''}）`);
+        break;
+      case 'message.sent':
+        log(`消息：${event.from} → ${event.to} (${event.kind})`);
+        break;
+      case 'error':
+        log(`错误：${event.text}`);
+        break;
+      default:
+        break;
+    }
+  });
+
+  runtime.start();
+  const recovered = runtime.recover();
+  if (recovered.interruptedWorkers > 0) log(`恢复：${recovered.interruptedWorkers} 个中断的 Worker 已重新排队`);
+
+  const started = Date.now();
+  log('发送主请求');
+  await router.handleUserMessage(
+    '请根据 materials 目录下的三份材料整理一份季度报告，保存为 report.md。要求：给出营收与运营的关键结论，所有数据都标注来源文件；完成后请安排一次同组检查再交付。',
+  );
+  const routerDone = Date.now() - started;
+  log(`Router 首轮回复完成，用时 ${(routerDone / 1000).toFixed(1)}s（此时 Worker 应仍在后台工作）`);
+
+  await sleep(2000);
+  log('在后台工作期间发送第二条独立请求');
+  const secondStart = Date.now();
+  await router.handleUserMessage('顺便用一句话说明：这个系统里 Router 和 Worker 各负责什么？');
+  log(`第二条请求已回复，等待 ${((Date.now() - secondStart) / 1000).toFixed(1)}s`);
+
+  const deadline = Date.now() + 600_000;
+  while (Date.now() < deadline) {
+    const tasks = store.listTasks();
+    const open = tasks.filter((task) => task.status === 'active' || task.status === 'waiting' || task.status === 'pending');
+    if (tasks.length > 0 && open.length === 0 && runtime.stats().running === 0) break;
+    await sleep(1000);
+  }
+  await runtime.waitForIdle(30_000);
+
+  log('==== 结果 ====');
+  for (const task of store.listTasks()) {
+    console.log(`\n任务 ${task.id}｜${task.title}｜状态 ${task.status}｜负责人 ${task.ownerWorkerId}`);
+    console.log(`  目标：${task.goal}`);
+    console.log(`  完成条件：${task.doneCriteria}`);
+    if (task.closeReason) console.log(`  结项说明：${task.closeReason.slice(0, 300)}`);
+    for (const worker of store.listGroupWorkers(task.groupId)) {
+      console.log(`  - ${worker.id} ${worker.role} ${worker.status} steps=${worker.stepCount} parent=${worker.parentId ?? '-'}`);
+    }
+    for (const message of store.listGroupMessages(task.groupId, 100)) {
+      console.log(`    [${message.kind}] ${message.fromId}→${message.toId} ${message.status} ${message.body.slice(0, 120)}`);
+    }
+    for (const artifact of store.listArtifacts(task.id)) {
+      console.log(`    产物：${artifact.name} v${artifact.version} ${artifact.bytes} 字节 sha256=${artifact.sha256.slice(0, 12)}`);
+    }
+  }
+
+  const taskWithArtifacts = store.listTasks().filter((task) => store.listArtifacts(task.id).length > 0);
+  const reportTask = taskWithArtifacts.at(-1);
+  const artifacts = reportTask ? store.listArtifacts(reportTask.id) : [];
+  const latest = artifacts.at(-1);
+  if (latest) {
+    const content = await readFile(join(config.workDir, latest.path), 'utf8');
+    console.log(`\n==== 产物正文（${latest.name} v${latest.version}）====\n${content.slice(0, 2000)}`);
+  } else {
+    console.log('\n==== 没有产生任何产物 ====');
+  }
+
+  unsubscribe();
+  await runtime.stop();
+  store.close();
+}
+
+main().catch((error: unknown) => {
+  console.error('冒烟失败：', error instanceof Error ? error.stack ?? error.message : error);
+  process.exitCode = 1;
+});
