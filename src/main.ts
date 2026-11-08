@@ -101,6 +101,8 @@ async function main(): Promise<void> {
   const daemon = process.argv.includes('--daemon') || process.env['SUPER_AGENT_DAEMON'] === '1';
   runtime.start();
   if (daemon) {
+    // 后台模式必须自己撑住事件循环：否则没有任何活跃句柄时进程会直接退出。
+    heartbeatTimer.ref?.();
     console.log('后台常驻模式：不依赖标准输入，调度持续运行。停止请用 SIGTERM 或写停机标记。');
     const stopFile = join(config.workDir, '.runtime', 'watchdog.stop');
     const stopWatcher = setInterval(() => {

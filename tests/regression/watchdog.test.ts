@@ -586,3 +586,48 @@ test('停机标记：存在时不会自动拉起主系统', async () => {
     await harness.cleanup();
   }
 });
+
+test('后台模式：不依赖标准输入，心跳持续推进直到显式停止', async () => {
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join: joinPath } = await import('node:path');
+  const { spawn } = await import('node:child_process');
+  const dir = await mkdtemp(joinPath(tmpdir(), 'daemon-'));
+  const workDir = joinPath(dir, 'work');
+  const child = spawn(process.execPath, ['src/main.ts', '--daemon'], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      DB_PATH: joinPath(dir, 'agent.db'),
+      WORK_DIR: workDir,
+      OLLAMA_BASE_URL: 'http://127.0.0.1:9/v1',
+      OLLAMA_API_KEY: 'k',
+      MODEL_NAME: 'm',
+      MODEL_CONCURRENCY: '1',
+    },
+    stdio: 'ignore',
+  });
+  try {
+    const heartbeatPath = joinPath(workDir, '.runtime', 'heartbeat.json');
+    await waitFor(() => existsSync(heartbeatPath), 15_000);
+    const first = JSON.parse(readFileSync(heartbeatPath, 'utf8')) as { at: number };
+    // 没有标准输入的情况下，进程必须继续跑并推进心跳
+    await new Promise((resolve) => setTimeout(resolve, 7000));
+    const second = JSON.parse(readFileSync(heartbeatPath, 'utf8')) as { at: number };
+    assert.equal(child.exitCode, null, '后台模式不应自行退出');
+    assert.ok(second.at > first.at, '心跳必须继续推进');
+
+    child.kill('SIGTERM');
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    const instance = JSON.parse(readFileSync(joinPath(workDir, '.runtime', 'instance.json'), 'utf8')) as {
+      pid: number | null;
+      stopped: boolean;
+    };
+    assert.equal(instance.stopped, true, '停止后应标记已停机');
+    assert.equal(instance.pid, null, '不允许用 0 冒充进程号');
+  } finally {
+    child.kill('SIGTERM');
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await rm(dir, { recursive: true, force: true });
+  }
+});
