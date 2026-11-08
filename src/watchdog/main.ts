@@ -100,35 +100,85 @@ process.on('exit', releaseLock);
 
 writeFileSync(pidFile, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }, null, 2), 'utf8');
 
-// 维护者提问入口：不抢巡检锁，用独立的问题锁避免与巡检同时改同一会话。
+// 维护者提问入口：写持久问题队列，由唯一的维护者串行处理。
+// 已有 Watchdog 在跑时，这里只当客户端，不会因为单实例约束被拒绝。
+// 没有 Watchdog 在跑时，本次进程接管唯一的维护资格来处理问题。
 const askIndex = process.argv.indexOf('--ask');
+const questionId = `wdq_${Date.now().toString(36)}${Math.random().toString(16).slice(2, 6)}`;
+
+async function runQuestionWorker(): Promise<void> {
+  const pending = store.nextPendingQuestion();
+  if (!pending) return;
+  try {
+    const answer = await session.ask(pending.question);
+    store.finishWdQuestion(pending.id, answer, null);
+  } catch (error) {
+    store.finishWdQuestion(pending.id, null, (error as Error).message);
+  }
+}
+
 if (askIndex !== -1) {
   const question = process.argv[askIndex + 1] ?? '';
   if (question.trim() === '') {
     console.log('用法：pnpm watchdog --ask "为什么这个任务停住了？"');
     process.exit(1);
   }
-  const lockPath = join(config.workDir, '.runtime', 'ask.lock');
-  mkdirSync(dirname(lockPath), { recursive: true });
-  try {
-    writeFileSync(lockPath, String(process.pid), { flag: 'wx' });
-  } catch {
-    console.log(`另一个维护入口正在处理提问（${lockPath}）。请稍后再试。`);
-    store.close();
-    process.exit(4);
-  }
-  try {
-    console.log(`提问：${question}`);
-    console.log('---');
-    console.log(await session.ask(question));
-  } finally {
+  store.insertWdQuestion(questionId, question);
+  console.log(`已提交问题 ${questionId}`);
+
+  const existing = (() => {
     try {
-      rmSync(lockPath, { force: true });
+      const info = JSON.parse(readFileSync(pidFile, 'utf8')) as { pid: number };
+      return info.pid;
     } catch {
-      // 清理失败不影响回答结果。
+      return null;
     }
+  })();
+  const ownerAlive =
+    existing !== null && Number.isInteger(existing) && existing >= 2 && isPidAlive(existing) && looksLikeOurProcess(existing, 'watchdog');
+
+  if (ownerAlive) {
+    // 已经有维护者在跑：等它处理，不启动第二个。
+    const deadline = Date.now() + 180_000;
+    while (Date.now() < deadline) {
+      const record = store.getWdQuestion(questionId);
+      if (record && record.status !== 'pending') {
+        console.log('---');
+        console.log(record.status === 'done' ? record.answer ?? '' : `处理失败：${record.error ?? '未知原因'}`);
+        store.close();
+        process.exit(record.status === 'done' ? 0 : 1);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+    console.log('问题仍在队列中（维护者尚未处理完），可用 --answer <问题ID> 稍后查询。');
     store.close();
+    process.exit(5);
   }
+
+  // 没有维护者在跑：本次进程取得维护资格后处理问题。
+  await runQuestionWorker();
+  const record = store.getWdQuestion(questionId);
+  if (record) {
+    console.log('---');
+    console.log(record.status === 'done' ? record.answer ?? '' : `处理失败：${record.error ?? '未知原因'}`);
+  }
+  store.close();
+  process.exit(record?.status === 'done' ? 0 : 1);
+}
+
+const answerIndex = process.argv.indexOf('--answer');
+if (answerIndex !== -1) {
+  const id = process.argv[answerIndex + 1] ?? '';
+  const record = store.getWdQuestion(id);
+  if (!record) {
+    console.log(`找不到问题 ${id}`);
+    store.close();
+    process.exit(1);
+  }
+  console.log(`${record.status}｜${record.question}`);
+  if (record.answer) console.log(`回答：${record.answer}`);
+  if (record.error) console.log(`失败：${record.error}`);
+  store.close();
   process.exit(0);
 }
 
@@ -159,6 +209,8 @@ async function tick(): Promise<void> {
   }
   running = true;
   try {
+    // 提问与巡检串行：同一时刻只有一个维护会话在动。
+    await runQuestionWorker();
     const result = await session.runOnce(Math.round(intervalMs / 60_000));
     log(`巡检完成：${result.steps} 次模型调用${result.acted ? '，执行了维护动作' : ''}｜${result.summary.split('\n')[0]?.slice(0, 160) ?? ''}`);
   } catch (error) {

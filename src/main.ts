@@ -98,8 +98,49 @@ async function main(): Promise<void> {
     ].join('\n'),
   );
 
-  const daemon = process.argv.includes('--daemon') || process.env['SUPER_AGENT_DAEMON'] === '1';
+  // 生命周期由主入口统一管理：恢复 → 启动调度 → 进入交互或后台等待 → 统一收尾。
+  // 交互入口不再单独承担恢复与停止，避免两套逻辑分叉。
+  const recovered = runtime.recover();
+  if (recovered.recovered > 0 || recovered.waiting > 0) {
+    console.log(
+      `[恢复] 执行中断 ${recovered.interrupted} 个、重新排队 ${recovered.requeued} 个、仍在等待 ${recovered.waiting} 个。`,
+    );
+  }
   runtime.start();
+
+  let shuttingDown: Promise<void> | null = null;
+  const shutdown = (reason: string): Promise<void> => {
+    if (shuttingDown) return shuttingDown;
+    shuttingDown = (async () => {
+      console.log(`正在收尾（${reason}）。`);
+      try {
+        // 先停止接受新执行并等运行中的工作结束，再把存储关掉；
+        // 任何迟到回调都会看到 stopped 标记，不会访问已经关闭的数据库。
+        await runtime.stop();
+      } catch (error) {
+        console.error('收尾阶段出错：', (error as Error).message);
+      }
+      clearInterval(heartbeatTimer);
+      try {
+        store.close();
+      } catch {
+        // 关闭失败不阻塞退出。
+      }
+    })();
+    return shuttingDown;
+  };
+
+  const waitForSignal = (): Promise<void> =>
+    new Promise<void>((resolve) => {
+      process.once('SIGINT', () => resolve());
+      process.once('SIGTERM', () => resolve());
+    });
+
+  process.on('unhandledRejection', (reason) => {
+    console.error('未处理的 Promise 拒绝：', reason instanceof Error ? reason.message : reason);
+  });
+
+  const daemon = process.argv.includes('--daemon') || process.env['SUPER_AGENT_DAEMON'] === '1';
   if (daemon) {
     // 后台模式必须自己撑住事件循环：否则没有任何活跃句柄时进程会直接退出。
     heartbeatTimer.ref?.();
@@ -116,26 +157,16 @@ async function main(): Promise<void> {
       }
     }, 3000);
     stopWatcher.unref?.();
-    await new Promise<void>((resolve) => {
-      const stop = (): void => {
-        console.log('收到停止信号，正在收尾。');
-        resolve();
-      };
-      process.on('SIGINT', stop);
-      process.on('SIGTERM', stop);
-    });
-    runtime.stop();
-    clearInterval(heartbeatTimer);
-    store.close();
+    await waitForSignal();
+    await shutdown('收到停止信号');
     return;
   }
-  try {
-    await startRepl({ runtime, router });
-  } finally {
-    runtime.stop();
-    clearInterval(heartbeatTimer);
-    store.close();
-  }
+  const replDone = startRepl({ runtime, router }).catch((error: unknown) => {
+    console.error('交互入口出错：', (error as Error).message);
+  });
+  await Promise.race([replDone, waitForSignal()]);
+  await shutdown('退出');
+  await replDone;
 }
 
 main().catch((error: unknown) => {

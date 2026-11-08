@@ -340,7 +340,8 @@ Watchdog 不是 Runtime 里的一个定时函数，它是**独立进程**：有�
 pnpm start                 # 交互模式（REPL）
 pnpm start -- --daemon     # 后台常驻：不依赖标准输入，调度持续运行
 pnpm watchdog              # 只启动 Watchdog
-pnpm watchdog --ask "为什么这个任务停住了？"   # 维护者提问，主系统不可用时也能用
+pnpm watchdog --ask "为什么这个任务停住了？"   # 维护者提问（写持久队列，由唯一维护者处理）
+pnpm watchdog --answer <问题ID>                # 查询之前提交的问题
 ```
 
 ### 一次真实巡检的结果（不是演示）
@@ -483,7 +484,7 @@ REPL 命令：
 
 ```bash
 pnpm typecheck                              # 类型检查
-pnpm test                                   # 81 个测试，全部使用临时目录与模拟模型
+pnpm test                                   # 84 个测试，全部使用临时目录与模拟模型
 pnpm smoke:mini                             # 真实模型最小链路
 pnpm smoke:real                             # 真实模型综合协作场景
 node scripts/verify-run.ts <db> [taskId]    # 对已有运行记录重新做严格判定，不调用模型

@@ -235,7 +235,7 @@ test('独立进程：Watchdog 作为分离进程启动，主系统不在也能�
     const { DatabaseSync } = await import('node:sqlite');
     const db = new DatabaseSync(dbPath, { readOnly: true });
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'wd_%'").all() as { name: string }[];
-    assert.deepEqual(tables.map((t) => t.name).sort(), ['wd_action', 'wd_issue', 'wd_turn']);
+    assert.deepEqual(tables.map((t) => t.name).sort(), ['wd_action', 'wd_issue', 'wd_question', 'wd_turn']);
     db.close();
   } finally {
     child.kill('SIGTERM');
@@ -344,7 +344,7 @@ test('挂起：已发出的响应返回后不执行工具，也不写文件', as
     const path = join(harness.config.workDir, task.id, 'late.txt');
     assert.equal(existsSync(path), false, '挂起之后返回的响应不应执行写操作');
     const turns = harness.store.listWorkerTurns(owner.id, 50).map((turn) => turn.content);
-    assert.ok(turns.some((text) => (text ?? '').includes('结果未知')), '应留下结果未知的记录');
+    assert.ok(turns.some((text) => (text ?? '').includes('未执行')), '应留下「未执行」的记录，而不是伪造工具结果');
   } finally {
     await harness.cleanup();
   }
@@ -628,6 +628,176 @@ test('后台模式：不依赖标准输入，心跳持续推进直到显式停�
   } finally {
     child.kill('SIGTERM');
     await new Promise((resolve) => setTimeout(resolve, 500));
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('后台恢复：预存 queued 任务，后台启动后会真正进入调度', async () => {
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join: joinPath } = await import('node:path');
+  const { spawn } = await import('node:child_process');
+  const dir = await mkdtemp(joinPath(tmpdir(), 'daemon-recover-'));
+  const workDir = joinPath(dir, 'work');
+  const dbPath = joinPath(dir, 'agent.db');
+
+  // 先用同一套代码在库里留下一个 queued 任务
+  const seed = await createHarness({ limits: { maxConcurrentRuns: 0 }, worker: () => mockReply({ text: 'ok' }) });
+  const config0 = { ...seed.config, dbPath, workDir };
+  await seed.cleanup();
+  const pre = new (await import('../../src/storage/store.ts')).Store(dbPath);
+  const { Runtime } = await import('../../src/runtime/runtime.ts');
+  const preRuntime = new Runtime({
+    store: pre,
+    config: config0,
+    workerModel: new (await import('../../src/model/mock.ts')).MockModel(() => mockReply({ text: 'ok' })),
+  });
+  const created = preRuntime.createTask({ title: '后台恢复', goal: 'g', ownerRole: 'r', ownerBrief: 'b' });
+  preRuntime.enqueue(created.owner.id);
+  pre.close();
+
+  const child = spawn(process.execPath, ['src/main.ts', '--daemon'], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      DB_PATH: dbPath,
+      WORK_DIR: workDir,
+      OLLAMA_BASE_URL: 'http://127.0.0.1:9/v1',
+      OLLAMA_API_KEY: 'k',
+      MODEL_NAME: 'm',
+      MODEL_CONCURRENCY: '1',
+    },
+    stdio: 'ignore',
+  });
+  try {
+    await waitFor(() => existsSync(joinPath(workDir, '.runtime', 'heartbeat.json')), 20_000);
+    await new Promise((resolve) => setTimeout(resolve, 6000));
+    const { DatabaseSync } = await import('node:sqlite');
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    const worker = db.prepare('SELECT step_count, status FROM worker').get() as { step_count: number; status: string };
+    db.close();
+    // 模型不可达会失败，但关键是有没有真的从恢复走到调度：步数必须动过或状态不再是 queued
+    assert.ok(
+      worker.step_count > 0 || worker.status !== 'queued',
+      `后台模式必须恢复并调度，实际 ${JSON.stringify(worker)}`,
+    );
+  } finally {
+    child.kill('SIGTERM');
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('后台停机：模型请求未返回时停止，不出现关闭数据库后的访问', async () => {
+  const { createServer } = await import('node:http');
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join: joinPath } = await import('node:path');
+  const { spawn } = await import('node:child_process');
+
+  // 故意慢响应：让停止发生在模型请求尚未返回的时候
+  const server = createServer((_req, res) => {
+    setTimeout(() => {
+      try {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }], usage: {} }));
+      } catch {
+        // 连接已关闭
+      }
+    }, 15_000);
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as { port: number }).port;
+
+  const dir = await mkdtemp(joinPath(tmpdir(), 'daemon-stop-'));
+  const workDir = joinPath(dir, 'work');
+  const dbPath = joinPath(dir, 'agent.db');
+  const child = spawn(process.execPath, ['src/main.ts', '--daemon'], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      DB_PATH: dbPath,
+      WORK_DIR: workDir,
+      OLLAMA_BASE_URL: `http://127.0.0.1:${port}/v1`,
+      OLLAMA_API_KEY: 'k',
+      MODEL_NAME: 'm',
+      MODEL_TIMEOUT_MS: '60000',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout?.on('data', (chunk: Buffer) => {
+    output += chunk.toString();
+  });
+  child.stderr?.on('data', (chunk: Buffer) => {
+    output += chunk.toString();
+  });
+  try {
+    await waitFor(() => existsSync(joinPath(workDir, '.runtime', 'heartbeat.json')), 20_000);
+    const { DatabaseSync } = await import('node:sqlite');
+    const seedDb = new DatabaseSync(dbPath);
+    seedDb.exec(
+      `INSERT INTO task (id, group_id, title, goal, brief, done_criteria, require_review, review_epoch, status, created_at, updated_at)
+       VALUES ('task_stop','g_stop','t','g','b','',0,0,'active','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')`,
+    );
+    seedDb.close();
+
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    child.kill('SIGTERM');
+    const code = await new Promise<number | null>((resolve) => child.on('exit', resolve));
+    assert.equal(code, 0, `应正常退出，实际 ${code}；输出：${output.slice(-300)}`);
+    assert.ok(!output.includes('database is not open'), '不能在存储关闭后继续访问数据库');
+  } finally {
+    child.kill('SIGKILL');
+    server.close();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('文件边界：相邻前缀目录、绝对路径、.. 与符号链接逃逸都被拒绝', async () => {
+  const { mkdtemp, writeFile, mkdir, symlink, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join: joinPath } = await import('node:path');
+  const dir = await mkdtemp(joinPath(tmpdir(), 'wd-files-'));
+  const root = joinPath(dir, 'work');
+  const neighbour = joinPath(dir, 'work-leak');
+  await mkdir(root, { recursive: true });
+  await mkdir(neighbour, { recursive: true });
+  await writeFile(joinPath(root, 'ok.txt'), '正常内容', 'utf8');
+  await writeFile(joinPath(neighbour, 'secret.txt'), '不该被读到', 'utf8');
+  await writeFile(joinPath(dir, 'outside.txt'), '外部文件', 'utf8');
+  await symlink(joinPath(dir, 'outside.txt'), joinPath(root, 'link.txt'));
+
+  const harness = await createHarness({ limits: { maxConcurrentRuns: 0 }, worker: () => mockReply({ text: 'ok' }) });
+  try {
+    type Req = { request: { messages: { role: string; content: string | null }[] } };
+    const session = new WatchdogSession({
+      store: harness.store,
+      config: { ...harness.config, workDir: root },
+      model: new MockModel((context) => {
+        const req = context as unknown as Req;
+        const asked = req.request.messages.at(-1)?.content ?? '';
+        const path = /READ:(.+)$/.exec(asked)?.[1] ?? 'ok.txt';
+        return mockReply({ toolCalls: [{ name: 'read_file', arguments: JSON.stringify({ path }) }] });
+      }),
+      modelName: 'mock',
+    });
+
+    const ask = async (path: string): Promise<string> => {
+      const answer = await session.ask(`READ:${path}`);
+      return answer;
+    };
+    // mock 会一直调用工具，取最后一次工具结果即可：这里直接调用工具路径
+    const direct = (session as unknown as { readInsideRoot: (p: string, o: number, l: number) => string }).readInsideRoot.bind(session);
+    assert.match(direct('ok.txt', 0, 1000), /正常内容/);
+    assert.match(direct('../work-leak/secret.txt', 0, 1000), /拒绝读取|越界/);
+    assert.match(direct('/etc/passwd', 0, 1000), /拒绝读取|越界/);
+    assert.match(direct('link.txt', 0, 1000), /拒绝读取|符号链接/);
+    assert.match(direct('nope.txt', 0, 1000), /文件不存在/);
+    void ask;
+  } finally {
+    await harness.cleanup();
     await rm(dir, { recursive: true, force: true });
   }
 });

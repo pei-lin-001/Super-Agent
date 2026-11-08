@@ -598,6 +598,34 @@ export class Store {
     );
   }
 
+  insertWdQuestion(id: string, question: string): void {
+    this.run(`INSERT INTO wd_question (id, question, status, asked_at) VALUES (?, ?, 'pending', ?)`, id, question, nowIso());
+  }
+
+  nextPendingQuestion(): { id: string; question: string } | null {
+    const row = this.get(`SELECT id, question FROM wd_question WHERE status = 'pending' ORDER BY asked_at ASC LIMIT 1`);
+    return row ? { id: str(row['id']), question: str(row['question']) } : null;
+  }
+
+  finishWdQuestion(id: string, answer: string | null, error: string | null): void {
+    this.run(
+      `UPDATE wd_question SET status = ?, answer = ?, error = ?, answered_at = ? WHERE id = ?`,
+      error ? 'failed' : 'done', answer, error, nowIso(), id,
+    );
+  }
+
+  getWdQuestion(id: string): { id: string; question: string; status: string; answer: string | null; error: string | null } | null {
+    const row = this.get('SELECT * FROM wd_question WHERE id = ?', id);
+    if (!row) return null;
+    return {
+      id: str(row['id']),
+      question: str(row['question']),
+      status: str(row['status']),
+      answer: strOrNull(row['answer']),
+      error: strOrNull(row['error']),
+    };
+  }
+
   listWdActions(limit = 20): { action: string; reason: string; result: string; createdAt: string }[] {
     return this.all('SELECT * FROM wd_action ORDER BY created_at DESC LIMIT ?', limit).map((row) => ({
       action: str(row['action']),

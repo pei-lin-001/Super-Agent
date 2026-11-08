@@ -970,6 +970,7 @@ export class Runtime implements ToolHost {
   }): { ok: boolean; messageId?: string; reason?: string } {
     const task = this.store.getTask(input.taskId);
     if (!task) return { ok: false, reason: '任务不存在' };
+    if (isTerminalTask(task.status)) return { ok: false, reason: `任务已 ${task.status}，不接受新的指令` };
     const worker = this.store.getWorker(input.workerId);
     if (!worker) return { ok: false, reason: 'Worker 不存在' };
     if (worker.groupId !== task.groupId) return { ok: false, reason: 'Worker 不属于该任务' };
@@ -1154,8 +1155,10 @@ export class Runtime implements ToolHost {
     };
 
     for (let stepIndex = 0; stepIndex < this.config.limits.maxStepsPerRun; stepIndex += 1) {
-      if (stale()) {
-        this.store.appendEvent(task.id, workerId, 'run.stale', `第 ${stepIndex} 步前发现运行代次已变化，停止本轮`);
+      const gate = this.canRun(workerId, epoch);
+      if (!gate.ok) {
+        this.store.appendEvent(task.id, workerId, 'run.stale', `第 ${stepIndex} 步前停止：${gate.reason}`);
+        this.settleWorker(workerId, gate.reason);
         return;
       }
       worker = this.store.getWorker(workerId)!;
@@ -1182,9 +1185,11 @@ export class Runtime implements ToolHost {
         reasoningEffort: this.config.reasoningEffort,
       });
 
-      if (stale()) {
-        this.store.appendEvent(task.id, workerId, 'run.stale', '模型响应返回时运行代次已变化，本次响应不执行任何工具');
-        this.recordStaleResult(worker, result);
+      const afterModel = this.canRun(workerId, epoch);
+      if (!afterModel.ok) {
+        this.store.appendEvent(task.id, workerId, 'run.stale', `模型响应返回后停止：${afterModel.reason}`);
+        this.recordStaleResult(worker, result, afterModel.reason);
+        this.settleWorker(workerId, afterModel.reason);
         return;
       }
       this.store.bumpWorkerStep(workerId);
@@ -1207,8 +1212,10 @@ export class Runtime implements ToolHost {
 
       for (let index = 0; index < result.toolCalls.length; index += 1) {
         const call = result.toolCalls[index]!;
-        if (stale()) {
-          this.recordUnexecuted(worker, result.toolCalls.slice(index), '运行代次已变化（暂停或取消），剩余调用未执行');
+        const beforeTool = this.canRun(workerId, epoch);
+        if (!beforeTool.ok) {
+          this.recordUnexecuted(worker, result.toolCalls.slice(index), `${beforeTool.reason}，剩余调用未执行`);
+          this.settleWorker(workerId, beforeTool.reason);
           return;
         }
         const currentTask = this.store.getTaskByGroup(worker.groupId);
@@ -1391,22 +1398,64 @@ export class Runtime implements ToolHost {
     }
   }
 
-  /** 迟到响应：保留成"结果未知"，不冒充未执行，也不冒充成功。 */
-  private recordStaleResult(worker: Worker, result: { text: string | null; toolCalls: ToolCall[] }): void {
-    const text = result.text?.trim() ?? '';
+  /**
+   * 统一执行资格：所有执行入口（出队、每轮开头、发起请求前、响应返回后、工具调用前）用同一套规则。
+   * 代次负责识别旧响应，这里负责决定还能不能继续。
+   */
+  private canRun(workerId: string, epoch: number): { ok: true } | { ok: false; reason: string; terminal: boolean } {
+    if (this.stopped) return { ok: false, reason: '系统已停止', terminal: false };
+    const worker = this.store.getWorker(workerId);
+    if (!worker) return { ok: false, reason: 'Worker 不存在', terminal: true };
+    if (isTerminalWorker(worker.status)) return { ok: false, reason: `Worker 已 ${worker.status}`, terminal: true };
+    const task = this.store.getTaskByGroup(worker.groupId);
+    if (!task) return { ok: false, reason: '任务不存在', terminal: true };
+    if (isTerminalTask(task.status)) return { ok: false, reason: `任务已 ${task.status}`, terminal: true };
+    if (Number(task.maintenance ?? 0) === 1) return { ok: false, reason: '任务处于维护挂起', terminal: false };
+    if ((worker.runEpoch ?? 0) !== epoch) return { ok: false, reason: '运行代次已变化', terminal: false };
+    return { ok: true };
+  }
+
+  /**
+   * 执行过程结束时的统一收尾：把 Worker 落到一个能解释的状态。
+   * 只有实际执行的过程可以把状态维持在 running；退出时必须说明它为什么继续、等待或结束。
+   */
+  private settleWorker(workerId: string, reason: string): void {
+    const worker = this.store.getWorker(workerId);
+    if (!worker || isTerminalWorker(worker.status)) return;
+    if (worker.status !== 'running') return;
+    const task = this.store.getTaskByGroup(worker.groupId);
+    if (this.stopped || (task && isTerminalTask(task.status))) return;
+    if (task && Number(task.maintenance ?? 0) === 1) {
+      this.store.setWorkerStatus(workerId, 'waiting', reason);
+      return;
+    }
+    const waits = this.store.listActiveWaitsForWorker(workerId);
+    if (waits.length > 0) {
+      this.store.setWorkerStatus(workerId, 'waiting', reason);
+      return;
+    }
+    this.store.setWorkerStatus(workerId, 'waiting', reason);
+    this.enqueue(workerId);
+  }
+
+  /** 迟到响应：只记程序事件，不伪造工具结果，也不冒充成功。 */
+  private recordStaleResult(worker: Worker, result: { text: string | null; toolCalls: ToolCall[] }, reason: string): void {
+    const task = this.store.getTaskByGroup(worker.groupId);
+    // 不写成 tool 消息：没有对应调用的 tool 结果会让下一次请求结构不合法。
+    // 这些调用从未派发，因此是"未执行"，不是"结果未知"。
     this.store.appendWorkerTurn({
       id: `turn_${worker.id}_${this.store.countWorkerTurns(worker.id) + 1}`,
       workerId: worker.id,
       seq: this.store.countWorkerTurns(worker.id) + 1,
-      role: 'tool',
+      role: 'assistant',
       content:
-        `[运行代次失效] 本轮响应在暂停/取消之后才返回，未执行任何工具（结果未知，不视为未执行）。` +
-        `${result.toolCalls.length > 0 ? ` 响应中要求调用：${result.toolCalls.map((call) => call.name).join('、')}。` : ''}` +
-        `${text === '' ? '' : ` 响应文本：${text.slice(0, 200)}`}`,
+        `（程序说明）上一次模型响应在${reason}之后才返回，其中的 ${result.toolCalls.length} 个工具调用**未执行**。` +
+        `这不是执行结果，不要把它们当成已完成。`,
       toolCalls: null,
       toolCallId: null,
       createdAt: nowIso(),
     });
+    this.store.appendEvent(task?.id ?? null, worker.id, 'run.stale', `${reason}；丢弃 ${result.toolCalls.length} 个未派发调用`);
   }
 
   /** 为未执行的调用补一条明确的 tool 记录，不伪造成功。 */

@@ -218,6 +218,17 @@ CREATE TABLE IF NOT EXISTS wd_issue (
 );
 CREATE INDEX IF NOT EXISTS idx_wd_issue_status ON wd_issue(status, check_after);
 
+CREATE TABLE IF NOT EXISTS wd_question (
+  id         TEXT PRIMARY KEY,
+  question   TEXT NOT NULL,
+  status     TEXT NOT NULL DEFAULT 'pending',
+  answer     TEXT,
+  error      TEXT,
+  asked_at   TEXT NOT NULL,
+  answered_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_wd_question_status ON wd_question(status, asked_at);
+
 CREATE TABLE IF NOT EXISTS wd_action (
   id         TEXT PRIMARY KEY,
   issue_id   TEXT,

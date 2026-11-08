@@ -5,8 +5,9 @@ import type { ChatMessage, ModelClient, ToolSchema } from '../model/types.ts';
 import type { Store } from '../storage/store.ts';
 import type { Config } from '../config.ts';
 import { observe, renderObservation } from './observer.ts';
-import { existsSync, readFileSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import { assertInsideRoot, resolveInside } from '../tools/paths.ts';
 import { observationPrompt, WATCHDOG_SYSTEM } from './prompts.ts';
 
 const WD_TOOLS: ToolSchema[] = [
@@ -74,7 +75,11 @@ const WD_TOOLS: ToolSchema[] = [
     description: '读取主系统工作目录内的证据文件（日志、产物、作业输出）。只读，路径不能跳出工作目录。',
     parameters: {
       type: 'object',
-      properties: { path: { type: 'string' }, limit: { type: 'number' } },
+      properties: {
+        path: { type: 'string' },
+        offset: { type: 'number', description: '从第几个字节开始，默认 0' },
+        limit: { type: 'number', description: '本次最多读取字节数，默认 8000，上限 200000' },
+      },
       required: ['path'],
     },
   },
@@ -126,6 +131,52 @@ export class WatchdogSession {
     return `wdi_${randomBytes(4).toString('hex')}`;
   }
 
+  /**
+   * 维护者读文件：复用既有路径规整 + 真实路径校验。
+   * 字符串前缀判断会把 work-leak 当成 work 的子目录，也会放过指向外部的符号链接。
+   */
+  private readInsideRoot(relative: string, offset: number, limit: number): string {
+    const root = this.deps.config.workDir;
+    let absolute: string;
+    try {
+      absolute = resolveInside(root, relative);
+      assertInsideRoot(root, absolute);
+    } catch (error) {
+      return `拒绝读取：${(error as Error).message}`;
+    }
+    if (!existsSync(absolute)) return `文件不存在：${relative}`;
+    let stat;
+    try {
+      stat = statSync(absolute);
+    } catch (error) {
+      return `无法读取文件属性：${(error as Error).message}`;
+    }
+    if (!stat.isFile()) return `不是普通文件：${relative}`;
+
+    const start = Number.isInteger(offset) && offset >= 0 ? offset : 0;
+    const size = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 200_000) : 8000;
+    const length = Math.min(size, Math.max(0, stat.size - start));
+    const buffer = Buffer.alloc(length);
+    let handle: number | null = null;
+    try {
+      handle = openSync(absolute, 'r');
+      const read = readSync(handle, buffer, 0, length, start);
+      const text = buffer.subarray(0, read).toString('utf8');
+      const more = start + read < stat.size ? `\n…（已到本次上限，可用 offset=${start + read} 继续）` : '';
+      return `${text}${more}`;
+    } catch (error) {
+      return `读取失败：${(error as Error).message}`;
+    } finally {
+      if (handle !== null) {
+        try {
+          closeSync(handle);
+        } catch {
+          // 关闭失败不影响结果。
+        }
+      }
+    }
+  }
+
   private describeTask(taskId: string, limit: number): string {
     const store = this.deps.store;
     const task = store.getTask(taskId);
@@ -172,18 +223,7 @@ export class WatchdogSession {
         .join('\n');
     }
     if (name === 'read_file') {
-      const relative = str('path');
-      const limit = num('limit', 4000);
-      const root = this.deps.config.workDir;
-      const absolute = join(root, relative);
-      if (!absolute.startsWith(root)) return '路径越界：只能读取工作目录内的文件';
-      if (!existsSync(absolute)) return `文件不存在：${relative}`;
-      try {
-        const text = readFileSync(absolute, 'utf8');
-        return text.length > limit ? `${text.slice(0, limit)}\n…（已截断，共 ${text.length} 字符）` : text;
-      } catch (error) {
-        return `读取失败：${(error as Error).message}`;
-      }
+      return this.readInsideRoot(str('path'), num('offset', 0), num('limit', 8000));
     }
     if (name === 'inspect_task') {
       return this.describeTask(str('task_id'), num('limit', 15));
