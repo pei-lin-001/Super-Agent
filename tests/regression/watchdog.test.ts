@@ -313,3 +313,210 @@ test('单实例：第二个 Watchdog 不会启动，避免重复巡检与恢复�
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('挂起：已发出的响应返回后不执行工具，也不写文件', async () => {
+  let release: (() => void) | null = null;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const harness = await createHarness({
+    limits: { maxConcurrentRuns: 1, maxStepsPerRun: 4 },
+    worker: async () => {
+      await gate;
+      return mockReply({ toolCalls: [{ name: 'fs_write', arguments: { path: 'late.txt', content: '不该被写入' } }] });
+    },
+  });
+  try {
+    const { owner, task } = harness.runtime.createTask({
+      title: '挂起', goal: 'g', ownerRole: '负责人', ownerBrief: 'b',
+    });
+    harness.runtime.enqueue(owner.id);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    harness.store.insertControlCommand({
+      id: 'cc_pause2', command: 'pause_task', payload: JSON.stringify({ taskId: task.id, reason: '测试' }), source: 'watchdog',
+    });
+    harness.runtime.tick();
+    assert.equal(harness.store.getTask(task.id)?.maintenance, 1);
+
+    release!();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const path = join(harness.config.workDir, task.id, 'late.txt');
+    assert.equal(existsSync(path), false, '挂起之后返回的响应不应执行写操作');
+    const turns = harness.store.listWorkerTurns(owner.id, 50).map((turn) => turn.content);
+    assert.ok(turns.some((text) => (text ?? '').includes('结果未知')), '应留下结果未知的记录');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('恢复：只解除维护阻塞，不打断提供方退避', async () => {
+  const harness = await createHarness({ limits: { maxConcurrentRuns: 0 }, worker: () => mockReply({ text: 'ok' }) });
+  try {
+    const { owner, task } = harness.runtime.createTask({
+      title: '退避', goal: 'g', ownerRole: '负责人', ownerBrief: 'b',
+    });
+    harness.runtime.registerWait(owner, { reason: 'provider', timeoutMs: 60_000 });
+    harness.store.setWorkerStatus(owner.id, 'waiting');
+
+    harness.store.insertControlCommand({
+      id: 'cc_p3', command: 'pause_task', payload: JSON.stringify({ taskId: task.id }), source: 'watchdog',
+    });
+    harness.runtime.tick();
+    harness.store.insertControlCommand({
+      id: 'cc_r3', command: 'resume_task', payload: JSON.stringify({ taskId: task.id }), source: 'watchdog',
+    });
+    harness.runtime.tick();
+
+    const waits = harness.store.listActiveWaitsForWorker(owner.id);
+    assert.equal(waits.length, 1, '提供方退避必须保留');
+    assert.equal(waits[0]!.reason, 'provider');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('完成：正常交付也会清理后台作业', async () => {
+  const harness = await createHarness({
+    limits: { maxConcurrentRuns: 0 },
+    worker: () => mockReply({ text: 'ok' }),
+  });
+  try {
+    const { owner, task } = harness.runtime.createTask({
+      title: '完成清理', goal: 'g', ownerRole: '负责人', ownerBrief: 'b', requireReview: false,
+    });
+    const job = harness.runtime.startJob({
+      worker: owner, taskId: task.id, command: 'python3', args: ['-c', 'import time;time.sleep(30)'],
+      cwd: harness.config.workDir, stdin: null, timeoutMs: 60_000,
+    });
+    await harness.runtime.saveArtifact(owner, 'report.md', '# 完成\n');
+    const result = await harness.runtime.submitResult(owner, '完成', ['report.md']);
+    assert.equal(result.ok, true, result.reason);
+    assert.equal(harness.store.getTask(task.id)?.status, 'completed');
+    assert.notEqual(harness.store.getJob(job.id)?.status, 'running', '终态任务不应留下运行中的作业');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('零值配置：显式 0 合法，非法值明确报错', async () => {
+  const { loadConfig } = await import('../../src/config.ts');
+  const base = {
+    OLLAMA_BASE_URL: 'http://127.0.0.1:9/v1',
+    OLLAMA_API_KEY: 'k',
+    MODEL_NAME: 'm',
+  };
+  const previous = { ...process.env };
+  try {
+    Object.assign(process.env, base, { MAX_STEPS_PER_WORKER: '0', MAX_STEPS_PER_GROUP: '0' });
+    const config = loadConfig();
+    assert.equal(config.limits.maxStepsPerWorker, 0);
+    assert.equal(config.limits.maxStepsPerGroup, 0);
+
+    process.env['MAX_STEPS_PER_WORKER'] = '-3';
+    assert.throws(() => loadConfig(), /非负整数/);
+    process.env['MAX_STEPS_PER_WORKER'] = 'abc';
+    assert.throws(() => loadConfig(), /非负整数/);
+    process.env['MAX_STEPS_PER_WORKER'] = '1.5';
+    assert.throws(() => loadConfig(), /非负整数/);
+  } finally {
+    process.env = previous;
+  }
+});
+
+test('Router 续接：重启后仍能发现待续接进度，失败时保留记录', async () => {
+  const harness = await createHarness({ limits: { maxConcurrentRuns: 0 }, worker: () => mockReply({ text: 'ok' }) });
+  try {
+    harness.store.saveRouterSession({
+      id: 'rs_1', taskId: null, messages: [{ role: 'assistant', content: '已创建任务' }], reason: '额度用尽',
+    });
+    const { Router } = await import('../../src/runtime/router.ts');
+    const { MockModel } = await import('../../src/model/mock.ts');
+    let failNext = true;
+    const router = new Router(
+      harness.runtime,
+      new MockModel(() => {
+        if (failNext) {
+          failNext = false;
+          throw new Error('提供方暂时不可用');
+        }
+        return mockReply({ text: '继续完成协调' });
+      }),
+      harness.config,
+    );
+    assert.equal(router.hasPendingSession(), true, '以持久化状态为准');
+    await assert.rejects(() => router.resume());
+    assert.ok(harness.store.pendingRouterSession(), '失败后记录必须保留，不能标成 abandoned');
+    await router.resume();
+    assert.equal(harness.store.pendingRouterSession(), null, '成功后才关闭会话');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('Watchdog 维护闭环：命令有回执，动作与问题关联', async () => {
+  const harness = await createHarness({ limits: { maxConcurrentRuns: 0 }, worker: () => mockReply({ text: 'ok' }) });
+  try {
+    const { task } = harness.runtime.createTask({ title: '闭环', goal: 'g', ownerRole: 'r', ownerBrief: 'b' });
+    let round = 0;
+    const session = new WatchdogSession({
+      store: harness.store,
+      config: harness.config,
+      model: new MockModel(() => {
+        round += 1;
+        if (round === 1) {
+          return mockReply({
+            toolCalls: [
+              { name: 'record', arguments: JSON.stringify({ issue_id: 'wdi_fixed', task_id: task.id, title: '检查者空转', note: '重复脚本', check_after_minutes: 1 }) },
+              { name: 'maintain', arguments: JSON.stringify({ action: 'nudge_worker', worker_id: harness.store.getTask(task.id)!.ownerWorkerId, text: '请提交检查结论', issue_id: 'wdi_fixed', reason: '空转' }) },
+            ],
+          });
+        }
+        if (round === 2) {
+          return mockReply({ toolCalls: [{ name: 'command_status', arguments: {} }] });
+        }
+        return mockReply({ text: '已提交纠偏，等待回执。' });
+      }),
+      modelName: 'mock',
+    });
+    await session.runOnce(1);
+    const actions = harness.store.listWdActions(10);
+    assert.ok(actions.some((action) => action.action === 'nudge_worker'), '动作要落到动作表');
+    assert.ok(actions.some((action) => action.result.includes('cc_')), '动作要带命令标识');
+    const controls = harness.store.listPendingControls();
+    assert.equal(controls.length, 1);
+    // 主系统消费后回执变化
+    harness.runtime.tick();
+    const after = harness.store.listRecentControls(3)[0]!;
+    assert.equal(after.status, 'done', '命令执行后状态必须变化');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('在线规则：不支持的 key 被拒绝，巡检间隔覆盖项可校验', async () => {
+  const harness = await createHarness({ limits: { maxConcurrentRuns: 0 }, worker: () => mockReply({ text: 'ok' }) });
+  try {
+    harness.store.insertControlCommand({
+      id: 'cc_bad', command: 'set_override', payload: JSON.stringify({ key: 'anything.goes', content: 'x' }), source: 'watchdog',
+    });
+    harness.runtime.tick();
+    const bad = harness.store.listRecentControls(3)[0]!;
+    assert.equal(bad.status, 'failed');
+    assert.match(bad.result ?? '', /不支持的覆盖项/);
+
+    harness.store.insertControlCommand({
+      id: 'cc_int_bad', command: 'set_override', payload: JSON.stringify({ key: 'watchdog.interval', content: '5' }), source: 'watchdog',
+    });
+    harness.runtime.tick();
+    assert.equal(harness.store.listRecentControls(3)[0]!.status, 'failed');
+
+    harness.store.insertControlCommand({
+      id: 'cc_int', command: 'set_override', payload: JSON.stringify({ key: 'watchdog.interval', content: '30000', reason: '降低频率' }), source: 'watchdog',
+    });
+    harness.runtime.tick();
+    assert.equal(harness.store.activeOverride('watchdog.interval')?.content, '30000');
+  } finally {
+    await harness.cleanup();
+  }
+});

@@ -337,8 +337,10 @@ Watchdog 不是 Runtime 里的一个定时函数，它是**独立进程**：有�
 主系统退出后它仍在运行。
 
 ```bash
-pnpm start        # 只启动主系统
-pnpm watchdog     # 只启动 Watchdog（可与主系统同时运行）
+pnpm start                 # 交互模式（REPL）
+pnpm start -- --daemon     # 后台常驻：不依赖标准输入，调度持续运行
+pnpm watchdog              # 只启动 Watchdog
+pnpm watchdog --ask "为什么这个任务停住了？"   # 维护者提问，主系统不可用时也能用
 ```
 
 ### 一次真实巡检的结果（不是演示）
@@ -383,6 +385,18 @@ pnpm watchdog     # 只启动 Watchdog（可与主系统同时运行）
 - **复查**：每条动作写清做了什么、为什么、预期、判断标准、下次检查时间；问题进 `wd_issue` 台账，
   没恢复就继续跟，恢复才置 `closed`。
 
+### 挂起在执行边界生效
+
+`pause_task` 会推进群组的**运行代次**（`worker.run_epoch`）。每次模型请求返回、每个工具调用之前都会核对代次：
+
+- 挂起之后返回的响应 → 不执行任何工具，留一条「结果未知」记录（不冒充未执行，也不冒充成功）；
+- 排队中的 Worker 受 `maintenance` 约束；
+- 暂停→恢复后，暂停前发出的响应已经失去执行资格，不会重新执行；
+- 已在运行的后台作业保留（这与「禁止启动新操作」是两件事）。
+
+`resume_task` 只解除 `maintenance` 等待。`provider` / `job` / `reply` / `user` 等待保持原义，
+恢复时若有这类等待，记录 `task.resume_keep_wait` 并跳过该 Worker，不强行入队。
+
 ### 通知不再顺手解除等待
 
 `pushSystemNotice` 默认只投递、不唤醒：
@@ -409,6 +423,15 @@ rollback_override key=worker.check_rules version=1
 - Worker 构建 system prompt 时读取当前生效版本，**下一次请求就生效**，不需要重启；
 - system prompt 里会标注 `# 维护者调整（vN，仅调整工作方式，不改变程序约束）`；
 - 覆盖项不能改用户目标、要求版本、正式检查规则或提交门槛。
+
+### 后台模式与受控恢复
+
+- `--daemon` 复用同一个 Runtime，不复制内核；不读标准输入，靠 SIGTERM 或停机标记退出。
+- 实例文件里 `pid: null` + `stopped: true` 表示已停机（不再写 `0`；`0` 会被当成有效进程）。
+- 心跳文件 `work/.runtime/heartbeat.json` 每 5 秒更新，用来区分「进程活着但主循环无响应」。
+- Watchdog 判断主系统状态：`absent` / `exited` / `unverified`（PID 复用或命令行不符）/ `alive` / `unresponsive`。
+- 拉起有 120 秒冷却和 `work/.runtime/restart.json` 记录；启动失败保留 `work/.runtime/main.log`。
+- 停机标记在**动作执行前**重新检查，维护者明确停机时不会被自动拉起。
 
 ### 累计调用不再是失败条件
 
@@ -460,7 +483,7 @@ REPL 命令：
 
 ```bash
 pnpm typecheck                              # 类型检查
-pnpm test                                   # 71 个测试，全部使用临时目录与模拟模型
+pnpm test                                   # 78 个测试，全部使用临时目录与模拟模型
 pnpm smoke:mini                             # 真实模型最小链路
 pnpm smoke:real                             # 真实模型综合协作场景
 node scripts/verify-run.ts <db> [taskId]    # 对已有运行记录重新做严格判定，不调用模型

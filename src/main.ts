@@ -4,7 +4,7 @@ import { Router } from './runtime/router.ts';
 import { Runtime } from './runtime/runtime.ts';
 import { Store } from './storage/store.ts';
 import { startRepl } from './ui/repl.ts';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 async function main(): Promise<void> {
@@ -22,22 +22,48 @@ async function main(): Promise<void> {
   }
 
   const store = new Store(config.dbPath);
-  // 实例文件：Watchdog 靠它判断主系统是活着还是已经退出。
+  // 实例文件：Watchdog 靠它判断主系统是活着、已退出，还是身份无法确认。
   const instancePath = join(config.workDir, '.runtime', 'instance.json');
   mkdirSync(dirname(instancePath), { recursive: true });
-  writeFileSync(
-    instancePath,
-    JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), dbPath: config.dbPath }, null, 2),
-    'utf8',
-  );
-  const clearInstance = (): void => {
+  const heartbeatPath = join(config.workDir, '.runtime', 'heartbeat.json');
+  const writeInstance = (stopped: boolean): void => {
     try {
-      writeFileSync(instancePath, JSON.stringify({ pid: 0, startedAt: new Date().toISOString(), dbPath: config.dbPath }), 'utf8');
+      writeFileSync(
+        instancePath,
+        JSON.stringify(
+          {
+            pid: stopped ? null : process.pid,
+            startedAt: new Date().toISOString(),
+            dbPath: config.dbPath,
+            stopped,
+            heartbeat: heartbeatPath,
+          },
+          null,
+          2,
+        ),
+        'utf8',
+      );
     } catch {
       // 退出路径不因为写文件失败而阻塞。
     }
   };
-  process.on('exit', clearInstance);
+  writeInstance(false);
+  // 心跳：证明事件循环和调度还在转，而不只是进程还在。
+  const heartbeat = (): void => {
+    try {
+      writeFileSync(
+        heartbeatPath,
+        JSON.stringify({ pid: process.pid, at: Date.now(), queue: 0 }, null, 2),
+        'utf8',
+      );
+    } catch {
+      // 心跳失败不阻塞业务。
+    }
+  };
+  heartbeat();
+  const heartbeatTimer = setInterval(heartbeat, 5000);
+  heartbeatTimer.unref?.();
+  process.on('exit', () => writeInstance(true));
   const workerModel = new OpenAICompatibleModel({
     baseUrl: config.baseUrl,
     apiKey: config.apiKey,
@@ -72,9 +98,40 @@ async function main(): Promise<void> {
     ].join('\n'),
   );
 
+  const daemon = process.argv.includes('--daemon') || process.env['SUPER_AGENT_DAEMON'] === '1';
+  runtime.start();
+  if (daemon) {
+    console.log('后台常驻模式：不依赖标准输入，调度持续运行。停止请用 SIGTERM 或写停机标记。');
+    const stopFile = join(config.workDir, '.runtime', 'watchdog.stop');
+    const stopWatcher = setInterval(() => {
+      try {
+        if (existsSync(stopFile)) {
+          console.log('检测到停机标记，退出后台模式。');
+          process.kill(process.pid, 'SIGTERM');
+        }
+      } catch {
+        // 忽略标记读取失败。
+      }
+    }, 3000);
+    stopWatcher.unref?.();
+    await new Promise<void>((resolve) => {
+      const stop = (): void => {
+        console.log('收到停止信号，正在收尾。');
+        resolve();
+      };
+      process.on('SIGINT', stop);
+      process.on('SIGTERM', stop);
+    });
+    runtime.stop();
+    clearInterval(heartbeatTimer);
+    store.close();
+    return;
+  }
   try {
     await startRepl({ runtime, router });
   } finally {
+    runtime.stop();
+    clearInterval(heartbeatTimer);
     store.close();
   }
 }

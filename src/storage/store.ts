@@ -76,6 +76,7 @@ function mapWorker(row: Row): Worker {
     status: str(row['status']) as WorkerStatus,
     model: strOrNull(row['model']),
     stepCount: num(row['step_count']),
+    runEpoch: num(row['run_epoch'] ?? 0),
     createdAt: str(row['created_at']),
     updatedAt: str(row['updated_at']),
     lastError: strOrNull(row['last_error']),
@@ -232,6 +233,7 @@ export class Store {
     };
     ensureColumn('task', 'review_epoch', 'review_epoch INTEGER NOT NULL DEFAULT 0');
     ensureColumn('task', 'maintenance', 'maintenance INTEGER NOT NULL DEFAULT 0');
+    ensureColumn('worker', 'run_epoch', 'run_epoch INTEGER NOT NULL DEFAULT 0');
     ensureColumn('message', 'dedupe_key', 'dedupe_key TEXT');
     ensureColumn('message', 'broadcast_id', 'broadcast_id TEXT');
     ensureColumn('wait_record', 'reason', "reason TEXT NOT NULL DEFAULT 'reply'");
@@ -523,6 +525,16 @@ export class Store {
   }
 
   // ---------------- wait ----------------
+
+  /** 运行代次：使暂停/取消之前发出的响应失去执行资格。 */
+  bumpWorkerEpoch(workerId: string): number {
+    this.run('UPDATE worker SET run_epoch = run_epoch + 1 WHERE id = ?', workerId);
+    return num(this.get('SELECT run_epoch FROM worker WHERE id = ?', workerId)?.['run_epoch'] ?? 0);
+  }
+
+  bumpGroupEpoch(groupId: string): void {
+    for (const worker of this.listGroupWorkers(groupId)) this.bumpWorkerEpoch(worker.id);
+  }
 
   setMaintenance(taskId: string, value: boolean): void {
     this.run('UPDATE task SET maintenance = ?, updated_at = ? WHERE id = ?', value ? 1 : 0, nowIso(), taskId);

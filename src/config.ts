@@ -57,14 +57,16 @@ export interface Config {
   limits: Limits;
 }
 
-function intEnv(name: string, fallback: number): number {
+function intEnv(name: string, fallback: number, options: { allowZero?: boolean } = {}): number {
   const raw = process.env[name];
   if (raw === undefined || raw.trim() === '') return fallback;
   const value = Number(raw);
-  if (!Number.isFinite(value) || value <= 0) {
-    throw new ConfigError(`环境变量 ${name} 必须是正数，当前为 "${raw}"`);
+  const minimum = options.allowZero ? 0 : 1;
+  if (!Number.isFinite(value) || value < minimum || !Number.isInteger(value)) {
+    const expectation = options.allowZero ? '非负整数' : '正整数';
+    throw new ConfigError(`环境变量 ${name} 必须是${expectation}，当前为 "${raw}"`);
   }
-  return Math.trunc(value);
+  return value;
 }
 
 function strEnv(name: string, fallback: string): string {
@@ -108,8 +110,8 @@ export function loadConfig(options: { requireModel?: boolean } = {}): Config {
       maxTotalWorkers: intEnv('MAX_TOTAL_WORKERS', 12),
       maxStepsPerRun: intEnv('MAX_STEPS_PER_RUN', 8),
       // 旧环境变量仍被读取，但语义已改为软阈值：达到只记录预算事件，不再让 Worker 失败。
-      maxStepsPerWorker: intEnv('MAX_STEPS_PER_WORKER', 0),
-      maxStepsPerGroup: intEnv('MAX_STEPS_PER_GROUP', 0),
+      maxStepsPerWorker: intEnv('MAX_STEPS_PER_WORKER', 0, { allowZero: true }),
+      maxStepsPerGroup: intEnv('MAX_STEPS_PER_GROUP', 0, { allowZero: true }),
       maxRequestHops: intEnv('MAX_REQUEST_HOPS', 4),
       messageTtlMinutes: intEnv('MESSAGE_TTL_MINUTES', 30),
       waitTimeoutMs: intEnv('WAIT_TIMEOUT_SECONDS', 300) * 1000,

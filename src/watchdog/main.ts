@@ -6,12 +6,14 @@
  * 主系统退出后它仍在运行，并能按需拉起主系统。
  */
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { loadConfig } from '../config.ts';
 import { OpenAICompatibleModel } from '../model/openai.ts';
 import { Store } from '../storage/store.ts';
+import { mkdirSync as mkdir, writeFileSync as writeJson } from 'node:fs';
 import { instancePath, isPidAlive, looksLikeOurProcess, readInstance } from './observer.ts';
+import { mainHealth, spawnMain } from './process.ts';
 import { WatchdogSession } from './session.ts';
 
 const config = loadConfig();
@@ -31,28 +33,12 @@ const pidFile = join(config.workDir, '.runtime', 'watchdog.json');
 
 /** 拉起主系统。只在确认它确实退出、或 PID 属于无关进程时进行。 */
 async function restartMain(): Promise<{ ok: boolean; message: string }> {
-  const instance = readInstance(config);
-  if (instance && isPidAlive(instance.pid)) {
-    return { ok: false, message: `主系统仍在运行（pid=${instance.pid}），不重复启动` };
+  // 停机标记必须在动作执行前重新检查：维护者明确停机时不能被自动拉起。
+  if (existsSync(stopFile)) {
+    return { ok: false, message: '存在停机标记，不执行自动拉起；需要维护者显式恢复自动维护' };
   }
-  if (instance && !looksLikeOurProcess(instance.pid, 'src/main.ts') && isPidAlive(instance.pid)) {
-    return { ok: false, message: `pid=${instance.pid} 已被其他进程复用，不操作它` };
-  }
-  const child = spawn(process.execPath, ['--env-file-if-exists=.env.local', 'src/main.ts'], {
-    cwd: process.cwd(),
-    detached: true,
-    stdio: 'ignore',
-    env: { ...process.env, WATCHDOG_SUPERVISED: '1' },
-  });
-  child.unref();
-  const dir = dirname(instancePath(config));
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(
-    instancePath(config),
-    JSON.stringify({ pid: child.pid ?? 0, startedAt: new Date().toISOString(), dbPath: config.dbPath }, null, 2),
-    'utf8',
-  );
-  return { ok: true, message: `已拉起主系统 pid=${child.pid}，稍后复查它是否真的恢复调度` };
+  const result = spawnMain(config, { cooldownMs: 120_000 });
+  return { ok: result.ok, message: result.message };
 }
 
 const session = new WatchdogSession({
@@ -61,6 +47,7 @@ const session = new WatchdogSession({
   model,
   modelName: process.env['WATCHDOG_MODEL'] ?? config.workerModel,
   restartMain,
+  health: () => mainHealth(config),
 });
 
 mkdirSync(dirname(pidFile), { recursive: true });
@@ -81,11 +68,53 @@ if (existing && existing.pid !== process.pid && isPidAlive(existing.pid) && look
 
 writeFileSync(pidFile, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }, null, 2), 'utf8');
 
+// 维护者提问入口：不抢巡检锁，用独立的问题锁避免与巡检同时改同一会话。
+const askIndex = process.argv.indexOf('--ask');
+if (askIndex !== -1) {
+  const question = process.argv[askIndex + 1] ?? '';
+  if (question.trim() === '') {
+    console.log('用法：pnpm watchdog --ask "为什么这个任务停住了？"');
+    process.exit(1);
+  }
+  const lockPath = join(config.workDir, '.runtime', 'ask.lock');
+  mkdirSync(dirname(lockPath), { recursive: true });
+  try {
+    writeFileSync(lockPath, String(process.pid), { flag: 'wx' });
+  } catch {
+    console.log(`另一个维护入口正在处理提问（${lockPath}）。请稍后再试。`);
+    store.close();
+    process.exit(4);
+  }
+  try {
+    console.log(`提问：${question}`);
+    console.log('---');
+    console.log(await session.ask(question));
+  } finally {
+    try {
+      rmSync(lockPath, { force: true });
+    } catch {
+      // 清理失败不影响回答结果。
+    }
+    store.close();
+  }
+  process.exit(0);
+}
+
 const log = (message: string): void => {
   console.log(`[${new Date().toISOString().slice(11, 19)}] ${message}`);
 };
 
-const intervalMs = config.limits.watchdogIntervalMs;
+/** 巡检间隔可以在线调整：watchdog.interval 覆盖项优先于配置。 */
+function currentIntervalMs(): number {
+  const override = store.activeOverride('watchdog.interval');
+  if (override) {
+    const value = Number(override.content.trim());
+    if (Number.isFinite(value) && value >= 10_000 && value <= 3_600_000) return value;
+  }
+  return config.limits.watchdogIntervalMs;
+}
+
+let intervalMs = currentIntervalMs();
 log(`Watchdog 启动：pid=${process.pid}｜间隔 ${Math.round(intervalMs / 1000)}s｜数据库 ${config.dbPath}`);
 log('主系统状态：' + (readInstance(config) ? `实例文件存在（pid=${readInstance(config)!.pid}）` : '没有实例文件'));
 
@@ -123,7 +152,17 @@ if (process.env['WATCHDOG_ONCE'] === '1') {
   process.exit(0);
 }
 if (process.env['WATCHDOG_NO_TICK'] !== '1') void tick();
-setInterval(() => void tick(), intervalMs);
+let timer = setInterval(() => void tick(), intervalMs);
+// 每轮都重新读一次间隔，在线调整不需要重启进程。
+setInterval(() => {
+  const next = currentIntervalMs();
+  if (next !== intervalMs) {
+    intervalMs = next;
+    clearInterval(timer);
+    timer = setInterval(() => void tick(), intervalMs);
+    log(`巡检间隔调整为 ${Math.round(intervalMs / 1000)}s（在线生效）`);
+  }
+}, 15_000);
 
 const shutdown = (): void => {
   log('Watchdog 退出');

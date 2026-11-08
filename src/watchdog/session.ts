@@ -5,6 +5,8 @@ import type { ChatMessage, ModelClient, ToolSchema } from '../model/types.ts';
 import type { Store } from '../storage/store.ts';
 import type { Config } from '../config.ts';
 import { observe, renderObservation } from './observer.ts';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { observationPrompt, WATCHDOG_SYSTEM } from './prompts.ts';
 
 const WD_TOOLS: ToolSchema[] = [
@@ -54,6 +56,29 @@ const WD_TOOLS: ToolSchema[] = [
     },
   },
   {
+    name: 'check_main',
+    description: '读取主系统当前健康状态：不存在 / 已退出 / 身份无法确认 / 活着但主循环无响应。',
+    parameters: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'command_status',
+    description: '查询维护命令的回执：pending（还没被主系统消费）、done（已执行）、failed（执行失败）及原因。',
+    parameters: {
+      type: 'object',
+      properties: { command_id: { type: 'string', description: '不填则返回最近 10 条' } },
+      required: [],
+    },
+  },
+  {
+    name: 'read_file',
+    description: '读取主系统工作目录内的证据文件（日志、产物、作业输出）。只读，路径不能跳出工作目录。',
+    parameters: {
+      type: 'object',
+      properties: { path: { type: 'string' }, limit: { type: 'number' } },
+      required: ['path'],
+    },
+  },
+  {
     name: 'record',
     description: '记录或关闭一个未解决事件。issue_id 为空表示新建；status=closed 表示已确认恢复。',
     parameters: {
@@ -78,6 +103,10 @@ export interface WatchdogDeps {
   modelName: string;
   /** 主系统重启：由外部提供，避免这里直接绑死进程管理细节。 */
   restartMain?: () => Promise<{ ok: boolean; message: string }>;
+  /** 主系统健康：区分不存在、退出、身份不明、无响应。 */
+  health?: () => { state: string; pid: number | null; detail: string; heartbeatAgeMs: number | null };
+  /** 读取 Watchdog 自己的运行配置（含在线调整的巡检间隔）。 */
+  runtimeConfig?: { intervalMs: number };
 }
 
 export interface WatchdogResult {
@@ -128,6 +157,34 @@ export class WatchdogSession {
     const num = (key: string, fallback: number): number =>
       typeof args[key] === 'number' ? (args[key] as number) : fallback;
 
+    if (name === 'check_main') {
+      const health = this.deps.health?.();
+      if (!health) return '当前环境没有配置主系统健康探测';
+      return `${health.state}｜${health.detail}${health.pid ? `｜pid=${health.pid}` : ''}` +
+        `${health.heartbeatAgeMs === null ? '' : `｜心跳 ${Math.round(health.heartbeatAgeMs / 1000)} 秒前`}`;
+    }
+    if (name === 'command_status') {
+      const id = str('command_id');
+      const records = id === '' ? store.listRecentControls(10) : store.listRecentControls(50).filter((item) => item.id === id);
+      if (records.length === 0) return id === '' ? '（还没有维护命令）' : `找不到命令 ${id}`;
+      return records
+        .map((item) => `${item.id} ${item.command} ${item.status}${item.result ? `｜${item.result}` : ''}`)
+        .join('\n');
+    }
+    if (name === 'read_file') {
+      const relative = str('path');
+      const limit = num('limit', 4000);
+      const root = this.deps.config.workDir;
+      const absolute = join(root, relative);
+      if (!absolute.startsWith(root)) return '路径越界：只能读取工作目录内的文件';
+      if (!existsSync(absolute)) return `文件不存在：${relative}`;
+      try {
+        const text = readFileSync(absolute, 'utf8');
+        return text.length > limit ? `${text.slice(0, limit)}\n…（已截断，共 ${text.length} 字符）` : text;
+      } catch (error) {
+        return `读取失败：${(error as Error).message}`;
+      }
+    }
     if (name === 'inspect_task') {
       return this.describeTask(str('task_id'), num('limit', 15));
     }
@@ -162,13 +219,22 @@ export class WatchdogSession {
         author: 'watchdog',
         version: num('version', 0),
       };
+      const commandId = `cc_${randomBytes(4).toString('hex')}`;
       store.insertControlCommand({
-        id: `cc_${randomBytes(4).toString('hex')}`,
+        id: commandId,
         command: action,
         payload: JSON.stringify(payload),
         source: 'watchdog',
       });
-      return `已提交维护命令 ${action}，由主系统在下一次调度中执行；执行结果需要后续复查确认。`;
+      store.appendWdAction({
+        id: `wda_${randomBytes(4).toString('hex')}`,
+        issueId: str('issue_id') || null,
+        action,
+        reason: str('reason') || str('text') || '',
+        expected: str('expected') || '',
+        result: `命令 ${commandId} 已入队（尚未执行）`,
+      });
+      return `已提交维护命令 ${action}，命令 ID ${commandId}。状态为 pending：主系统消费后才会变成 done/failed，请用 command_status 复查。`;
     }
     if (name === 'record') {
       const status = str('status') || 'open';
@@ -186,17 +252,71 @@ export class WatchdogSession {
         note: str('note') || '',
         checkAfter,
       });
+      store.appendWdAction({
+        id: `wda_${randomBytes(4).toString('hex')}`,
+        issueId,
+        action: 'record',
+        reason: str('note') || '',
+        expected: `${minutes} 分钟后复查`,
+        result: '已登记',
+      });
       return `事件 ${issueId} 已记录，${minutes} 分钟后复查`;
     }
     return `未知工具：${name}`;
   }
 
+  /** 维护者提问：用同一套会话与工具，主系统不可用时也能回答。 */
+  async ask(question: string): Promise<string> {
+    const { store, config, model, modelName } = this.deps;
+    const observation = observe(store, config);
+    const health = this.deps.health?.();
+    const messages: ChatMessage[] = [
+      { role: 'system', content: WATCHDOG_SYSTEM },
+      ...store.listWdTurns(10).map((turn): ChatMessage => ({ role: turn.role, content: turn.content })),
+      {
+        role: 'user',
+        content:
+          `# 维护者提问\n${question}\n\n## 当前观察\n${renderObservation(observation)}\n\n` +
+          `## 主系统健康\n${health ? `${health.state}｜${health.detail}` : '未知'}\n\n` +
+          `## 未解决事件\n${store.listOpenIssues().map((issue) => `- ${issue.id}｜${issue.title}｜${issue.note ?? ''}`).join('\n') || '（无）'}\n\n` +
+          `先用工具核对证据再回答。说清楚哪些是已确认的事实、哪些还不确定。`,
+      },
+    ];
+    store.appendWdTurn({ id: `wdt_${randomBytes(4).toString('hex')}`, role: 'user', content: question });
+    for (let index = 0; index < 8; index += 1) {
+      const result = await model.chat({ model: modelName, messages, tools: WD_TOOLS, reasoningEffort: config.reasoningEffort });
+      messages.push({ role: 'assistant', content: result.text, ...(result.toolCalls.length > 0 ? { toolCalls: result.toolCalls } : {}) });
+      if (result.toolCalls.length === 0) {
+        const answer = result.text?.trim() ?? '';
+        store.appendWdTurn({ id: `wdt_${randomBytes(4).toString('hex')}`, role: 'assistant', content: answer });
+        return answer;
+      }
+      for (const call of result.toolCalls) {
+        let output: string;
+        try {
+          output = await this.executeTool(call.name, JSON.parse(call.arguments || '{}') as Record<string, unknown>);
+        } catch (error) {
+          output = `执行失败：${(error as Error).message}`;
+        }
+        messages.push({ role: 'tool', content: output, toolCallId: call.id });
+      }
+    }
+    return '（达到工具调用上限，未得出结论）';
+  }
+
   async runOnce(intervalMinutes: number): Promise<WatchdogResult> {
     const { store, config, model, modelName } = this.deps;
     const observation = observe(store, config);
+    const now = Date.now();
     const issues = store
       .listOpenIssues()
-      .map((issue) => `- ${issue.id}｜${issue.title}｜尝试 ${issue.attempts} 次｜${issue.note ?? ''}｜复查于 ${issue.checkAfter ?? '-'}`)
+      .map((issue) => {
+        const due = issue.checkAfter ? Date.parse(issue.checkAfter) <= now : true;
+        return (
+          `- ${issue.id}｜${issue.title}｜尝试 ${issue.attempts} 次｜${issue.note ?? ''}｜` +
+          `复查时间 ${issue.checkAfter ?? '-'}｜${due ? '已到复查时间' : '未到复查时间，除非有新证据否则不要重复下同一动作'}`
+        );
+      })
       .join('\n');
     const actions = store
       .listWdActions(6)

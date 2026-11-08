@@ -69,6 +69,7 @@ export interface Worker {
   status: WorkerStatus;
   model: string | null;
   stepCount: number;
+  runEpoch?: number;
   createdAt: string;
   updatedAt: string;
   lastError: string | null;
