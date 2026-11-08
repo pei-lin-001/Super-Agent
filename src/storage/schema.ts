@@ -1,4 +1,4 @@
-/** 数据库结构。一次性建表，不做迁移框架：模块 1 允许重建 .data/agent.db。 */
+/** 数据库结构。新库直接建全量结构；旧库由 Store.migrate() 增量补列，不删数据。 */
 export const SCHEMA_SQL = `
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS task (
   brief            TEXT NOT NULL DEFAULT '',
   done_criteria    TEXT NOT NULL DEFAULT '',
   require_review   INTEGER NOT NULL DEFAULT 0,
+  review_epoch     INTEGER NOT NULL DEFAULT 0,
   owner_worker_id  TEXT,
   status           TEXT NOT NULL,
   close_reason     TEXT,
@@ -48,6 +49,7 @@ CREATE TABLE IF NOT EXISTS message (
   reply_to     TEXT,
   refs         TEXT,
   dedupe_key   TEXT,
+  broadcast_id TEXT,
   status       TEXT NOT NULL,
   created_at   TEXT NOT NULL,
   delivered_at TEXT,
@@ -75,6 +77,7 @@ CREATE TABLE IF NOT EXISTS wait_record (
   id            TEXT PRIMARY KEY,
   worker_id     TEXT NOT NULL,
   group_id      TEXT NOT NULL,
+  reason        TEXT NOT NULL DEFAULT 'reply',
   match_from    TEXT,
   match_reply_to TEXT,
   match_kinds   TEXT,
@@ -85,16 +88,19 @@ CREATE TABLE IF NOT EXISTS wait_record (
 CREATE INDEX IF NOT EXISTS idx_wait_worker ON wait_record(worker_id, resolved_at);
 
 CREATE TABLE IF NOT EXISTS review (
-  id                TEXT PRIMARY KEY,
-  task_id           TEXT NOT NULL,
-  artifact_id       TEXT NOT NULL,
-  artifact_version  INTEGER NOT NULL,
-  requested_by      TEXT NOT NULL,
-  reviewer_id       TEXT,
+  id                 TEXT PRIMARY KEY,
+  task_id            TEXT NOT NULL,
+  artifact_id        TEXT NOT NULL,
+  artifact_version   INTEGER NOT NULL,
+  artifact_sha256    TEXT NOT NULL DEFAULT '',
+  epoch              INTEGER NOT NULL DEFAULT 0,
+  requested_by       TEXT NOT NULL,
+  reviewer_id        TEXT,
   request_message_id TEXT NOT NULL,
-  reply_message_id  TEXT,
-  status            TEXT NOT NULL,
-  created_at        TEXT NOT NULL
+  reply_message_id   TEXT,
+  outcome            TEXT NOT NULL DEFAULT 'pending',
+  status             TEXT NOT NULL DEFAULT 'pending',
+  created_at         TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_review_task ON review(task_id, status);
 

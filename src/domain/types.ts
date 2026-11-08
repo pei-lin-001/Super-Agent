@@ -9,7 +9,12 @@
 
 export type TaskStatus = 'pending' | 'active' | 'waiting' | 'completed' | 'failed' | 'cancelled';
 
-export type WorkerStatus = 'idle' | 'running' | 'waiting' | 'done' | 'failed' | 'cancelled';
+/**
+ * queued 表示「需要跑，但还没跑」：单轮步数用完、恢复后待调度都落在这个状态，
+ * 因此重启后可以直接从数据库重建调度，而不靠内存队列。
+ * idle 仅用于兼容历史数据。
+ */
+export type WorkerStatus = 'queued' | 'idle' | 'running' | 'waiting' | 'done' | 'failed' | 'cancelled';
 
 export type MessageStatus = 'queued' | 'delivered' | 'consumed' | 'failed' | 'expired';
 
@@ -28,7 +33,11 @@ export type MessageKind =
   | 'reply'
   | 'notice';
 
-export type ReviewStatus = 'pending' | 'answered' | 'superseded' | 'failed';
+/** 检查结论。只有 approved 能放行交付；其余一律视为未通过。 */
+export type ReviewOutcome = 'pending' | 'approved' | 'changes_required' | 'inconclusive';
+
+/** 等待原因，决定恢复时如何处理。 */
+export type WaitReason = 'reply' | 'provider' | 'user';
 
 export interface Task {
   id: string;
@@ -39,6 +48,8 @@ export interface Task {
   doneCriteria: string;
   /** 是否必须经过一次同组检查（由 Router 建任务时声明，程序据此校验）。 */
   requireReview: boolean;
+  /** 要求版本号：用户每次补充要求时递增，旧检查不再算数。 */
+  reviewEpoch: number;
   ownerWorkerId: string | null;
   status: TaskStatus;
   closeReason: string | null;
@@ -82,6 +93,8 @@ export interface Message {
   refs: MessageRefs | null;
   /** 发送方提供的去重键：同一群组内相同键只落一条消息。 */
   dedupeKey: string | null;
+  /** 广播时指向同一次广播的编号；每个接收者各有一条独立消息。 */
+  broadcastId: string | null;
   status: MessageStatus;
   createdAt: string;
   deliveredAt: string | null;
@@ -105,6 +118,7 @@ export interface WaitRecord {
   id: string;
   workerId: string;
   groupId: string;
+  reason: WaitReason;
   matchFrom: string | null;
   matchReplyTo: string | null;
   matchKinds: MessageKind[] | null;
@@ -113,16 +127,23 @@ export interface WaitRecord {
   resolvedAt: string | null;
 }
 
+/**
+ * 一条检查记录对应「一次检查请求」与「一份产物版本」。
+ * 一次请求检查多份产物时会有多行，同一事务写入。
+ * 产物 id 本身唯一标识一个版本，sha256 再固定内容，防止登记后被改写。
+ */
 export interface Review {
   id: string;
   taskId: string;
   artifactId: string;
   artifactVersion: number;
+  artifactSha256: string;
+  epoch: number;
   requestedBy: string;
   reviewerId: string | null;
   requestMessageId: string;
   replyMessageId: string | null;
-  status: ReviewStatus;
+  outcome: ReviewOutcome;
   createdAt: string;
 }
 

@@ -15,9 +15,11 @@ const TASK_TRANSITIONS: Record<TaskStatus, readonly TaskStatus[]> = {
 };
 
 const WORKER_TRANSITIONS: Record<WorkerStatus, readonly WorkerStatus[]> = {
-  idle: ['running', 'cancelled', 'failed'],
-  running: ['waiting', 'idle', 'done', 'failed', 'cancelled'],
-  waiting: ['running', 'cancelled', 'failed'],
+  // done 表示工作完成，从任何非终态都可能直接到达（例如等待中由别人代提交）。
+  queued: ['running', 'waiting', 'done', 'cancelled', 'failed'],
+  idle: ['queued', 'running', 'done', 'cancelled', 'failed'],
+  running: ['queued', 'waiting', 'done', 'failed', 'cancelled'],
+  waiting: ['queued', 'running', 'done', 'cancelled', 'failed'],
   done: [],
   failed: [],
   cancelled: [],

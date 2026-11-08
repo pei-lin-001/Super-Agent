@@ -11,10 +11,11 @@ import type {
   MessageRefs,
   MessageStatus,
   Review,
-  ReviewStatus,
+  ReviewOutcome,
   RouterTurn,
   Task,
   TaskStatus,
+  WaitReason,
   WaitRecord,
   Worker,
   WorkerStatus,
@@ -52,6 +53,7 @@ function mapTask(row: Row): Task {
     brief: str(row['brief']),
     doneCriteria: str(row['done_criteria']),
     requireReview: num(row['require_review']) === 1,
+    reviewEpoch: num(row['review_epoch'] ?? 0),
     ownerWorkerId: strOrNull(row['owner_worker_id']),
     status: str(row['status']) as TaskStatus,
     closeReason: strOrNull(row['close_reason']),
@@ -94,6 +96,7 @@ function mapMessage(row: Row): Message {
     replyTo: strOrNull(row['reply_to']),
     refs: refsRaw ? (JSON.parse(refsRaw) as MessageRefs) : null,
     dedupeKey: strOrNull(row['dedupe_key']),
+    broadcastId: strOrNull(row['broadcast_id']),
     status: str(row['status']) as MessageStatus,
     createdAt: str(row['created_at']),
     deliveredAt: strOrNull(row['delivered_at']),
@@ -122,6 +125,7 @@ function mapWait(row: Row): WaitRecord {
     id: str(row['id']),
     workerId: str(row['worker_id']),
     groupId: str(row['group_id']),
+    reason: (strOrNull(row['reason']) ?? 'reply') as WaitReason,
     matchFrom: strOrNull(row['match_from']),
     matchReplyTo: strOrNull(row['match_reply_to']),
     matchKinds: kinds ? (JSON.parse(kinds) as MessageKind[]) : null,
@@ -137,11 +141,13 @@ function mapReview(row: Row): Review {
     taskId: str(row['task_id']),
     artifactId: str(row['artifact_id']),
     artifactVersion: num(row['artifact_version']),
+    artifactSha256: strOrNull(row['artifact_sha256']) ?? '',
+    epoch: num(row['epoch'] ?? 0),
     requestedBy: str(row['requested_by']),
     reviewerId: strOrNull(row['reviewer_id']),
     requestMessageId: str(row['request_message_id']),
     replyMessageId: strOrNull(row['reply_message_id']),
-    status: str(row['status']) as ReviewStatus,
+    outcome: (strOrNull(row['outcome']) ?? 'pending') as ReviewOutcome,
     createdAt: str(row['created_at']),
   };
 }
@@ -166,14 +172,35 @@ export class Store {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
     this.db.exec(SCHEMA_SQL);
-    // 兼容模块 1 早期版本留下的数据库文件。
-    const columns = this.db.prepare('PRAGMA table_info(message)').all() as { name?: string }[];
-    if (!columns.some((column) => column.name === 'dedupe_key')) {
-      this.db.exec('ALTER TABLE message ADD COLUMN dedupe_key TEXT');
-    }
+    this.migrate();
+  }
+
+  /**
+   * 增量迁移：只补列，不删数据、不重建表。
+   * 旧记录里无法判定的状态一律落到「不安全」的一侧（例如旧检查记为 inconclusive）。
+   */
+  private migrate(): void {
+    const ensureColumn = (table: string, column: string, ddl: string): void => {
+      const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as { name?: string }[];
+      if (!columns.some((item) => item.name === column)) {
+        this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+      }
+    };
+    ensureColumn('task', 'review_epoch', 'review_epoch INTEGER NOT NULL DEFAULT 0');
+    ensureColumn('message', 'dedupe_key', 'dedupe_key TEXT');
+    ensureColumn('message', 'broadcast_id', 'broadcast_id TEXT');
+    ensureColumn('wait_record', 'reason', "reason TEXT NOT NULL DEFAULT 'reply'");
+    ensureColumn('review', 'artifact_sha256', "artifact_sha256 TEXT NOT NULL DEFAULT ''");
+    ensureColumn('review', 'epoch', 'epoch INTEGER NOT NULL DEFAULT 0');
+    ensureColumn('review', 'outcome', "outcome TEXT NOT NULL DEFAULT 'pending'");
+    // 旧版 review.status 只有 pending/answered，无法表达结论，一律不放行。
+    this.db.exec(
+      `UPDATE review SET outcome = 'inconclusive' WHERE outcome = 'pending' AND status = 'answered'`,
+    );
   }
 
   close(): void {
+    if (!this.db.isOpen) return;
     this.db.close();
   }
 
@@ -326,14 +353,16 @@ export class Store {
   insertMessage(message: Message): Message {
     this.run(
       `INSERT INTO message (id, group_id, task_id, from_kind, from_id, to_kind, to_id, kind, body,
-                            payload, reply_to, refs, dedupe_key, status, created_at, delivered_at, consumed_at, error)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                            payload, reply_to, refs, dedupe_key, broadcast_id, status,
+                            created_at, delivered_at, consumed_at, error)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       message.id, message.groupId, message.taskId, message.fromKind, message.fromId, message.toKind,
       message.toId, message.kind, message.body,
       message.payload ? JSON.stringify(message.payload) : null,
       message.replyTo,
       message.refs ? JSON.stringify(message.refs) : null,
       message.dedupeKey,
+      message.broadcastId,
       message.status, message.createdAt, message.deliveredAt, message.consumedAt, message.error,
     );
     return message;
@@ -435,6 +464,14 @@ export class Store {
     return row ? mapArtifact(row) : null;
   }
 
+  getArtifactVersion(taskId: string, name: string, version: number): Artifact | null {
+    const row = this.get(
+      'SELECT * FROM artifact WHERE task_id = ? AND name = ? AND version = ?',
+      taskId, name, version,
+    );
+    return row ? mapArtifact(row) : null;
+  }
+
   listArtifacts(taskId: string): Artifact[] {
     return this.all('SELECT * FROM artifact WHERE task_id = ? ORDER BY created_at ASC', taskId).map(mapArtifact);
   }
@@ -443,10 +480,10 @@ export class Store {
 
   createWait(wait: WaitRecord): WaitRecord {
     this.run(
-      `INSERT INTO wait_record (id, worker_id, group_id, match_from, match_reply_to, match_kinds,
+      `INSERT INTO wait_record (id, worker_id, group_id, reason, match_from, match_reply_to, match_kinds,
                                 deadline_at, created_at, resolved_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      wait.id, wait.workerId, wait.groupId, wait.matchFrom, wait.matchReplyTo,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      wait.id, wait.workerId, wait.groupId, wait.reason, wait.matchFrom, wait.matchReplyTo,
       wait.matchKinds ? JSON.stringify(wait.matchKinds) : null,
       wait.deadlineAt, wait.createdAt, wait.resolvedAt,
     );
@@ -476,13 +513,24 @@ export class Store {
 
   createReview(review: Review): Review {
     this.run(
-      `INSERT INTO review (id, task_id, artifact_id, artifact_version, requested_by, reviewer_id,
-                           request_message_id, reply_message_id, status, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      review.id, review.taskId, review.artifactId, review.artifactVersion, review.requestedBy,
-      review.reviewerId, review.requestMessageId, review.replyMessageId, review.status, review.createdAt,
+      `INSERT INTO review (id, task_id, artifact_id, artifact_version, artifact_sha256, epoch,
+                           requested_by, reviewer_id, request_message_id, reply_message_id,
+                           outcome, status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      review.id, review.taskId, review.artifactId, review.artifactVersion, review.artifactSha256,
+      review.epoch, review.requestedBy, review.reviewerId, review.requestMessageId,
+      review.replyMessageId, review.outcome, review.outcome, review.createdAt,
     );
     return review;
+  }
+
+  /** 一次检查请求可能覆盖多份产物，必须整批写入。 */
+  createReviews(reviews: Review[]): void {
+    for (const review of reviews) this.createReview(review);
+  }
+
+  listReviewsByRequest(requestMessageId: string): Review[] {
+    return this.all('SELECT * FROM review WHERE request_message_id = ?', requestMessageId).map(mapReview);
   }
 
   getReviewByRequestMessage(messageId: string): Review | null {
@@ -490,19 +538,38 @@ export class Store {
     return row ? mapReview(row) : null;
   }
 
-  answerReview(requestMessageId: string, replyMessageId: string): void {
+  answerReview(requestMessageId: string, replyMessageId: string, reviewerId: string, outcome: ReviewOutcome): void {
     this.run(
-      "UPDATE review SET status = 'answered', reply_message_id = ? WHERE request_message_id = ?",
-      replyMessageId, requestMessageId,
+      `UPDATE review SET outcome = ?, status = ?, reply_message_id = ?, reviewer_id = ?
+        WHERE request_message_id = ? AND outcome = 'pending'`,
+      outcome, outcome, replyMessageId, reviewerId, requestMessageId,
     );
   }
 
   listOpenReviews(taskId: string): Review[] {
-    return this.all("SELECT * FROM review WHERE task_id = ? AND status = 'pending'", taskId).map(mapReview);
+    return this.all("SELECT * FROM review WHERE task_id = ? AND outcome = 'pending'", taskId).map(mapReview);
   }
 
   listReviews(taskId: string): Review[] {
     return this.all('SELECT * FROM review WHERE task_id = ? ORDER BY created_at ASC', taskId).map(mapReview);
+  }
+
+  countActiveWorkers(): number {
+    const row = this.get(
+      "SELECT COUNT(*) AS n FROM worker WHERE status NOT IN ('done','failed','cancelled')",
+    );
+    return row ? num(row['n']) : 0;
+  }
+
+  countWorkersInGroup(groupId: string): number {
+    const row = this.get('SELECT COUNT(*) AS n FROM worker WHERE group_id = ?', groupId);
+    return row ? num(row['n']) : 0;
+  }
+
+  bumpReviewEpoch(taskId: string): number {
+    this.run('UPDATE task SET review_epoch = review_epoch + 1, updated_at = ? WHERE id = ?', nowIso(), taskId);
+    const row = this.get('SELECT review_epoch FROM task WHERE id = ?', taskId);
+    return row ? num(row['review_epoch']) : 0;
   }
 
   // ---------------- turns ----------------
@@ -514,6 +581,13 @@ export class Store {
       turn.id, turn.workerId, turn.seq, turn.role, turn.content,
       turn.toolCalls ? JSON.stringify(turn.toolCalls) : null, turn.toolCallId, turn.createdAt,
     );
+  }
+
+  listWorkerTurnsBefore(workerId: string, seq: number, limit: number): WorkerTurn[] {
+    return this.all(
+      'SELECT * FROM worker_turn WHERE worker_id = ? AND seq < ? ORDER BY seq DESC LIMIT ?',
+      workerId, seq, limit,
+    ).map(mapTurn).reverse();
   }
 
   countWorkerTurns(workerId: string): number {
