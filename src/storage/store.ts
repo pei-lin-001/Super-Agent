@@ -10,6 +10,7 @@ import type {
   MessageKind,
   MessageRefs,
   MessageStatus,
+  ProcessJob,
   Review,
   ReviewOutcome,
   RouterTurn,
@@ -120,6 +121,28 @@ function mapArtifact(row: Row): Artifact {
   };
 }
 
+function mapJob(row: Row): ProcessJob {
+  const args = strOrNull(row['args_json']);
+  return {
+    id: str(row['id']),
+    taskId: str(row['task_id']),
+    workerId: str(row['worker_id']),
+    command: str(row['command']),
+    args: args ? (JSON.parse(args) as string[]) : [],
+    cwd: str(row['cwd']),
+    pid: row['pid'] === null || row['pid'] === undefined ? null : num(row['pid']),
+    status: str(row['status']) as ProcessJob['status'],
+    exitCode: row['exit_code'] === null || row['exit_code'] === undefined ? null : num(row['exit_code']),
+    signal: strOrNull(row['signal']),
+    stdoutPath: str(row['stdout_path']),
+    stderrPath: str(row['stderr_path']),
+    timeoutMs: num(row['timeout_ms']),
+    startedAt: str(row['started_at']),
+    endedAt: strOrNull(row['ended_at']),
+    error: strOrNull(row['error']),
+  };
+}
+
 function mapWait(row: Row): WaitRecord {
   const kinds = strOrNull(row['match_kinds']);
   return {
@@ -130,6 +153,7 @@ function mapWait(row: Row): WaitRecord {
     matchFrom: strOrNull(row['match_from']),
     matchReplyTo: strOrNull(row['match_reply_to']),
     matchKinds: kinds ? (JSON.parse(kinds) as MessageKind[]) : null,
+    matchJob: strOrNull(row['match_job']),
     deadlineAt: str(row['deadline_at']),
     createdAt: str(row['created_at']),
     resolvedAt: strOrNull(row['resolved_at']),
@@ -209,6 +233,7 @@ export class Store {
     ensureColumn('message', 'dedupe_key', 'dedupe_key TEXT');
     ensureColumn('message', 'broadcast_id', 'broadcast_id TEXT');
     ensureColumn('wait_record', 'reason', "reason TEXT NOT NULL DEFAULT 'reply'");
+    ensureColumn('wait_record', 'match_job', 'match_job TEXT');
     ensureColumn('review', 'artifact_sha256', "artifact_sha256 TEXT NOT NULL DEFAULT ''");
     ensureColumn('review', 'epoch', 'epoch INTEGER NOT NULL DEFAULT 0');
     ensureColumn('review', 'outcome', "outcome TEXT NOT NULL DEFAULT 'pending'");
@@ -497,13 +522,51 @@ export class Store {
 
   // ---------------- wait ----------------
 
+  // ---------------- 进程作业 ----------------
+
+  insertJob(job: ProcessJob): ProcessJob {
+    this.run(
+      `INSERT INTO process_job (id, task_id, worker_id, command, args_json, cwd, pid, status, exit_code,
+                                signal, stdout_path, stderr_path, timeout_ms, started_at, ended_at, error)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      job.id, job.taskId, job.workerId, job.command, JSON.stringify(job.args), job.cwd, job.pid, job.status,
+      job.exitCode, job.signal, job.stdoutPath, job.stderrPath, job.timeoutMs, job.startedAt, job.endedAt, job.error,
+    );
+    return job;
+  }
+
+  updateJob(job: ProcessJob): void {
+    this.run(
+      `UPDATE process_job SET pid = ?, status = ?, exit_code = ?, signal = ?, ended_at = ?, error = ?
+       WHERE id = ?`,
+      job.pid, job.status, job.exitCode, job.signal, job.endedAt, job.error, job.id,
+    );
+  }
+
+  getJob(id: string): ProcessJob | null {
+    const row = this.get('SELECT * FROM process_job WHERE id = ?', id);
+    return row ? mapJob(row) : null;
+  }
+
+  listJobs(taskId: string): ProcessJob[] {
+    return this.all('SELECT * FROM process_job WHERE task_id = ? ORDER BY started_at ASC', taskId).map(mapJob);
+  }
+
+  listRunningJobs(taskId: string): ProcessJob[] {
+    return this.all("SELECT * FROM process_job WHERE task_id = ? AND status = 'running'", taskId).map(mapJob);
+  }
+
+  listAllRunningJobs(): ProcessJob[] {
+    return this.all("SELECT * FROM process_job WHERE status = 'running'").map(mapJob);
+  }
+
   createWait(wait: WaitRecord): WaitRecord {
     this.run(
       `INSERT INTO wait_record (id, worker_id, group_id, reason, match_from, match_reply_to, match_kinds,
-                                deadline_at, created_at, resolved_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                                match_job, deadline_at, created_at, resolved_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       wait.id, wait.workerId, wait.groupId, wait.reason, wait.matchFrom, wait.matchReplyTo,
-      wait.matchKinds ? JSON.stringify(wait.matchKinds) : null,
+      wait.matchKinds ? JSON.stringify(wait.matchKinds) : null, wait.matchJob ?? null,
       wait.deadlineAt, wait.createdAt, wait.resolvedAt,
     );
     return wait;

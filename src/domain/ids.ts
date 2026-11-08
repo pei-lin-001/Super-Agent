@@ -24,6 +24,10 @@ export function newWaitId(): string {
   return `wait_${short()}`;
 }
 
+export function newJobId(): string {
+  return `job_${short()}`;
+}
+
 export function newReviewId(): string {
   return `rev_${short()}`;
 }

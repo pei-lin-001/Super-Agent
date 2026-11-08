@@ -37,7 +37,7 @@ export type MessageKind =
 export type ReviewOutcome = 'pending' | 'approved' | 'changes_required' | 'inconclusive';
 
 /** 等待原因，决定恢复时如何处理。 */
-export type WaitReason = 'reply' | 'provider' | 'user';
+export type WaitReason = 'reply' | 'provider' | 'user' | 'job';
 
 export interface Task {
   id: string;
@@ -115,6 +115,8 @@ export interface Artifact {
 }
 
 export interface WaitRecord {
+  /** 等待某个进程作业结束时，记录作业 id；与消息匹配互斥。 */
+  matchJob?: string | null;
   id: string;
   workerId: string;
   groupId: string;
@@ -190,6 +192,28 @@ export type RuntimeEvent =
  * Worker 的累计工作记录。每次整理生成一份新记录，覆盖到 coveredSeq。
  * 失败记录只用于诊断：failed=1 时 content 为空，不参与注入，也不推进覆盖位置。
  */
+/** 一次命令执行。日志落在 workDir/.jobs/<taskId>/ 下，按字节偏移读取。 */
+export type JobStatus = 'running' | 'exited' | 'failed' | 'killed' | 'timeout' | 'unknown';
+
+export interface ProcessJob {
+  id: string;
+  taskId: string;
+  workerId: string;
+  command: string;
+  args: string[];
+  cwd: string;
+  pid: number | null;
+  status: JobStatus;
+  exitCode: number | null;
+  signal: string | null;
+  stdoutPath: string;
+  stderrPath: string;
+  timeoutMs: number;
+  startedAt: string;
+  endedAt: string | null;
+  error: string | null;
+}
+
 export interface WorkerNote {
   id: string;
   workerId: string;

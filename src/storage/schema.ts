@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS wait_record (
   match_from    TEXT,
   match_reply_to TEXT,
   match_kinds   TEXT,
+  match_job     TEXT,
   deadline_at   TEXT NOT NULL,
   created_at    TEXT NOT NULL,
   resolved_at   TEXT
@@ -139,6 +140,27 @@ CREATE TABLE IF NOT EXISTS worker_note (
   created_at   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_note_worker ON worker_note(worker_id, created_at);
+
+CREATE TABLE IF NOT EXISTS process_job (
+  id               TEXT PRIMARY KEY,
+  task_id          TEXT NOT NULL,
+  worker_id        TEXT NOT NULL,
+  command          TEXT NOT NULL,
+  args_json        TEXT NOT NULL,
+  cwd              TEXT NOT NULL,
+  pid              INTEGER,
+  status           TEXT NOT NULL,
+  exit_code        INTEGER,
+  signal           TEXT,
+  stdout_path      TEXT NOT NULL,
+  stderr_path      TEXT NOT NULL,
+  timeout_ms       INTEGER NOT NULL,
+  started_at       TEXT NOT NULL,
+  ended_at         TEXT,
+  error            TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_job_task ON process_job(task_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_job_status ON process_job(status);
 
 CREATE TABLE IF NOT EXISTS event (
   id         TEXT PRIMARY KEY,
