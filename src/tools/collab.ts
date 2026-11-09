@@ -24,13 +24,18 @@ export const collabTools: ToolDefinition[] = [
       properties: {
         role: { type: 'string', description: '一句话职责，例如「数据核对」' },
         brief: { type: 'string', description: '具体工作说明：要做什么、交付什么、边界在哪' },
+        model: {
+          type: 'string',
+          description: '可选：协作者使用的模型别名，见系统提示里的可用模型；不填则沿用你自己的模型配置',
+        },
       },
       required: ['role', 'brief'],
     },
     run(args, context) {
       const role = argString(args, 'role');
       const brief = argString(args, 'brief');
-      const result = context.host.createCollaborator(context.worker, role, brief);
+      const model = argOptionalString(args, 'model');
+      const result = context.host.createCollaborator(context.worker, role, brief, model ? { model } : {});
       if (!result.ok) return { type: 'failed', content: `创建协作者失败：${result.reason ?? '未知原因'}` };
       return ok(`已创建协作者 ${result.workerId}｜职责=${role}｜群组=${context.worker.groupId}`);
     },

@@ -17,13 +17,23 @@ export class RecordingModel implements ModelClient {
   private readonly inner: ModelClient;
   private readonly store: Store;
   private readonly purpose: CallPurpose;
-  private readonly scope: { taskId?: string | null; workerId?: string | null; sessionId?: string | null };
+  private readonly scope: {
+    taskId?: string | null;
+    workerId?: string | null;
+    sessionId?: string | null;
+    modelAlias?: string | null;
+  };
 
   constructor(
     inner: ModelClient,
     store: Store,
     purpose: CallPurpose,
-    scope: { taskId?: string | null; workerId?: string | null; sessionId?: string | null } = {},
+    scope: {
+      taskId?: string | null;
+      workerId?: string | null;
+      sessionId?: string | null;
+      modelAlias?: string | null;
+    } = {},
   ) {
     this.inner = inner;
     this.store = store;
@@ -57,6 +67,7 @@ export class RecordingModel implements ModelClient {
         usage: result.usage ?? null,
         httpAttempts: result.httpAttempts ?? null,
         error: null,
+        responseModel: result.model ?? null,
       });
       return result;
     } catch (error) {

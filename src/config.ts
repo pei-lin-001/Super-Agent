@@ -41,6 +41,26 @@ export interface Limits {
   noteMaxFailures: number;
 }
 
+/**
+ * 一个"模型配置项"：别名 + 连接方式 + 模型名。
+ *
+ * 别名只是名字，不与「规划者 / 执行者 / 检查者」这类职责绑定：
+ * 同一个别名可以执行，也可以检查；同一职责也可以由不同别名承担。
+ */
+export interface ModelProfile {
+  alias: string;
+  /** 提供方协议；本轮只实现 OpenAI-compatible。 */
+  provider: string;
+  baseUrl: string;
+  apiKey: string;
+  /** 真正发给提供方的模型名。 */
+  model: string;
+  /** 来自配置的用途说明，不是实测能力。 */
+  note: string | null;
+  /** 来自配置的相对成本说明，不是实时价格。 */
+  costHint: string | null;
+}
+
 export interface Config {
   provider: string;
   baseUrl: string;
@@ -48,6 +68,10 @@ export interface Config {
   modelName: string;
   routerModel: string;
   workerModel: string;
+  /** 可调用模型目录；至少包含 default。 */
+  models: ModelProfile[];
+  /** Worker 未指定模型时使用的别名。 */
+  defaultModelAlias: string;
   reasoningEffort: string;
   timeoutMs: number;
   maxTokens: number;
@@ -74,6 +98,66 @@ function strEnv(name: string, fallback: string): string {
   return raw === undefined || raw.trim() === '' ? fallback : raw.trim();
 }
 
+/**
+ * 读取模型目录。
+ *
+ * 优先用 `MODEL_CATALOG`（JSON 数组）；没有就用 `MODEL_NAME` 造一个 `default`，
+ * 保证旧配置照常启动。凭据只从环境读取，不进入任何会被写进库或日志的结构。
+ */
+function loadModelProfiles(fallback: {
+  provider: string;
+  baseUrl: string;
+  apiKey: string;
+  modelName: string;
+}): ModelProfile[] {
+  const raw = strEnv('MODEL_CATALOG', '').trim();
+  if (raw === '') {
+    return [
+      {
+        alias: 'default',
+        provider: fallback.provider,
+        baseUrl: fallback.baseUrl,
+        apiKey: fallback.apiKey,
+        model: fallback.modelName,
+        note: null,
+        costHint: null,
+      },
+    ];
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new ConfigError('MODEL_CATALOG 不是合法 JSON，请写成 [{"alias":"...","model":"..."}]');
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0) {
+    throw new ConfigError('MODEL_CATALOG 必须是非空数组');
+  }
+  const seen = new Set<string>();
+  const profiles: ModelProfile[] = [];
+  for (const [index, item] of parsed.entries()) {
+    if (typeof item !== 'object' || item === null) throw new ConfigError(`MODEL_CATALOG[${index}] 必须是对象`);
+    const record = item as Record<string, unknown>;
+    const alias = typeof record['alias'] === 'string' ? record['alias'].trim() : '';
+    const model = typeof record['model'] === 'string' ? record['model'].trim() : '';
+    if (alias === '') throw new ConfigError(`MODEL_CATALOG[${index}] 缺少 alias`);
+    if (model === '') throw new ConfigError(`MODEL_CATALOG[${index}] 缺少 model`);
+    if (seen.has(alias)) throw new ConfigError(`模型别名重复：${alias}`);
+    seen.add(alias);
+    profiles.push({
+      alias,
+      provider: typeof record['provider'] === 'string' ? record['provider'] : fallback.provider,
+      baseUrl: typeof record['baseUrl'] === 'string' ? record['baseUrl'] : fallback.baseUrl,
+      // 凭据只能来自环境；目录里写 key 一律忽略，避免明文进配置。
+      apiKey: fallback.apiKey,
+      model,
+      note: typeof record['note'] === 'string' ? record['note'] : null,
+      costHint: typeof record['costHint'] === 'string' ? record['costHint'] : null,
+    });
+  }
+  return profiles;
+}
+
 export function loadConfig(options: { requireModel?: boolean } = {}): Config {
   const requireModel = options.requireModel ?? true;
   const provider = strEnv('MODEL_PROVIDER', 'ollama-cloud');
@@ -91,6 +175,14 @@ export function loadConfig(options: { requireModel?: boolean } = {}): Config {
   const workDir = resolve(root, strEnv('WORK_DIR', 'work'));
   const materialsDir = resolve(workDir, 'materials');
 
+  const models = loadModelProfiles({ provider, baseUrl, apiKey, modelName });
+  const defaultModelAlias = strEnv('DEFAULT_MODEL_ALIAS', models[0]?.alias ?? 'default');
+  if (requireModel && !models.some((item) => item.alias === defaultModelAlias)) {
+    throw new ConfigError(
+      `默认模型别名 ${defaultModelAlias} 不在模型目录里；可用别名：${models.map((item) => item.alias).join(', ')}`,
+    );
+  }
+
   return {
     provider,
     baseUrl,
@@ -98,6 +190,8 @@ export function loadConfig(options: { requireModel?: boolean } = {}): Config {
     modelName,
     routerModel: strEnv('ROUTER_MODEL', modelName),
     workerModel: strEnv('WORKER_MODEL', modelName),
+    models,
+    defaultModelAlias,
     reasoningEffort: strEnv('MODEL_REASONING_EFFORT', 'max'),
     timeoutMs: intEnv('MODEL_TIMEOUT_MS', 180_000),
     maxTokens: intEnv('MODEL_MAX_TOKENS', 16384),

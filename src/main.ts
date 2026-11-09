@@ -1,6 +1,8 @@
 import { randomBytes } from 'node:crypto';
 import { ConfigError, loadConfig } from './config.ts';
+import { ModelRegistry } from './model/registry.ts';
 import { OpenAICompatibleModel } from './model/openai.ts';
+import type { ModelClient } from './model/types.ts';
 import { Router } from './runtime/router.ts';
 import { Runtime } from './runtime/runtime.ts';
 import { Store } from './storage/store.ts';
@@ -70,15 +72,25 @@ async function main(): Promise<void> {
   const heartbeatTimer = setInterval(heartbeat, 5000);
   heartbeatTimer.unref?.();
   process.on('exit', () => writeInstance(true));
-  const workerModel = new OpenAICompatibleModel({
-    baseUrl: config.baseUrl,
-    apiKey: config.apiKey,
-    timeoutMs: config.timeoutMs,
-    retry: config.limits.modelRetry,
-    reasoningEffort: config.reasoningEffort,
-    maxTokens: config.maxTokens,
-    label: `openai-compatible:${config.baseUrl}`,
-  });
+  // 目录里每个别名一个客户端；同一个别名复用同一个实例，避免重复建连接。
+  const modelClients = new Map<string, ModelClient>();
+  for (const profile of config.models) {
+    if (modelClients.has(profile.alias)) continue;
+    modelClients.set(
+      profile.alias,
+      new OpenAICompatibleModel({
+        baseUrl: profile.baseUrl,
+        apiKey: profile.apiKey,
+        timeoutMs: config.timeoutMs,
+        retry: config.limits.modelRetry,
+        reasoningEffort: config.reasoningEffort,
+        maxTokens: config.maxTokens,
+        label: `openai-compatible:${profile.alias}@${profile.baseUrl}`,
+      }),
+    );
+  }
+  const workerModel = modelClients.get(config.defaultModelAlias)!;
+  const models = new ModelRegistry(config.models, modelClients);
   const routerModel = new OpenAICompatibleModel({
     baseUrl: config.baseUrl,
     apiKey: config.apiKey,
@@ -89,7 +101,7 @@ async function main(): Promise<void> {
     label: `openai-compatible:${config.baseUrl}`,
   });
 
-  const runtime = new Runtime({ store, config, workerModel });
+  const runtime = new Runtime({ store, config, workerModel, models });
   const router = new Router(runtime, routerModel, config);
   runtime.attachRouter(router);
 
@@ -98,6 +110,7 @@ async function main(): Promise<void> {
       `模型提供方：${config.provider}`,
       `端点：${config.baseUrl}`,
       `Router 模型：${config.routerModel}　Worker 模型：${config.workerModel}　思考强度：${config.reasoningEffort}`,
+      `可用模型：${config.models.map((item) => `${item.alias}=${item.model}`).join('　')}`,
       `数据库：${config.dbPath}`,
       `工作目录：${config.workDir}`,
       `并发上限：${config.limits.maxConcurrentRuns}　单组 Worker 上限：${config.limits.maxWorkersPerGroup}`,

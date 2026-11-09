@@ -11,8 +11,30 @@ export function renderCollaborators(workers: Worker[], selfId: string): string {
   const others = workers.filter((worker) => worker.id !== selfId);
   if (others.length === 0) return '（暂无其他协作者）';
   return others
-    .map((worker) => `- ${worker.id}｜${worker.role}｜状态 ${worker.status}${worker.parentId ? `｜由 ${worker.parentId} 创建` : ''}`)
+    .map(
+      (worker) =>
+        `- ${worker.id}｜${worker.role}｜状态 ${worker.status}${worker.model ? `｜模型 ${worker.model}` : ''}` +
+        `${worker.parentId ? `｜由 ${worker.parentId} 创建` : ''}`,
+    )
     .join('\n');
+}
+
+/** 可用模型目录的展示文本。说明只来自配置，不宣称实测能力。 */
+export function renderModelCatalog(
+  models: { alias: string; model: string; note: string | null; costHint: string | null }[],
+  currentAlias: string | null,
+): string {
+  const lines = models.map((item) => {
+    const extras = [item.note, item.costHint].filter((text): text is string => Boolean(text));
+    return `- ${item.alias}（${item.model}）${extras.length > 0 ? `：${extras.join('；')}` : ''}`;
+  });
+  return [
+    `你当前使用的模型配置：${currentAlias ?? '默认'}`,
+    '可用模型配置（来自配置文件的说明，不代表实测能力）：',
+    ...lines,
+    '需要不同模型时，用 create_worker 的 model 参数选择上面的别名；不填则沿用你自己的配置。',
+    '别名只是配置名，不绑定职责：同一个模型可以执行，也可以检查；同一职责也可以由不同模型承担。',
+  ].join('\n');
 }
 
 export function workerSystemPrompt(input: {
@@ -26,6 +48,8 @@ export function workerSystemPrompt(input: {
   noteStaleEpoch: number | null;
   noteCoveredSeq: number;
   windowSummary: string;
+  /** 可用模型目录与当前选择；不传则不展示这一段。 */
+  modelCatalog?: { models: { alias: string; model: string; note: string | null; costHint: string | null }[]; currentAlias: string | null } | null;
   /** 维护者在线调整的行为覆盖（已激活版本），只影响措辞与工作方式，不改程序约束。 */
   override?: { content: string; version: number } | null;
 }): string {
@@ -72,6 +96,9 @@ ${input.windowSummary}。更早的内容不在输入里，需要时用 history_s
 - 职责：${worker.role}
 - 具体工作：${worker.brief}
 - 你是否为任务负责人：${isOwner ? '是' : '否'}
+
+# 模型配置
+${input.modelCatalog ? renderModelCatalog(input.modelCatalog.models, input.modelCatalog.currentAlias) : '（未提供模型目录）'}
 
 # 同组协作者（同为 Worker 层，互不构成上下级）
 ${collabLines}

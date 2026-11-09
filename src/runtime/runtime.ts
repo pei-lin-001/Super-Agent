@@ -18,6 +18,7 @@ import {
 } from '../domain/ids.ts';
 import { isTerminalTask, isTerminalWorker } from '../domain/state.ts';
 import { Execution, ExecutionRevoked } from './execution.ts';
+import { ModelRegistry } from '../model/registry.ts';
 import { identifyProcess } from '../watchdog/observer.ts';
 import type {
   Artifact,
@@ -110,6 +111,7 @@ export class Runtime implements ToolHost {
   readonly store: Store;
   readonly config: Config;
   readonly workerModel: ModelClient;
+  readonly models: ModelRegistry;
   readonly defaultWaitTimeoutMs: number;
 
   private readonly events = new EventEmitter();
@@ -142,10 +144,32 @@ export class Runtime implements ToolHost {
   private timer: NodeJS.Timeout | null = null;
   private router: RouterBridge | null = null;
 
-  constructor(options: { store: Store; config: Config; workerModel: ModelClient }) {
+  constructor(options: {
+    store: Store;
+    config: Config;
+    workerModel: ModelClient;
+    /** 模型目录；不传时退化为"单模型"，仍然按别名 default 解析。 */
+    models?: ModelRegistry;
+  }) {
     this.store = options.store;
     this.config = options.config;
     this.workerModel = options.workerModel;
+    this.models =
+      options.models ??
+      new ModelRegistry(
+        [
+          {
+            alias: 'default',
+            provider: options.config.provider,
+            baseUrl: options.config.baseUrl,
+            apiKey: options.config.apiKey,
+            model: options.config.workerModel,
+            note: null,
+            costHint: null,
+          },
+        ],
+        new Map([['default', options.workerModel]]),
+      );
     this.defaultWaitTimeoutMs = options.config.limits.waitTimeoutMs;
     this.tools = new ToolRegistry('worker', [
       ...fileTools,
@@ -267,7 +291,7 @@ export class Runtime implements ToolHost {
         parentId: null,
         role: input.ownerRole,
         brief: input.ownerBrief,
-        model: input.model ?? null,
+        modelAlias: input.model ?? this.config.defaultModelAlias,
       });
       this.store.setTaskOwner(taskId, owner.id);
       options.onRecorded?.(task, owner);
@@ -285,7 +309,8 @@ export class Runtime implements ToolHost {
     parentId: string | null;
     role: string;
     brief: string;
-    model: string | null;
+    /** 模型别名；必须是目录里已配置的别名。 */
+    modelAlias: string;
   }): Worker {
     // 组内按「累计创建」计预算，防止一个任务无限拉人；全局按「当前活跃」计资源。
     const createdInGroup = this.store.countWorkersInGroup(input.groupId);
@@ -305,7 +330,7 @@ export class Runtime implements ToolHost {
       role: input.role,
       brief: input.brief,
       status: 'queued',
-      model: input.model,
+      model: input.modelAlias,
       stepCount: 0,
       createdAt: now,
       updatedAt: now,
@@ -318,14 +343,24 @@ export class Runtime implements ToolHost {
     return worker;
   }
 
-  createCollaborator(parent: Worker, role: string, brief: string): CreateCollaboratorResult {
+  createCollaborator(
+    parent: Worker,
+    role: string,
+    brief: string,
+    options: { model?: string | null } = {},
+  ): CreateCollaboratorResult {
     try {
+      // 不指定就沿用它创建者的模型配置；指定时必须真实存在，不回退默认。
+      const alias = options.model ?? parent.model ?? this.config.defaultModelAlias;
+      if (!this.models.has(alias)) {
+        return { ok: false, reason: `未配置的模型别名：${alias}；可用别名：${this.models.list().map((item) => item.alias).join(', ')}` };
+      }
       const worker = this.createWorkerRecord({
         groupId: parent.groupId,
         parentId: parent.id,
         role,
         brief,
-        model: parent.model,
+        modelAlias: alias,
       });
       this.enqueue(worker.id);
       return { ok: true, workerId: worker.id };
@@ -1277,12 +1312,15 @@ export class Runtime implements ToolHost {
         return;
       }
       dbg(`request model closed=${this.store.isClosed}`);
+      // 按 Worker 记录的模型别名解析：别名决定客户端与请求模型，二者必须一致。
+      const resolved = this.models.resolve(worker.model ?? this.config.defaultModelAlias);
       const result = await execution.attach(
-        new RecordingModel(this.workerModel, this.store, 'worker', {
+        new RecordingModel(resolved.client, this.store, 'worker', {
           taskId: task.id,
           workerId,
+          modelAlias: resolved.alias,
         }).chat({
-          model: worker.model ?? this.config.workerModel,
+          model: resolved.model,
           messages,
           tools: this.tools.schemas(),
           reasoningEffort: this.config.reasoningEffort,
@@ -1608,9 +1646,11 @@ export class Runtime implements ToolHost {
       limits: this.config.limits,
     });
     if (decision.action === 'none') return;
+    // 工作记录整理沿用这个 Worker 自己的模型，不为摘要另建路由。
+    const noteModel = this.models.resolve(worker.model ?? this.config.defaultModelAlias);
     const result = await runNote({
-      model: this.workerModel,
-      modelName: worker.model ?? this.config.workerModel,
+      model: noteModel.client,
+      modelName: noteModel.model,
       store: this.store,
       signal: this.lifecycle.signal,
       worker,
@@ -1652,6 +1692,7 @@ export class Runtime implements ToolHost {
       noteStaleEpoch: note && note.epoch !== task.reviewEpoch ? note.epoch : null,
       noteCoveredSeq: note?.coveredSeq ?? 0,
       windowSummary: `近期窗口含 ${plan.turns.length} 条，历史共 ${plan.totalTurns} 条（约 ${plan.totalChars} 字符）`,
+      modelCatalog: { models: this.models.list(), currentAlias: worker.model ?? this.config.defaultModelAlias },
       override: this.currentOverride(),
     });
     const history = this.buildHistory(worker, plan);

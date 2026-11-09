@@ -244,6 +244,8 @@ export class Store {
     ensureColumn('task', 'maintenance', 'maintenance INTEGER NOT NULL DEFAULT 0');
     ensureColumn('wd_action', 'command_id', 'command_id TEXT');
     ensureColumn('model_call', 'instance_id', 'instance_id TEXT');
+    ensureColumn('model_call', 'model_alias', 'model_alias TEXT');
+    ensureColumn('model_call', 'response_model', 'response_model TEXT');
     ensureColumn('worker', 'run_epoch', 'run_epoch INTEGER NOT NULL DEFAULT 0');
     ensureColumn('message', 'dedupe_key', 'dedupe_key TEXT');
     ensureColumn('message', 'broadcast_id', 'broadcast_id TEXT');
@@ -794,10 +796,12 @@ export class Store {
     taskId?: string | null;
     workerId?: string | null;
     sessionId?: string | null;
+    /** Worker 选择的模型别名；为空表示按默认别名执行。 */
+    modelAlias?: string | null;
   }): void {
     this.run(
-      `INSERT INTO model_call (id, instance_id, purpose, task_id, worker_id, session_id, model, status, started_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?)`,
+      `INSERT INTO model_call (id, instance_id, purpose, task_id, worker_id, session_id, model, model_alias, status, started_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)`,
       input.id,
       this.instanceId,
       input.purpose,
@@ -805,6 +809,7 @@ export class Store {
       input.workerId ?? null,
       input.sessionId ?? null,
       input.model,
+      input.modelAlias ?? null,
       nowIso(),
     );
   }
@@ -815,18 +820,21 @@ export class Store {
     usage?: { promptTokens: number; completionTokens: number } | null;
     httpAttempts?: number | null;
     error?: string | null;
+    /** 提供方实际返回的模型标识，与请求的模型分开保存。 */
+    responseModel?: string | null;
   }): void {
     // usage 缺失记为未知（usage_known=0），不填 0；提供方明确返回的 0 会保留。
     const known = input.usage ? 1 : 0;
     this.run(
       `UPDATE model_call SET status = ?, prompt_tokens = ?, completion_tokens = ?, usage_known = ?,
-         http_attempts = ?, error = ?, ended_at = ? WHERE id = ?`,
+         http_attempts = ?, error = ?, response_model = ?, ended_at = ? WHERE id = ?`,
       input.status,
       input.usage?.promptTokens ?? null,
       input.usage?.completionTokens ?? null,
       known,
       input.httpAttempts ?? null,
       input.error ?? null,
+      input.responseModel ?? null,
       nowIso(),
       input.id,
     );

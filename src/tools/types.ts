@@ -77,7 +77,12 @@ export interface ReportResult {
 export interface ToolHost {
   /** 未显式给出超时时的等待上限。 */
   readonly defaultWaitTimeoutMs: number;
-  createCollaborator(parent: Worker, role: string, brief: string): CreateCollaboratorResult;
+  createCollaborator(
+    parent: Worker,
+    role: string,
+    brief: string,
+    options?: { model?: string | null },
+  ): CreateCollaboratorResult;
   sendMessage(input: SendMessageInput): SendMessageResult;
   registerWait(worker: Worker, options: WaitOptions): WaitResult;
   submitResult(worker: Worker, summary: string, artifactNames: string[]): Promise<SubmitResult>;

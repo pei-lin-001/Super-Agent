@@ -243,6 +243,8 @@ CREATE INDEX IF NOT EXISTS idx_wd_issue_status ON wd_issue(status, check_after);
 CREATE TABLE IF NOT EXISTS model_call (
   id           TEXT PRIMARY KEY,
   instance_id  TEXT,
+  model_alias  TEXT,
+  response_model TEXT,
   purpose      TEXT NOT NULL,
   task_id      TEXT,
   worker_id    TEXT,
