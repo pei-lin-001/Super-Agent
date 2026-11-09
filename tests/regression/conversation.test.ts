@@ -54,11 +54,18 @@ test('话题隔离：同一聊天里两个话题的历史互不可见', async ()
       conversationId: second.id,
     });
 
-    // 两个话题各有一条用户历史，互不串
+    // 每个话题只装自己的问答，互不串
     const oneTurns = harness.store.listRouterTurns(20, TG_KEY, first.id);
     const twoTurns = harness.store.listRouterTurns(20, TG_KEY, second.id);
-    assert.deepEqual(oneTurns.map((turn) => turn.content), ['这是话题一说的秘密']);
-    assert.deepEqual(twoTurns.map((turn) => turn.content), ['这是话题二说的话']);
+    assert.deepEqual(
+      oneTurns.map((turn) => [turn.role, turn.content]),
+      [['user', '这是话题一说的秘密'], ['assistant', '好的']],
+      '用户消息与回答必须都落在同一个话题里',
+    );
+    assert.deepEqual(
+      twoTurns.map((turn) => [turn.role, turn.content]),
+      [['user', '这是话题二说的话'], ['assistant', '好的']],
+    );
 
     // 话题二的 Router 请求里不能带上话题一的内容
     const lastPrompt = prompts[prompts.length - 1]!;
@@ -280,6 +287,109 @@ test('升级兼容：话题上线前的历史会被收进第一个话题，不�
       turns.some((turn) => turn.content === '升级前说过的话'),
       `升级前的历史应被收进第一个话题（实际 ${JSON.stringify(turns.map((t) => t.content))}）`,
     );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('同一话题追问：第二轮请求必须包含上一轮的回答', async () => {
+  const seen: string[][] = [];
+  let round = 0;
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    router: (context) => {
+      seen.push(
+        context.request.messages
+          .filter((message) => message.role === 'user' || message.role === 'assistant')
+          .map((message) => `${message.role}:${message.content}`),
+      );
+      round += 1;
+      return mockReply({ text: round === 1 ? '审查专用答案_ALPHA_739' : '解释完了' });
+    },
+  });
+  const conversations = new ConversationService(harness.store);
+  try {
+    const topic = conversations.create(TG_KEY, '追问测试');
+    await harness.router.handleUserMessage('请给一个答案', { sessionKey: TG_KEY, conversationId: topic.id });
+    await harness.router.handleUserMessage('解释你刚才的答案', {
+      sessionKey: TG_KEY,
+      conversationId: topic.id,
+    });
+
+    const second = seen[1]!.join('\n');
+    assert.ok(
+      second.includes('审查专用答案_ALPHA_739'),
+      `第二轮必须看到上一轮回答（实际：${second}）`,
+    );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('同轮新建话题：之后建立的任务属于新话题', async () => {
+  let round = 0;
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    router: () => {
+      round += 1;
+      if (round === 1) return mockReply({ toolCalls: [{ name: 'conversation_new', arguments: { title: '乙' } }] });
+      if (round === 2) {
+        return mockReply({
+          toolCalls: [
+            {
+              name: 'create_task',
+              arguments: { title: '乙任务', goal: 'g', owner_role: 'r', owner_brief: 'b' },
+            },
+          ],
+        });
+      }
+      return mockReply({ text: '建好了' });
+    },
+  });
+  const conversations = new ConversationService(harness.store);
+  try {
+    const alpha = conversations.create(TG_KEY, '甲');
+    await harness.router.handleUserMessage('新开乙话题并建乙的任务', {
+      sessionKey: TG_KEY,
+      conversationId: alpha.id,
+    });
+
+    const beta = conversations.list(TG_KEY).at(-1)!;
+    assert.notEqual(beta.id, alpha.id, '应有第二个话题');
+    const tasks = harness.store.listTasks();
+    assert.equal(tasks.length, 1, '应建了一个任务');
+    assert.equal(tasks[0]!.sourceConversationId, beta.id, '任务必须属于同轮新建的乙话题');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('归档：编号不重排，归档话题可以通过 /use 恢复', async () => {
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    router: () => mockReply({ text: '好的' }),
+  });
+  const conversations = new ConversationService(harness.store);
+  try {
+    const a = conversations.create(TG_KEY, '甲');
+    const b = conversations.create(TG_KEY, '乙');
+    const c = conversations.create(TG_KEY, '丙');
+
+    // 归档乙：甲的编号仍是 1，丙仍是 3
+    conversations.switchTo(TG_KEY, '2');
+    assert.match(conversations.handleCommand(TG_KEY, '/archive') ?? '', /已归档话题「乙」/);
+    const list = conversations.handleCommand(TG_KEY, '/list') ?? '';
+    assert.match(list, /1\. 甲/, `甲的编号不能变（实际：${list}）`);
+    assert.match(list, /3\. 丙/, `丙的编号不能变（实际：${list}）`);
+    assert.match(list, /2\. 乙（已归档）/, '归档话题仍要出现在列表里');
+
+    // 切回归档话题 = 恢复
+    const restored = conversations.switchTo(TG_KEY, '2');
+    assert.equal(restored?.id, b.id);
+    assert.equal(harness.store.getConversation(b.id)?.status, 'active', '切到归档话题要恢复它');
+    assert.equal(harness.store.currentConversationId(TG_KEY), b.id);
+    assert.equal(harness.store.getConversation(a.id)?.status, 'active');
+    assert.equal(harness.store.getConversation(c.id)?.status, 'active');
   } finally {
     await harness.cleanup();
   }

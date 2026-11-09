@@ -113,6 +113,17 @@ export class ChannelService {
   private readonly placeholderTimers = new Map<string, NodeJS.Timeout>();
   private unsubscribe: (() => void) | null = null;
   private readonly sleeps = new Set<NodeJS.Timeout>();
+  /**
+   * 服务生命周期取消信号：所有发送、草稿、正在输入都挂在它上面。
+   *
+   * 没有它的时候，stop() 返回了发送还在跑：主入口随后关数据库，
+   * 迟到回执就会写一个已关闭的库。
+   */
+  private readonly lifecycle = new AbortController();
+  /** 在途发送：停机要等它们收尾。 */
+  private readonly pendingSends = new Set<Promise<unknown>>();
+  /** 已经收完尾：此后的回执一律丢弃，不再写库。 */
+  private stopped = false;
 
   constructor(options: {
     runtime: Runtime;
@@ -220,9 +231,16 @@ export class ChannelService {
     for (const timer of this.placeholderTimers.values()) clearTimeout(timer);
     this.placeholderTimers.clear();
     this.live.clear();
+    // 先取消在途发送（它们会按"结果未知"落库），再等它们真的收尾。
+    // 顺序反了就是之前的缺陷：stop 返回时 send 还在跑，回执晚于数据库关闭。
+    this.lifecycle.abort();
     await Promise.allSettled([...this.runtimes.values()].map((entry) => entry.loop ?? Promise.resolve()));
-    // 发送中的调用交给它自己结束：这里只关连接，不改业务状态。
+    while (this.pendingSends.size > 0) {
+      await Promise.allSettled([...this.pendingSends]);
+    }
     await Promise.allSettled([...this.runtimes.values()].map((entry) => entry.adapter.close()));
+    // 收尾完成：此后任何迟到结果都不再写库。
+    this.stopped = true;
   }
 
   /** 一轮轮询 + 一次收发推进；测试与进程级验收直接调用它。 */
@@ -388,6 +406,9 @@ export class ChannelService {
           // 用户输入一旦持久化就标记已交接：之后崩溃走续接，不重复派工。
           onAccepted: () => {
             accepted = true;
+            // 话题归属在交接这一刻固定下来：附件认领、材料补充都按它筛选，
+            // 不再事后去读"这个聊天当前是哪个话题"。
+            this.store.setInboundConversation(item.id, conversation.id);
             this.store.markInbound(item.id, 'handed');
             this.store.upsertChannelSession({
               sessionKey,
@@ -459,7 +480,7 @@ export class ChannelService {
         platformMessageId: null,
         error: null,
       },
-      signal: new AbortController().signal,
+      signal: this.lifecycle.signal,
     });
     if (outcome.status === 'sent' && outcome.platformMessageId) {
       this.live.set(sessionKey, {
@@ -514,7 +535,7 @@ export class ChannelService {
           target: target.outbound,
           draftId: entry.draftId,
           text: composed,
-          signal: new AbortController().signal,
+          signal: this.lifecycle.signal,
         })
         .then((outcome) => {
           // 平台不支持或参数不认：本轮不再试，最终答案照常发送，用户不会看到报错。
@@ -540,7 +561,7 @@ export class ChannelService {
         target: target.outbound,
         messageId: entry.messageId,
         text: composed,
-        signal: new AbortController().signal,
+        signal: this.lifecycle.signal,
       })
       .catch(() => undefined)
       .finally(done);
@@ -574,7 +595,7 @@ export class ChannelService {
       target: target.outbound,
       messageId: entry.messageId,
       text: head ?? '',
-      signal: new AbortController().signal,
+      signal: this.lifecycle.signal,
     });
     if (outcome.status !== 'sent') return false;
     // 改写只能覆盖第一段，剩下的照常发。
@@ -589,7 +610,7 @@ export class ChannelService {
     if (this.typingTimers.has(sessionKey)) return;
     const beat = (): void => {
       void adapter
-        .typing!({ target: outbound, signal: new AbortController().signal })
+        .typing!({ target: outbound, signal: this.lifecycle.signal })
         .catch(() => undefined);
     };
     beat();
@@ -645,6 +666,8 @@ export class ChannelService {
     taskId: string | null,
     artifact: OutboundArtifact | null,
   ): void {
+    // 停机之后不再产生新的发件记录：数据库可能已经被关掉。
+    if (this.stopped) return;
     const session = this.store.getChannelSession(sessionKey);
     const parts = sessionKey.split('|').map((part) => decodeURIComponent(part));
     const channel = session?.channel ?? parts[0] ?? '';
@@ -695,6 +718,7 @@ export class ChannelService {
    * 发送结果未知时如实记录为 unknown，不当成功、也不整条重来。
    */
   async drainOutbound(): Promise<void> {
+    if (this.stopped) return;
     if (this.outboundBusy) return;
     this.outboundBusy = true;
     try {
@@ -706,11 +730,14 @@ export class ChannelService {
         if (!entry) continue;
         if (this.sending.has(key)) continue;
         this.sending.add(key);
+        const sending = this.deliver(record, entry.adapter);
+        this.pendingSends.add(sending);
         try {
           this.dbg(`deliver ${record.id}`);
-          await this.deliver(record, entry.adapter);
+          await sending;
           this.dbg(`delivered ${record.id}`);
         } finally {
+          this.pendingSends.delete(sending);
           this.sending.delete(key);
         }
       }
@@ -748,6 +775,8 @@ export class ChannelService {
     // 每段一有结果就落库：第一段已拿到平台回执、后一段还在等的时候崩溃，
     // 重启后必须知道第一段已经发出去了，不能整条重来再发一遍。
     const persist = (nextAttemptAt: string | null = null): void => {
+      // 迟到回执：服务已经收尾、数据库可能已关闭，写入会把停机变成异常。
+      if (this.stopped) return;
       const sent = segments.filter((segment) => segment.status === 'sent').length;
       // 还有没送完的段就保持可调度：unknown 只代表那一段不确定，
       // 不能因为一段 unknown 把后面确定没发的段一起冻结。
@@ -786,8 +815,10 @@ export class ChannelService {
         persist();
         continue;
       }
-      if (segment.kind === 'file' && !segment.path) {
-        // 只认排队时固定的产物版本；文件不存在或指纹不符就不发。
+      if (segment.kind === 'file') {
+        // 只认排队时固定的产物版本，而且**每次**派发都重新核验。
+        // 以前只在 segment.path 为空时核验：第一次发送限速后磁盘文件被改，
+        // 重试直接把新内容发了出去，还登记成"已发送"。
         const resolved = this.resolveArtifactSegment(segment);
         if (!resolved.ok) {
           segment.status = 'failed';
@@ -806,9 +837,12 @@ export class ChannelService {
       persist();
       let outcome: SendOutcome;
       try {
-        outcome = await adapter.send({ target, segment, signal: new AbortController().signal });
+        outcome = await adapter.send({ target, segment, signal: this.lifecycle.signal });
       } catch (error) {
-        outcome = { status: 'failed', error: (error as Error).message, retryable: true };
+        // 停机取消：请求可能已经到了平台，不能当"肯定没发出去"去重发。
+        outcome = this.lifecycle.signal.aborted
+          ? { status: 'unknown', error: `发送被取消：${(error as Error).message}` }
+          : { status: 'failed', error: (error as Error).message, retryable: true };
       }
       if (outcome.status === 'sent') {
         segment.status = 'sent';

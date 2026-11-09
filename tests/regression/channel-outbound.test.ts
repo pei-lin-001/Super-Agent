@@ -8,6 +8,9 @@ import { FakeAdapter, expireOutboundBackoff, serviceOf } from '../channel-helper
 import { mockReply } from '../../src/model/mock.ts';
 import { sessionKeyOf, type OutboundSegment } from '../../src/channels/types.ts';
 import { splitText } from '../../src/channels/service.ts';
+import { createHash } from 'node:crypto';
+import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 
 const TG_KEY = sessionKeyOf({ channel: 'telegram', accountId: 'bot_1', peerId: 'owner-1' });
 
@@ -635,4 +638,121 @@ test('草稿：平台不认这个接口时安静退回，答案照常发送', as
     await service.stop();
     await harness.cleanup();
   }
+});
+
+test('文件重试：第二次派发前必须重新核验真实内容，被改过就不发', async () => {
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    router: () => mockReply({ text: '好的' }),
+  });
+  const service = serviceOf({ runtime: harness.runtime, store: harness.store, config: harness.config });
+  const adapter = new FakeAdapter('telegram', 'bot_1', ['owner-1']);
+  service.register(adapter);
+  service.start();
+  try {
+    const { task } = harness.runtime.createTask({
+      title: 't',
+      goal: 'g',
+      ownerRole: 'r',
+      ownerBrief: 'b',
+    });
+    const rel = join(task.id, 'deliverable.md');
+    const abs = join(harness.config.workDir, rel);
+    mkdirSync(dirname(abs), { recursive: true });
+    writeFileSync(abs, 'REGISTERED-V1', 'utf8');
+    const artifact = harness.store.insertArtifact({
+      id: 'art_pin_1',
+      taskId: task.id,
+      workerId: 'w-1',
+      name: 'deliverable.md',
+      path: rel,
+      version: 1,
+      bytes: Buffer.byteLength('REGISTERED-V1'),
+      sha256: createHash('sha256').update('REGISTERED-V1').digest('hex'),
+      createdAt: new Date().toISOString(),
+    });
+    service.enqueueOutbound(
+      TG_KEY,
+      '',
+      task.id,
+      {
+        artifactId: artifact.id,
+        name: artifact.name,
+        version: artifact.version,
+        sha256: artifact.sha256,
+        bytes: artifact.bytes,
+      },
+    );
+
+    // 第一次：平台临时限速（可重试失败）
+    let attempt = 0;
+    const contents: string[] = [];
+    adapter.sendPolicy = () => {
+      attempt += 1;
+      contents.push(readFileSync(abs, 'utf8'));
+      if (attempt === 1) return { status: 'failed', error: 'rate limited', retryable: true, retryAfterMs: 0 };
+      return { status: 'sent', platformMessageId: `m${attempt}` };
+    };
+    await service.drainOutbound();
+    // 失败后磁盘文件被改
+    writeFileSync(abs, 'MUTATED-AFTER-FIRST-ATTEMPT', 'utf8');
+    expireOutboundBackoff(harness.store, TG_KEY);
+    await service.drainOutbound();
+
+    assert.deepEqual(contents, ['REGISTERED-V1'], `第二次不该再发给平台（实际 ${JSON.stringify(contents)}）`);
+    const row = harness.store.listOutboundBySession(TG_KEY)[0]!;
+    const segs = segmentsOf(row);
+    assert.equal(segs[0]!.status, 'failed', '被改过的文件必须判失败');
+    assert.match(segs[0]!.error ?? '', /指纹|大小/);
+  } finally {
+    await service.stop();
+    await harness.cleanup();
+  }
+});
+
+test('停机：stop 必须取消并等完在途发送，迟到回执不再写库', async () => {
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    router: () => mockReply({ text: '好的' }),
+  });
+  const service = serviceOf({ runtime: harness.runtime, store: harness.store, config: harness.config });
+  const adapter = new FakeAdapter('telegram', 'bot_1', ['owner-1']);
+  service.register(adapter);
+  service.start();
+
+  let release: (() => void) | undefined;
+  let sawAbort = false;
+  let sendFinished = false;
+  (adapter as unknown as { send: (input: { signal?: AbortSignal }) => Promise<unknown> }).send = async (input) => {
+    await new Promise<void>((resolve) => {
+      release = resolve;
+      input.signal?.addEventListener('abort', () => {
+        sawAbort = true;
+        resolve();
+      });
+    });
+    sendFinished = true;
+    throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+  };
+
+  service.enqueueOutbound(TG_KEY, '停机测试', null, null);
+  const drain = service.drainOutbound();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  const stopping = service.stop();
+  const stopDone = await Promise.race([
+    stopping.then(() => 'stopped'),
+    new Promise((resolve) => setTimeout(() => resolve('timeout'), 2_000)),
+  ]);
+  release?.();
+  await drain.catch(() => undefined);
+  await stopping;
+
+  assert.equal(sawAbort, true, '在途发送必须收到取消信号');
+  assert.equal(sendFinished, true, '取消后发送要收尾');
+  assert.equal(stopDone, 'stopped', 'stop 不能提前返回');
+  const row = harness.store.listOutboundBySession(TG_KEY)[0]!;
+  const segs = segmentsOf(row);
+  assert.equal(segs[0]!.status, 'unknown', '被取消的发送只能记结果未知');
+  await harness.cleanup();
 });

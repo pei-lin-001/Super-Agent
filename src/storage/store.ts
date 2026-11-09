@@ -262,6 +262,8 @@ export class Store {
     ensureColumn('task', 'source_peer_id', 'source_peer_id TEXT');
     ensureColumn('task', 'source_session_key', 'source_session_key TEXT');
     ensureColumn('channel_inbound', 'silent', 'silent INTEGER NOT NULL DEFAULT 0');
+    // 入站消息的话题归属：附件认领、材料补充都按它筛选，不再临时读"当前话题指针"。
+    ensureColumn('channel_inbound', 'conversation_id', 'conversation_id TEXT');
     ensureColumn('channel_outbound', 'next_attempt_at', 'next_attempt_at TEXT');
     ensureColumn('router_turn', 'session_key', 'session_key TEXT');
     ensureColumn('router_session', 'session_key', 'session_key TEXT');
@@ -287,6 +289,17 @@ export class Store {
        WHERE conversation_id IS NULL
          AND session_key IS NOT NULL
          AND EXISTS (SELECT 1 FROM conversation c2 WHERE c2.session_key = router_turn.session_key)
+    `);
+    // 入站记录同理：老附件的归属收进该会话最早的话题，避免"文件在哪个话题里"说不清。
+    this.db.exec(`
+      UPDATE channel_inbound
+         SET conversation_id = (
+           SELECT c.id FROM conversation c
+            WHERE c.session_key = channel_inbound.session_key
+            ORDER BY c.created_at ASC, c.rowid ASC LIMIT 1
+         )
+       WHERE conversation_id IS NULL
+         AND EXISTS (SELECT 1 FROM conversation c2 WHERE c2.session_key = channel_inbound.session_key)
     `);
     ensureColumn('wd_action', 'command_id', 'command_id TEXT');
     ensureColumn('model_call', 'instance_id', 'instance_id TEXT');
@@ -964,6 +977,14 @@ export class Store {
       this.run("UPDATE router_session SET status = 'pending', updated_at = ? WHERE status = 'running'", nowIso());
     }
     return rows.length;
+  }
+
+  /** 只改话题归属：话题在轮内切换时用，不动消息内容与状态。 */
+  setRouterSessionConversation(id: string, conversationId: string | null): void {
+    this.run(
+      'UPDATE router_session SET conversation_id = ?, updated_at = ? WHERE id = ?',
+      conversationId, nowIso(), id,
+    );
   }
 
   closeRouterSession(id: string, status: 'done' | 'abandoned'): void {
@@ -1667,18 +1688,33 @@ export class Store {
    * 取某个会话里带附件、尚未归属任务、且已成功交接的入站记录。
    *
    * 用于把用户发来的材料真正落到任务目录：交接失败的记录不算。
+   * 传了话题就只认这个话题的附件——否则在乙话题建任务会把甲话题刚发的文件
+   * 一起认领走，用户看到的是"文件跑到了别的话题里"。
    */
-  listUnclaimedSessionAttachments(sessionKey: string, limit = 50): {
+  listUnclaimedSessionAttachments(
+    sessionKey: string,
+    conversationId: string | null = null,
+    limit = 50,
+  ): {
     id: string;
     attachments: unknown;
     receivedAt: string;
   }[] {
+    // 没有话题归属的老记录（升级前写入）只在"这个聊天只有一个话题"时才算进来：
+    // 那时不存在分错话题的可能；有两个以上话题就拒绝认领，不猜。
+    const topicClause =
+      conversationId === null
+        ? ''
+        : ` AND (conversation_id = ?
+               OR (conversation_id IS NULL
+                   AND (SELECT COUNT(*) FROM conversation c
+                         WHERE c.session_key = channel_inbound.session_key AND c.status = 'active') <= 1))`;
     return this.all(
       `SELECT * FROM channel_inbound
        WHERE session_key = ? AND status = 'handed' AND claimed_task_id IS NULL
-         AND attachments IS NOT NULL AND attachments != '[]'
+         AND attachments IS NOT NULL AND attachments != '[]'${topicClause}
        ORDER BY created_at ASC, rowid ASC LIMIT ?`,
-      sessionKey, limit,
+      ...(conversationId === null ? [sessionKey, limit] : [sessionKey, conversationId, limit]),
     ).map((row) => ({
       id: str(row['id']),
       attachments: JSON.parse(str(row['attachments'] ?? '[]')),
@@ -1690,6 +1726,20 @@ export class Store {
     for (const id of ids) {
       this.run('UPDATE channel_inbound SET claimed_task_id = ? WHERE id = ?', taskId, id);
     }
+  }
+
+  /** 把升级前没有话题归属的入站记录收进该会话的第一个话题。 */
+  adoptOrphanInbound(sessionKey: string, conversationId: string): number {
+    this.assertUsable();
+    const result = this.db
+      .prepare('UPDATE channel_inbound SET conversation_id = ? WHERE session_key = ? AND conversation_id IS NULL')
+      .run(conversationId, sessionKey);
+    return Number(result.changes ?? 0);
+  }
+
+  /** 记下这条入站消息属于哪个话题；交接时写入，之后不再变。 */
+  setInboundConversation(id: string, conversationId: string): void {
+    this.run('UPDATE channel_inbound SET conversation_id = ? WHERE id = ?', conversationId, id);
   }
 
   markInbound(id: string, status: 'handed' | 'rejected' | 'failed', reason?: string | null): void {

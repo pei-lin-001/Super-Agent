@@ -3,7 +3,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHarness } from '../helpers.ts';
 import { FakeAdapter, eventOf, serviceOf } from '../channel-helpers.ts';
@@ -11,6 +11,7 @@ import { mockReply } from '../../src/model/mock.ts';
 import { sessionKeyOf, type OutboundSegment } from '../../src/channels/types.ts';
 import { safeFileName, sha256Of, writeInboundAttachment, resolveArtifactPath } from '../../src/channels/storage.ts';
 import { composeInboundText } from '../../src/channels/service.ts';
+import { ConversationService } from '../../src/channels/conversations.ts';
 
 const TG_KEY = sessionKeyOf({ channel: 'telegram', accountId: 'bot_1', peerId: 'owner-1' });
 
@@ -563,6 +564,208 @@ test('材料补充：任务建好后用户再发文件，能补进已有任务�
     const again = harness.runtime.attachSessionMaterials(task.id, TG_KEY);
     assert.equal(again.ok, false);
     assert.match(again.ok ? '' : again.message, /没有待补充的材料/);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('附件按话题认领：甲话题的文件不会被乙话题新建的任务拿走', async () => {
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    router: () => mockReply({ text: '好的' }),
+  });
+  const conversations = new ConversationService(harness.store);
+  try {
+    const alpha = conversations.create(TG_KEY, '甲');
+    const payload = Buffer.from('A-file\n', 'utf8');
+    const stored = writeInboundAttachment({
+      workDir: harness.config.workDir,
+      channel: 'telegram',
+      accountId: 'bot_1',
+      eventId: 'update:61',
+      name: 'A-file.csv',
+      kind: 'file',
+      mime: 'text/csv',
+      bytes: payload,
+    });
+    harness.store.recordInboundBatch({
+      channel: 'telegram',
+      accountId: 'bot_1',
+      ownerIds: ['owner-1'],
+      events: [
+        {
+          id: 'in_61',
+          eventId: 'update:61',
+          peerId: 'owner-1',
+          senderId: 'owner-1',
+          platformMessageId: '61',
+          sessionKey: TG_KEY,
+          threadId: null,
+          body: '甲的材料',
+          attachments: [stored],
+          unsupported: null,
+          receivedAt: new Date().toISOString(),
+        },
+      ],
+      cursor: '62',
+    });
+    // 交接时固定话题归属（真实链路由渠道层写入）
+    harness.store.setInboundConversation('in_61', alpha.id);
+    harness.store.markInbound('in_61', 'handed');
+
+    const beta = conversations.create(TG_KEY, '乙');
+    const { task } = harness.runtime.createTask({
+      title: '乙任务',
+      goal: 'g',
+      ownerRole: 'r',
+      ownerBrief: 'b',
+      source: {
+        channel: 'telegram',
+        accountId: 'bot_1',
+        peerId: 'owner-1',
+        sessionKey: TG_KEY,
+        conversationId: beta.id,
+      },
+    });
+
+    assert.ok(!task.brief.includes('A-file.csv'), `乙任务不该拿到甲的材料（实际：${task.brief}）`);
+    assert.equal(
+      harness.store.listUnclaimedSessionAttachments(TG_KEY, alpha.id).length,
+      1,
+      '甲的材料仍留给自己话题使用',
+    );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('补材料失败：只删本次复制的新文件，原有产物与任务目录必须还在', async () => {
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    router: () => mockReply({ text: '好的' }),
+  });
+  try {
+    const { task } = harness.runtime.createTask({
+      title: '已有任务',
+      goal: 'g',
+      ownerRole: 'r',
+      ownerBrief: 'b',
+      source: { channel: 'telegram', accountId: 'bot_1', peerId: 'owner-1', sessionKey: TG_KEY },
+    });
+    const existing = join(harness.config.workDir, task.id, 'existing-deliverable.md');
+    mkdirSync(join(harness.config.workDir, task.id), { recursive: true });
+    writeFileSync(existing, '原有成果\n', 'utf8');
+
+    // 附件记录在，但缓存文件已经没了
+    const stored = writeInboundAttachment({
+      workDir: harness.config.workDir,
+      channel: 'telegram',
+      accountId: 'bot_1',
+      eventId: 'update:71',
+      name: 'gone.csv',
+      kind: 'file',
+      mime: 'text/csv',
+      bytes: Buffer.from('x\n', 'utf8'),
+    });
+    rmSync(join(harness.config.workDir, stored.path), { force: true });
+    harness.store.recordInboundBatch({
+      channel: 'telegram',
+      accountId: 'bot_1',
+      ownerIds: ['owner-1'],
+      events: [
+        {
+          id: 'in_71',
+          eventId: 'update:71',
+          peerId: 'owner-1',
+          senderId: 'owner-1',
+          platformMessageId: '71',
+          sessionKey: TG_KEY,
+          threadId: null,
+          body: '补个材料',
+          attachments: [stored],
+          unsupported: null,
+          receivedAt: new Date().toISOString(),
+        },
+      ],
+      cursor: '72',
+    });
+    harness.store.markInbound('in_71', 'handed');
+
+    const attached = harness.runtime.attachSessionMaterials(task.id, TG_KEY);
+    assert.equal(attached.ok, false, '源文件没了必须如实失败');
+    assert.equal(existsSync(existing), true, '原有产物不能被删');
+    assert.equal(existsSync(join(harness.config.workDir, task.id)), true, '任务目录不能被删');
+    assert.ok(harness.store.getTask(task.id), '任务记录当然还在');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('补材料：负责人被通知、要求版本推进；终态任务拒绝补材料', async () => {
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    router: () => mockReply({ text: '好的' }),
+  });
+  try {
+    const { task, owner } = harness.runtime.createTask({
+      title: '要补材料的任务',
+      goal: 'g',
+      ownerRole: 'r',
+      ownerBrief: 'b',
+      source: { channel: 'telegram', accountId: 'bot_1', peerId: 'owner-1', sessionKey: TG_KEY },
+    });
+    const payload = Buffer.from('新材料\n', 'utf8');
+    const stored = writeInboundAttachment({
+      workDir: harness.config.workDir,
+      channel: 'telegram',
+      accountId: 'bot_1',
+      eventId: 'update:81',
+      name: 'new.csv',
+      kind: 'file',
+      mime: 'text/csv',
+      bytes: payload,
+    });
+    harness.store.recordInboundBatch({
+      channel: 'telegram',
+      accountId: 'bot_1',
+      ownerIds: ['owner-1'],
+      events: [
+        {
+          id: 'in_81',
+          eventId: 'update:81',
+          peerId: 'owner-1',
+          senderId: 'owner-1',
+          platformMessageId: '81',
+          sessionKey: TG_KEY,
+          threadId: null,
+          body: '再补一份',
+          attachments: [stored],
+          unsupported: null,
+          receivedAt: new Date().toISOString(),
+        },
+      ],
+      cursor: '82',
+    });
+    harness.store.markInbound('in_81', 'handed');
+
+    const epochBefore = harness.store.getTask(task.id)!.reviewEpoch;
+    // 不带任何 note：通知与要求版本推进都不该省
+    const attached = harness.runtime.attachSessionMaterials(task.id, TG_KEY);
+    assert.equal(attached.ok, true);
+
+    const after = harness.store.getTask(task.id)!;
+    assert.ok(after.reviewEpoch > epochBefore, `要求版本必须推进（${epochBefore} → ${after.reviewEpoch}）`);
+    const updates = harness.store
+      .listGroupMessages(task.groupId, 200)
+      .filter((message) => message.kind === 'update' && message.toId === owner.id);
+    assert.equal(updates.length, 1, `负责人必须收到一条补充要求（实际 ${updates.length}）`);
+    assert.match(updates[0]!.body, /补充了新材料/);
+
+    // 终态任务：明确拒绝，不静默改已交付的东西
+    harness.store.setTaskStatus(task.id, 'completed', { reason: '完成' });
+    const rejected = harness.runtime.attachSessionMaterials(task.id, TG_KEY);
+    assert.equal(rejected.ok, false);
+    assert.match(rejected.ok ? '' : rejected.message, /不能再补材料/);
   } finally {
     await harness.cleanup();
   }

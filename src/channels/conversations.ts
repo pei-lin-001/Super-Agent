@@ -79,8 +79,10 @@ export class ConversationService {
       sessionKey,
       firstMessage === undefined ? '默认话题' : autoTitle(firstMessage),
     );
-    // 第一次有话题时，把升级前的历史收进来，避免"升级后突然失忆"。
+    // 第一次有话题时，把升级前的历史与入站记录收进来，避免"升级后突然失忆"、
+    // 以及"文件不知道属于哪个话题"。
     this.store.adoptOrphanRouterTurns(sessionKey, created.id);
+    this.store.adoptOrphanInbound(sessionKey, created.id);
     return created;
   }
 
@@ -110,13 +112,18 @@ export class ConversationService {
     return { id, sessionKey, title: autoTitle(title), status: 'active', lastMessageAt: nowIso() };
   }
 
-  list(sessionKey: string): Conversation[] {
-    return this.store.listConversations(sessionKey);
+  list(sessionKey: string, status: 'active' | 'archived' | 'all' = 'active'): Conversation[] {
+    return this.store.listConversations(sessionKey, status);
   }
 
-  /** 按 /list 里显示的编号（从 1 开始）或话题 id 找话题。 */
+  /**
+   * 按 /list 里显示的编号（从 1 开始）或话题 id 找话题。
+   *
+   * 编号覆盖归档话题：归档一个话题不该让后面所有话题的编号往前跳，
+   * 用户记忆中的「3 号」必须一直是同一个话题。
+   */
   resolve(sessionKey: string, ref: string): Conversation | null {
-    const list = this.store.listConversations(sessionKey);
+    const list = this.store.listConversations(sessionKey, 'all');
     const byId = list.find((item) => item.id === ref);
     if (byId) return byId;
     const index = Number(ref.replace(/^#/, ''));
@@ -128,6 +135,11 @@ export class ConversationService {
     const target = this.resolve(sessionKey, ref);
     if (!target) return null;
     this.ensureSessionRow(sessionKey);
+    // 切到归档话题 = 恢复它：用户没有别的入口能把归档翻回来。
+    if (target.status === 'archived') {
+      this.store.setConversationStatus(target.id, 'active');
+      target.status = 'active';
+    }
     this.store.setCurrentConversation(sessionKey, target.id);
     return target;
   }
@@ -164,14 +176,15 @@ export class ConversationService {
     const command = parseCommand(text);
     if (!command) return null;
     if (command.kind === 'list') {
-      const list = this.store.listConversations(sessionKey);
+      const list = this.store.listConversations(sessionKey, 'all');
       const currentId = this.ensureCurrent(sessionKey).id;
       if (list.length === 0) return '还没有任何话题。直接说话就会自动建一个。';
       const lines = list.map((item, index) => {
         const mark = item.id === currentId ? '●' : '○';
-        return `${mark} ${index + 1}. ${item.title}`;
+        const tag = item.status === 'archived' ? '（已归档）' : '';
+        return `${mark} ${index + 1}. ${item.title}${tag}`;
       });
-      return `话题（● 当前）：\n${lines.join('\n')}\n用 /use 编号 切换。`;
+      return `话题（● 当前）：\n${lines.join('\n')}\n用 /use 编号 切换（切到归档话题会恢复它）。`;
     }
     if (command.kind === 'new') {
       const title = command.title ?? '新话题';
@@ -179,9 +192,10 @@ export class ConversationService {
       return `已新建并切换到话题「${created.title}」。之前的任务仍在后台跑，完成后会标注话题名发回这里。`;
     }
     if (command.kind === 'use') {
+      const wasArchived = this.resolve(sessionKey, command.ref)?.status === 'archived';
       const target = this.switchTo(sessionKey, command.ref);
       if (!target) return `没找到话题「${command.ref}」。用 /list 看已有话题。`;
-      return `已切换到话题「${target.title}」。`;
+      return wasArchived ? `已恢复并切换到话题「${target.title}」。` : `已切换到话题「${target.title}」。`;
     }
     if (command.kind === 'name') {
       const renamed = this.rename(sessionKey, command.title);

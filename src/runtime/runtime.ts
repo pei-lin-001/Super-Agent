@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { assertInsideRoot, normalizeRelativePath, resolveInside } from '../tools/paths.ts';
@@ -309,7 +309,7 @@ export class Runtime implements ToolHost {
     // 聊天里发来的材料必须在建任务时就落到任务目录：Worker 的文件权限范围是
     // workDir/<taskId>，只给一个它读不到的缓存路径等于没给。
     const staged = input.source
-      ? this.prepareSessionMaterials(taskId, input.source.sessionKey)
+      ? this.prepareSessionMaterials(taskId, input.source.sessionKey, input.source.conversationId ?? null)
       : { files: [], inboundIds: [], cleanup: (): void => {} };
     if (staged.files.length > 0) {
       task.brief = [
@@ -359,10 +359,15 @@ export class Runtime implements ToolHost {
   attachSessionMaterials(
     taskId: string,
     sessionKey: string,
-  ): { ok: true; files: { path: string; bytes: number; sha256: string }[] } | { ok: false; message: string } {
+    conversationId: string | null = null,
+    note?: string,
+  ): { ok: true; files: { path: string; bytes: number; sha256: string }[]; messageId: string | null } | { ok: false; message: string } {
     const task = this.store.getTask(taskId);
     if (!task) return { ok: false, message: `任务不存在：${taskId}` };
-    const staged = this.prepareSessionMaterials(taskId, sessionKey);
+    if (isTerminalTask(task.status)) {
+      return { ok: false, message: `任务已是 ${task.status}，不能再补材料；需要继续请新建任务。` };
+    }
+    const staged = this.prepareSessionMaterials(taskId, sessionKey, conversationId);
     if (staged.inboundIds.length === 0) {
       return { ok: false, message: '这个会话没有待补充的材料：请先把文件发到聊天里。' };
     }
@@ -374,19 +379,75 @@ export class Runtime implements ToolHost {
     const added = staged.files
       .map((item) => `- ${item.path}（${item.bytes} 字节，sha256 ${item.sha256.slice(0, 16)}）`)
       .join('\n');
+    // 材料进了任务就是一次"要求变更"：认领、材料清单、要求版本、通知负责人必须一起生效。
+    // 之前只有填了 note 才发 update，于是不填 note 时负责人根本不知道有新材料，
+    // 旧检查也不会失效——补材料变成了绕过验收的后门。
+    const body = [
+      '补充了新材料，请按最新材料重新核对。',
+      ...(note === undefined || note.trim() === '' ? [] : [note.trim()]),
+    ].join('\n');
+    const message = this.buildRouterMessage(task, body, 'update');
     try {
       this.store.tx(() => {
         this.store.claimInboundAttachments(staged.inboundIds, taskId);
         this.store.updateTaskRequirements(taskId, {
-          brief: [task.brief, '随后补充的材料（已放入 materials/）：', added].filter((line) => line !== '').join('\n'),
+          brief: `${task.brief}\n随后补充的材料（已放入 materials/）：\n${added}`.trim(),
         });
+        this.store.bumpReviewEpoch(taskId);
+        if (message) {
+          this.store.insertMessage(message);
+          this.store.setMessageStatus(message.id, 'delivered');
+        }
+        this.store.appendEvent(taskId, null, 'task.materials', `补充 ${staged.files.length} 份材料`);
       });
     } catch (error) {
       staged.cleanup();
       throw error;
     }
-    this.store.appendEvent(taskId, null, 'task.materials', `补充 ${staged.files.length} 份材料`);
-    return { ok: true, files: staged.files };
+    // 事务提交后再唤醒负责人：回滚了就不该有人在跑。
+    if (message) {
+      this.emit({ type: 'message.sent', messageId: message.id, from: 'router', to: message.toId, kind: 'update' });
+      this.onMessageDelivered(message);
+    }
+    return { ok: true, files: staged.files, messageId: message?.id ?? null };
+  }
+
+  /**
+   * 构造一条 Router → 负责人 的消息，不落库。
+   *
+   * 抽出来是为了让"补材料"能在自己的事务里写通知：先落消息再建任务那种
+   * 半截状态不能再出现。
+   */
+  private buildRouterMessage(
+    task: Task,
+    body: string,
+    kind: 'update' | 'stop',
+  ): Message | null {
+    const ownerId = task.ownerWorkerId;
+    if (!ownerId) return null;
+    const worker = this.store.getWorker(ownerId);
+    if (!worker || isTerminalWorker(worker.status)) return null;
+    return {
+      id: newMessageId(),
+      groupId: task.groupId,
+      taskId: task.id,
+      fromKind: 'router',
+      fromId: 'router',
+      toKind: 'worker',
+      toId: worker.id,
+      kind,
+      body,
+      payload: null,
+      replyTo: null,
+      refs: null,
+      dedupeKey: null,
+      broadcastId: null,
+      status: 'queued',
+      createdAt: nowIso(),
+      deliveredAt: null,
+      consumedAt: null,
+      error: null,
+    };
   }
 
   /**
@@ -398,20 +459,37 @@ export class Runtime implements ToolHost {
   private prepareSessionMaterials(
     taskId: string,
     sessionKey: string,
+    conversationId: string | null = null,
   ): { files: { path: string; bytes: number; sha256: string }[]; inboundIds: string[]; cleanup: () => void } {
-    const pending = this.store.listUnclaimedSessionAttachments(sessionKey);
-    const cleanup = (): void => {
-      try {
-        rmSync(join(this.config.workDir, taskId), { recursive: true, force: true });
-      } catch {
-        // 清理失败不掩盖原始错误。
-      }
-    };
-    if (pending.length === 0) return { files: [], inboundIds: [], cleanup };
+    const pending = this.store.listUnclaimedSessionAttachments(sessionKey, conversationId);
+    if (pending.length === 0) return { files: [], inboundIds: [], cleanup: (): void => {} };
     const attachments = pending.flatMap(
       (item) => (Array.isArray(item.attachments) ? item.attachments : []) as StoredAttachment[],
     );
     const files = stageMaterials({ workDir: this.config.workDir, taskId, attachments });
+    // 回滚只能删"本次新复制的文件"。
+    // 之前这里 rm -rf 整个 work/<taskId>：给已有任务补材料失败时，会连它原有的
+    // 全部成果一起删掉，而数据库里的任务还在——这是数据丢失，不是清理。
+    const cleanup = (): void => {
+      for (const file of files) {
+        try {
+          rmSync(resolve(this.config.workDir, file.path), { force: true });
+        } catch {
+          // 单个文件删不掉不掩盖原始错误，也不去删别的东西。
+        }
+      }
+      // 只尝试删除空目录：非空说明里面还有别人的东西，rmdir 自己会失败。
+      try {
+        rmdirSync(resolve(this.config.workDir, taskId, 'materials'));
+      } catch {
+        // 目录里还有别的材料，保持原样。
+      }
+      try {
+        rmdirSync(resolve(this.config.workDir, taskId));
+      } catch {
+        // 任务目录里还有原来的成果，不能动。
+      }
+    };
     return { files, inboundIds: pending.map((item) => item.id), cleanup };
   }
 
