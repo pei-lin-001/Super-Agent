@@ -1,8 +1,10 @@
 /**
  * 上下文预算：token 估算、压缩阈值、按预算切窗口。
  *
- * 三处来源，都是移植不是自创：
- * - token 估算 `chars / 4`：pi `packages/ai/dist/utils/...`（estimateTokens）
+ * 三处来源，都是移植不是自创。注意本条与其它两条性质不同：换算比例是设计参照，
+ * 阈值与切点是代码搬运（见 THIRD_PARTY_NOTICES.md「pi」与「OpenClaw」两节）。
+ * - token 估算 `chars / 4`：pi 的 estimateTokens 用同一换算（上游为 monorepo
+ *   `packages/ai` 下的工具函数；本地只取换算比例，未搬运其代码）
  * - 压缩阈值 `min(window - reserve, window * 0.75)`：OpenClaw
  *   `packages/agent-core/src/harness/compaction/compaction-threshold.ts`
  * - 按 keepRecentTokens 从尾部累计切点：pi `findCutPoint`

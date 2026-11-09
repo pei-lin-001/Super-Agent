@@ -53,3 +53,43 @@ SOFTWARE.
 
 - OpenClaw 的持久入站与游标顺序思路（先落库、再前移）。
 - Hermes 的渠道抽象与微信恢复状态机。
+
+## pi（@earendil-works/pi-coding-agent）
+
+`src/vendor/pi/` 下 5 个文件、`src/runtime/pi-worker.ts` 的宿主接口，以及
+`src/runtime/window.ts` 的 token 估算与窗口切点，移植/参照自
+`@earendil-works/pi-coding-agent@1.5.0`：
+
+- 包名与版本：`@earendil-works/pi-coding-agent`，`1.5.0`
+- 上游许可：**MIT**（依据：该包 `package.json` 的 `license: "MIT"` 字段，与
+  `README.md` 的 License 小节；上游 npm 包内未附带 LICENSE 文件）
+- 参考源码：上游为 monorepo 结构，移植文件头部逐条写明来源，例如
+  `packages/agent-core/dist/agent-loop.js`、`packages/ai/dist/utils/event-stream.js`、
+  `packages/ai/dist/utils/transcript.js`、`packages/ai/dist/types.d.ts`、
+  `packages/coding-agent/dist/core/tools/truncate.js`
+
+| 本仓库文件 | 上游来源 | 方式 |
+| --- | --- | --- |
+| `src/vendor/pi/agent-loop.ts` | `packages/agent-core/dist/agent-loop.js` | 原样搬运，删减见下 |
+| `src/vendor/pi/event-stream.ts` | `packages/ai/dist/utils/event-stream.js` | 原样搬运，补类型 |
+| `src/vendor/pi/transcript.ts` | `packages/ai/dist/utils/transcript.js` | 原样搬运，只保留用到的函数 |
+| `src/vendor/pi/truncate.ts` | `packages/coding-agent/dist/core/tools/truncate.js` | 原样搬运 |
+| `src/vendor/pi/types.ts` | `packages/ai/dist/types.d.ts` | 原样搬运，裁剪到用到的子集 |
+| `src/runtime/pi-worker.ts` | 上游宿主接口（`StreamFn`、`AgentLoopConfig` 等） | 本地新写的衔接层，非搬运 |
+| `src/runtime/window.ts` | token 估算与窗口切点逻辑 | 改名适配 |
+
+`agent-loop.ts` 相对上游的删减：provider 身份归因字段、并行工具执行
+（改为逐个顺序执行）、`beforeToolCall`/`afterToolCall` 钩子、工具参数 schema
+校验。控制流（内外双层循环、steering/follow-up 队列、输出被上限截断时整批工具
+作废）保留。
+
+有意的行为差异：
+
+| 场景 | 上游 | 本仓库 |
+| --- | --- | --- |
+| 上下文压缩 | 由 `prepareNextTurn` 钩子驱动 compaction | 该钩子未接，改由 `note.ts` + `context.ts` 的字符预算负责 |
+| 工具结果失败标记 | `isError` 随消息流转 | 落库到 `worker_turn.is_error`，回放时同时进 `isError` 与模型可见文本 |
+| 工具声明变更 | 支持运行期增删 | 工具集合在一次运行内恒定，相关机制不启用 |
+| 事件流 | 逐事件驱动 UI | 事件回调未接，状态仍以 `worker_turn` 为唯一事实源 |
+
+MIT 许可要求保留版权声明与许可声明；本仓库以本文件承担该声明义务。

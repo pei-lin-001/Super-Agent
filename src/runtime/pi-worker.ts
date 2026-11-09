@@ -107,9 +107,11 @@ export function toAgentMessages(messages: ChatMessage[]): AgentMessage[] {
     out.push({
       role: 'toolResult',
       toolCallId: message.toolCallId ?? '',
+      // pi 用 toolName 做事件标注，本地历史只存 toolCallId；留空不影响配对。
       toolName: '',
       content: [{ type: 'text', text: message.content ?? '' }],
-      isError: false,
+      // 必须透传：恒置 false 会让失败的工具结果在回放时变成成功。
+      isError: message.isError ?? false,
       timestamp: Date.now(),
     });
   }
@@ -126,13 +128,6 @@ function parseArguments(raw: string): Record<string, unknown> {
     // 参数不是合法 JSON：交给工具层报可读错误，这里给空对象。
   }
   return {};
-}
-
-/** 从消息里抽出工具声明（pi 把工具放在 system 消息上）。 */
-export function declaredTools(messages: AgentMessage[]): ToolDeclaration[] {
-  return messages
-    .filter((message): message is AgentMessage & { role: 'system' } => message.role === 'system')
-    .flatMap((message) => message.toolsAdded ?? []);
 }
 
 /** 把 pi 的消息渲染成发给模型的 ChatMessage（system 单独返回）。 */
@@ -167,10 +162,16 @@ export function toLlmMessages(messages: AgentMessage[]): { system: string; chat:
       continue;
     }
     if (message.role !== 'toolResult') continue;
+    const text = textOf(message.content);
+    // 模型侧 tool 消息只有 content，失败状态只能落在文本上；
+    // 内容里已经写了「失败 / 未执行」的不重复加前缀。
+    const flagged =
+      message.isError && !/失败|未执行|不可用|拒绝/.test(text) ? `[执行失败] ${text}` : text;
     chat.push({
       role: 'tool',
-      content: textOf(message.content),
+      content: flagged,
       toolCallId: message.toolCallId,
+      ...(message.isError ? { isError: true } : {}),
     });
   }
   return { system: systemParts.join('\n\n'), chat };
@@ -456,9 +457,4 @@ export function toStepResult(message: AssistantMessage): {
         ? null
         : { promptTokens: message.usage.input, completionTokens: message.usage.output },
   };
-}
-
-/** 导出给测试：Message[] → 我们发给模型的 chat。 */
-export function messagesToChat(messages: Message[]): ChatMessage[] {
-  return toLlmMessages(messages as AgentMessage[]).chat;
 }

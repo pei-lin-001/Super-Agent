@@ -147,7 +147,8 @@ Message: queued → delivered → consumed
 | 任务状态 | 程序（任务表） | 是 | 约 1 千字符 |
 | 当前产物表 | 程序（产物 + 检查记录） | 是，每个名字只列最新版本 | 12 份，超出只提示 |
 | 工作记录 | 整理模型输出（`worker_note`） | 有则注入 | `NOTE_MAX_CHARS`，默认 6000 |
-| 近期历史 | `worker_turn` | 是，按字符预算 | `CONTEXT_WINDOW_CHARS`，默认 16000 |
+| 近期历史 | `worker_turn` | 是，按字符预算 | `CONTEXT_WINDOW_CHARS`，默认 200000（≈50k token） |
+| Router 对话历史 | `router_turn` | 是，按 token 预算，超出压成摘要 | `CONTEXT_WINDOW_TOKENS` / `ROUTER_KEEP_RECENT_TOKENS` |
 
 ### 窗口怎么取
 
@@ -762,7 +763,8 @@ Router 建任务 task_c50c5d0d → Worker w1_b8c2cc9d
 
 **模块 2 完整协作验收：通过。** `real-20261108114205-ec16`
 
-配置（压力测试调整项，非默认值）：`CONTEXT_WINDOW_CHARS=16000`（默认值）、
+配置（压力测试调整项，非默认值）：`CONTEXT_WINDOW_CHARS=16000`（当时的值；
+2026-11-09 起默认改为 200000）、
 `NOTE_TRIGGER_TURNS=6`、`NOTE_TRIGGER_CHARS=800`（默认 10 / 3000，为确定性触发而收紧）、
 `MODEL_CONCURRENCY=1`、`MODEL_MIN_INTERVAL_MS=800`、等待上限 1500 秒。
 
@@ -782,7 +784,7 @@ submit_result 后任务 completed，验收脚本退出码 0
 | 窗口 | 请求数 | `finish=load` | 结果 |
 |---|---:|---:|---|
 | 3000 字符 | — | 0 | 两个 Worker 均撞 24 步上限失败；检查者把同一份材料读了 10 次 |
-| 16000 字符（默认） | 83 | 0 | 任务 completed，交付 v1 通过 |
+| 16000 字符（当时的默认值） | 83 | 0 | 任务 completed，交付 v1 通过 |
 
 3000 字符那次是明确的反面证据：窗口小到装不下材料，整理做得再多也挡不住重复读取。
 所以不能把"整理"当成重复读写的解法，它只是把退出窗口的内容换成可查回的引用。

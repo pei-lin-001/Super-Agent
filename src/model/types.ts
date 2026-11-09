@@ -12,6 +12,13 @@ export interface ChatMessage {
   content: string | null;
   toolCalls?: ToolCall[];
   toolCallId?: string;
+  /**
+   * tool 消息专用：这次工具执行是否失败。
+   *
+   * 必须有：历史只存文本时，"执行失败"和"执行成功但没有输出"给模型的信号完全一样，
+   * 模型会重复一个已经失败过的操作。
+   */
+  isError?: boolean;
 }
 
 export interface ToolSchema {

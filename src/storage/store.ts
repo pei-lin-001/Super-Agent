@@ -223,6 +223,7 @@ function mapTurn(row: Row): WorkerTurn {
     content: strOrNull(row['content']),
     toolCalls: row['tool_calls'] ? JSON.parse(str(row['tool_calls'])) : null,
     toolCallId: strOrNull(row['tool_call_id']),
+    isError: row['is_error'] === null || row['is_error'] === undefined ? null : num(row['is_error']) === 1,
     createdAt: str(row['created_at']),
   };
 }
@@ -265,6 +266,8 @@ export class Store {
     // 入站消息的话题归属：附件认领、材料补充都按它筛选，不再临时读"当前话题指针"。
     ensureColumn('channel_inbound', 'conversation_id', 'conversation_id TEXT');
     ensureColumn('channel_outbound', 'next_attempt_at', 'next_attempt_at TEXT');
+    // 工具结果是否失败：历史回放要靠它区分「失败」和「成功但没输出」。
+    ensureColumn('worker_turn', 'is_error', 'is_error INTEGER');
     ensureColumn('router_turn', 'session_key', 'session_key TEXT');
     ensureColumn('router_session', 'session_key', 'session_key TEXT');
     // 话题归属：老记录为 NULL，按"本聊天任何话题都可见"处理（见 router 的 visibleTo）。
@@ -1411,10 +1414,12 @@ export class Store {
 
   appendWorkerTurn(turn: WorkerTurn): void {
     this.run(
-      `INSERT INTO worker_turn (id, worker_id, seq, role, content, tool_calls, tool_call_id, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO worker_turn (id, worker_id, seq, role, content, tool_calls, tool_call_id, is_error, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       turn.id, turn.workerId, turn.seq, turn.role, turn.content,
-      turn.toolCalls ? JSON.stringify(turn.toolCalls) : null, turn.toolCallId, turn.createdAt,
+      turn.toolCalls ? JSON.stringify(turn.toolCalls) : null, turn.toolCallId,
+      turn.isError === undefined || turn.isError === null ? null : (turn.isError ? 1 : 0),
+      turn.createdAt,
     );
   }
 

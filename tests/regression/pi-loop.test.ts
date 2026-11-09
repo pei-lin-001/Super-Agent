@@ -163,3 +163,47 @@ test('消息转换：历史里的工具调用与结果能原样往返', () => {
   assert.equal(back.chat[1]?.toolCallId, 'c1');
   assert.equal(back.chat[1]?.content, '文件内容');
 });
+
+test('pi loop：工具失败标记进 pi 消息，也进模型可见文本', async () => {
+  const seen: ChatRequest[] = [];
+  const model = makeModel((request, index) => {
+    seen.push(request);
+    if (index === 0) {
+      return mockReply({ toolCalls: [{ id: 'call_bad', name: 'read_file', arguments: { path: 'nope.md' } }] });
+    }
+    return mockReply({ text: '读不到' });
+  });
+
+  await runWorkerTurn({
+    model: 'mock',
+    modelClient: model,
+    systemPrompt: 'x',
+    tools: TOOLS,
+    history: [
+      { role: 'user', content: '读 nope.md' },
+      { role: 'assistant', content: null, toolCalls: [{ id: 'call_old', name: 'read_file', arguments: '{"path":"old.md"}' }] },
+      { role: 'tool', content: '打开失败：文件不存在', toolCallId: 'call_old', isError: true },
+    ],
+    prompts: [],
+    executeToolCall: async () => ({
+      outcome: { type: 'failed', content: '打开失败：文件不存在' },
+      terminate: false,
+    }),
+    maxSteps: 4,
+  });
+
+  // 1) 历史里的失败状态不会被抹平
+  const round = toAgentMessages([
+    { role: 'tool', content: '打开失败：文件不存在', toolCallId: 'call_old', isError: true },
+  ]);
+  assert.equal(round[0]!.role, 'toolResult');
+  assert.equal((round[0] as { isError?: boolean }).isError, true, 'isError 不能恒置 false');
+
+  // 2) 模型侧看得见失败：内容本身没写「失败」时补前缀
+  const { chat } = toLlmMessages([
+    { role: 'toolResult', toolCallId: 'c1', toolName: 'read_file', content: [{ type: 'text', text: '返回值为 0' }], isError: true, timestamp: 0 },
+  ]);
+  assert.equal(chat[0]!.role, 'tool');
+  assert.match(chat[0]!.content ?? '', /执行失败/, '失败必须体现在模型可见文本上');
+  assert.equal(chat[0]!.isError, true);
+});

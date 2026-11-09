@@ -1594,7 +1594,7 @@ export class Runtime implements ToolHost {
         const toolCall: ToolCall = { id: call.id, name: call.name, arguments: call.arguments };
         const outcome = await this.tools.execute(call.name, call.arguments, this.toolContext(workerId));
         const fresh = this.store.getWorker(workerId);
-        if (fresh) this.recordToolTurn(fresh, toolCall, outcome.content);
+        if (fresh) this.recordToolTurn(fresh, toolCall, outcome.content, outcome.type === 'failed');
         // wait / finish 改变 Worker 终态，交给外层统一结算，不在这里直接改。
         return { outcome, terminate: outcome.type === 'wait' || outcome.type === 'finish' };
       },
@@ -1855,7 +1855,7 @@ export class Runtime implements ToolHost {
   /** 为未执行的调用补一条明确的 tool 记录，不伪造成功。 */
   private recordUnexecuted(worker: Worker, calls: ToolCall[], reason: string): void {
     for (const call of calls) {
-      this.recordToolTurn(worker, call, `[未执行] ${call.name}：${reason}`);
+      this.recordToolTurn(worker, call, `[未执行] ${call.name}：${reason}`, true);
     }
   }
 
@@ -1964,7 +1964,12 @@ export class Runtime implements ToolHost {
         content.length > TOOL_LIMIT
           ? `${content.slice(0, TOOL_LIMIT)}\n…（工具输出共 ${content.length} 字符，已截断；需要完整内容请用 offset 续读）`
           : content;
-      return { role: 'tool', content: clipped, toolCallId: turn.toolCallId ?? undefined };
+      return {
+        role: 'tool',
+        content: clipped,
+        toolCallId: turn.toolCallId ?? undefined,
+        ...(turn.isError ? { isError: true } : {}),
+      };
     };
 
     const messages: ChatMessage[] = [];
@@ -1989,6 +1994,7 @@ export class Runtime implements ToolHost {
                 `[执行结果未知] ${call.name}：历史只记录了这次调用，没有记录结果（可能是进程中断）。` +
                 '不要当成未执行，也不要自动重做；先核对当前文件与消息再决定。',
               toolCallId: call.id,
+              isError: true,
             });
           }
         }
@@ -2118,7 +2124,7 @@ export class Runtime implements ToolHost {
     });
   }
 
-  private recordToolTurn(worker: Worker, call: ToolCall, content: string): void {
+  private recordToolTurn(worker: Worker, call: ToolCall, content: string, isError = false): void {
     this.store.appendWorkerTurn({
       id: `turn_${worker.id}_${this.store.countWorkerTurns(worker.id) + 1}`,
       workerId: worker.id,
@@ -2127,6 +2133,7 @@ export class Runtime implements ToolHost {
       content: `[${call.name}] ${content}`,
       toolCalls: null,
       toolCallId: call.id,
+      isError,
       createdAt: nowIso(),
     });
   }
