@@ -18,6 +18,8 @@ import {
 } from '../domain/ids.ts';
 import { isTerminalTask, isTerminalWorker } from '../domain/state.ts';
 import { Execution, ExecutionRevoked } from './execution.ts';
+import { runWorkerTurn, toStepResult } from './pi-worker.ts';
+import type { AssistantMessage } from '../vendor/pi/types.ts';
 
 /**
  * 进度汇报唤醒 Router 的最小间隔。
@@ -1467,6 +1469,10 @@ export class Runtime implements ToolHost {
   }
 
   private async runWorkerBody(workerId: string, execution: Execution): Promise<void> {
+    if (this.config.workerLoop === 'pi') {
+      await this.runWorkerBodyPi(workerId, execution);
+      return;
+    }
     const dbg = (m: string): void => {
       if (process.env['DEBUG_RUN']) console.error(`[run:${workerId}] ${m}`);
     };
@@ -1627,6 +1633,172 @@ export class Runtime implements ToolHost {
     }
   }
 
+  /**
+   * pi agent-loop 驱动的 Worker 调度。
+   *
+   * 循环、工具批处理、步数截断后的工具作废都交给 pi 的 agent-loop（见 src/vendor/pi）；
+   * epoch 撤销、收件箱、步数计量、落库、等待/提交的终态仍然由这里决定——
+   * 「模型表达意图，程序决定事实」不因为换了循环而改变。
+   */
+  private async runWorkerBodyPi(workerId: string, execution: Execution): Promise<void> {
+    let worker = this.store.getWorker(workerId);
+    if (!worker || isTerminalWorker(worker.status)) return;
+    let task = this.store.getTaskByGroup(worker.groupId);
+    if (!task) {
+      await this.failWorker(workerId, '任务不存在');
+      return;
+    }
+    if (isTerminalTask(task.status)) {
+      this.store.setWorkerStatus(workerId, 'cancelled', '任务已结束');
+      return;
+    }
+
+    this.store.setWorkerStatus(workerId, 'running');
+    this.emit({ type: 'worker.status', workerId, status: 'running' });
+
+    const epoch = this.store.getWorker(workerId)?.runEpoch ?? 0;
+    const runController = this.runs.get(workerId);
+    const staleReason = (): string | null => {
+      const gate = this.canRun(workerId, epoch);
+      return gate.ok ? null : gate.reason;
+    };
+
+    // 收件箱先落入历史再标记已读：模型后续步骤仍能看到消息原文与编号。
+    const inbox = this.store.listInbox(workerId);
+    if (inbox.length > 0) {
+      this.recordInboxTurn(workerId, inbox);
+      for (const message of inbox) this.markConsumed(message.id);
+    }
+
+    this.ensureOpeningTurn(workerId);
+    const messages = await this.buildWorkerMessages(worker, task);
+    const systemPrompt = messages.find((message) => message.role === 'system')?.content ?? '';
+    const chat = messages.filter((message) => message.role !== 'system');
+    const prompts = chat.slice(0, 1);
+    const history = chat.slice(1);
+
+    const beforeRequest = this.canRun(workerId, epoch);
+    if (!beforeRequest.ok) {
+      this.store.appendEvent(task.id, workerId, 'run.stale', `准备完成后停止：${beforeRequest.reason}`);
+      this.settleWorker(workerId, beforeRequest.reason);
+      return;
+    }
+
+    let nudges = 0;
+    const resolved = this.models.resolve(worker.model ?? this.config.defaultModelAlias);
+
+    const result = await runWorkerTurn({
+      model: resolved.model,
+      modelClient: new RecordingModel(resolved.client, this.store, 'worker', {
+        taskId: task.id,
+        workerId,
+        modelAlias: resolved.alias,
+      }),
+      systemPrompt,
+      prompts,
+      history,
+      tools: this.tools.schemas(),
+      maxSteps: this.config.limits.maxStepsPerRun,
+      signal: runController?.signal ?? null,
+      reasoningEffort: this.config.reasoningEffort,
+      canContinue: staleReason,
+      stopOnPlainText: task.ownerWorkerId !== workerId,
+      pullInbox: () => {
+        const fresh = this.store.listInbox(workerId);
+        if (fresh.length === 0) return [];
+        this.recordInboxTurn(workerId, fresh);
+        for (const message of fresh) this.markConsumed(message.id);
+        return fresh.map((message) => ({ role: 'user' as const, content: message.body }));
+      },
+      onTerminate: (rest, reason) => {
+        const current = this.store.getWorker(workerId);
+        if (!current) return;
+        this.recordUnexecuted(
+          current,
+          rest,
+          reason.includes('等待') ? '本次运行因等待而提前结束，该调用未执行' : '本次运行因提交/停止而结束，该调用未执行',
+        );
+      },
+      onStep: (message: AssistantMessage) => {
+        // 模型响应回来之后、动手之前再核一次：暂停或取消后旧响应不得再落库。
+        // 这里必须留痕——静默丢弃会让历史里出现「调用过但没有结果」的假象。
+        const afterModel = this.canRun(workerId, epoch);
+        if (!afterModel.ok) {
+          const current = this.store.getWorker(workerId);
+          if (current) this.recordStaleResult(current, toStepResult(message), afterModel.reason);
+          return;
+        }
+        const stepResult = toStepResult(message);
+        this.store.bumpWorkerStep(workerId);
+        const current = this.store.getWorker(workerId);
+        if (current) this.recordAssistantTurn(current, stepResult);
+        if (stepResult.toolCalls.length === 0 && task && task.ownerWorkerId === workerId) {
+          nudges += 1;
+          if (nudges === this.config.limits.maxNudges + 1) {
+            this.store.appendEvent(task.id, workerId, 'worker.text_only', `连续 ${nudges} 次只输出文本未调用工具`);
+          }
+          this.pushSystemNotice(workerId, '你还没有调用 submit_result。工作若已完成，请先 artifact_save 保存产物再提交；否则继续推进。');
+        }
+      },
+      runTool: async (call: { id: string; name: string; arguments: string }) => {
+        const current = this.store.getWorker(workerId);
+        const ownerGroupId = this.store.getWorker(workerId)?.groupId;
+        const budgetTask = ownerGroupId ? this.store.getTaskByGroup(ownerGroupId) : null;
+        if (current && budgetTask) this.noteBudget(current, budgetTask);
+        const before = this.canRun(workerId, epoch);
+        if (!before.ok) {
+          return { outcome: { type: 'failed', content: `未执行：${before.reason}` }, terminate: true };
+        }
+        const liveTask = ownerGroupId ? this.store.getTaskByGroup(ownerGroupId) : null;
+        if (liveTask && Number(liveTask.maintenance ?? 0) === 1) {
+          return { outcome: { type: 'failed', content: '未执行：任务处于维护挂起' }, terminate: true };
+        }
+        if (!liveTask || isTerminalTask(liveTask.status)) {
+          return { outcome: { type: 'failed', content: '未执行：任务已结束' }, terminate: true };
+        }
+        const toolCall: ToolCall = { id: call.id, name: call.name, arguments: call.arguments };
+        const outcome = await this.tools.execute(call.name, call.arguments, this.toolContext(workerId));
+        const fresh = this.store.getWorker(workerId);
+        if (fresh) this.recordToolTurn(fresh, toolCall, outcome.content);
+        // wait / finish 改变 Worker 终态，交给外层统一结算，不在这里直接改。
+        return { outcome, terminate: outcome.type === 'wait' || outcome.type === 'finish' };
+      },
+    });
+
+    worker = this.store.getWorker(workerId) ?? worker;
+    task = this.store.getTaskByGroup(worker.groupId) ?? task;
+
+    if (result.stop === 'cancelled') {
+      this.store.appendEvent(task.id, workerId, 'run.stale', `第 ${result.steps} 步后停止：${result.reason ?? '执行被取消'}`);
+      this.settleWorker(workerId, result.reason ?? '执行被取消');
+      return;
+    }
+    if (result.stop === 'error') {
+      // 交给 runWorker 的 catch → handleRunError：失败判定的 revoke 会撤销当前
+      // Execution，在这里直接写库会被自己的撤销挡住，落不进库。
+      throw new Error(result.reason ?? '模型调用失败');
+    }
+    if (result.stop === 'wait') {
+      this.store.setWorkerStatus(workerId, 'waiting');
+      this.emit({ type: 'worker.status', workerId, status: 'waiting' });
+      this.checkGroupDeadlock(worker.groupId);
+      return;
+    }
+    if (result.stop === 'finish') return;
+
+    // 单轮步数用完但整体预算还在：转回 queued 请求下一轮。
+    const endState = this.store.getWorker(workerId);
+    if (endState && endState.status === 'running') {
+      this.store.setWorkerStatus(workerId, 'queued');
+      this.emit({ type: 'worker.status', workerId, status: 'queued' });
+      this.enqueue(workerId);
+    }
+  }
+
+  /**
+   * pi 的 AssistantMessage → 本项目的 StepResult（只用于落库与诊断）。
+   * 两个形状的差别只在工具参数：pi 存对象，我们存原始 JSON 字符串。
+   */
   /**
    * 预算提醒：达到软阈值只写事件，不改变执行。
    * 真正的资源约束是并发、执行时限和每轮调度额度。

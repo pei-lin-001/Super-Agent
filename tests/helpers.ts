@@ -77,6 +77,7 @@ export function testConfig(dir: string, overrides: Partial<Limits> = {}): Config
     workDir: join(dir, 'work'),
     materialsDir: join(dir, 'work', 'materials'),
     readRoot: dir,
+    workerLoop: 'pi',
     limits: { ...BASE_LIMITS, ...overrides },
   };
 }
@@ -97,6 +98,7 @@ export async function createHarness(options: {
 
   const config: Config = {
     readRoot: dir,
+    workerLoop: 'pi',
     provider: 'mock',
     baseUrl: 'http://127.0.0.1:0/v1',
     apiKey: 'test-key',
@@ -220,8 +222,10 @@ export function lastToolContent(request: ChatRequest): string {
 }
 
 export function toolResult(request: ChatRequest): string | null {
-  const last = request.messages.at(-1);
-  return last?.role === 'tool' ? (last.content ?? '') : null;
+  // 取最近一条工具结果，而不是「最后一条消息」：pi 的 agent-loop 会把新到的
+  // 协作者消息（steering）插在工具结果之后，最后一条就不一定是工具结果了。
+  const tool = request.messages.filter((message) => message.role === 'tool').at(-1);
+  return tool ? (tool.content ?? '') : null;
 }
 
 export function inboxOf(request: ChatRequest): string {

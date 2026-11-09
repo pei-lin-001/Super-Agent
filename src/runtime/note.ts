@@ -129,6 +129,39 @@ export function renderTurnsForNote(turns: WorkerTurn[]): string {
   return lines.join('\n');
 }
 
+/**
+ * 从历史里收集文件操作清单。
+ *
+ * 移植 pi compaction 的 readFiles/modifiedFiles 思路：摘要最容易丢的是
+ * 「我到底读过/改过哪些文件」，而这条线索决定下一轮要不要重读。
+ */
+export function collectFileOps(turns: WorkerTurn[]): { read: string[]; written: string[] } {
+  const read = new Set<string>();
+  const written = new Set<string>();
+  for (const turn of turns) {
+    if (!Array.isArray(turn.toolCalls)) continue;
+    for (const call of turn.toolCalls) {
+      const path = typeof call.arguments === 'string' ? extractPath(call.arguments) : null;
+      if (!path) continue;
+      if (call.name === 'fs_read' || call.name === 'fs_stat' || call.name === 'fs_glob' || call.name === 'fs_search') read.add(path);
+      if (call.name === 'fs_write' || call.name === 'fs_edit' || call.name === 'artifact_save') written.add(path);
+    }
+  }
+  return { read: [...read], written: [...written] };
+}
+
+function extractPath(raw: string): string | null {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== 'object') return null;
+    const record = parsed as Record<string, unknown>;
+    const value = record['path'] ?? record['name'];
+    return typeof value === 'string' && value.trim() !== '' ? value.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
 export function buildNotePrompt(input: {
   task: Task;
   worker: Worker;
@@ -141,6 +174,14 @@ export function buildNotePrompt(input: {
     : '（这是第一次整理，之前没有工作记录）';
   const system = `你是 Super-Agent 的工作记录整理器，为同一个 Worker 维护一份累计工作记录。
 你的输出会成为该 Worker 后续唯一的过程记忆，必须准确、可追溯，不能编造。`;
+
+  const ops = collectFileOps(decision.turns);
+  const opsBlock = [
+    ops.read.length > 0 ? `- 已读：${ops.read.slice(0, 40).join('、')}` : '',
+    ops.written.length > 0 ? `- 已写：${ops.written.slice(0, 40).join('、')}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
 
   const user = `# 任务（程序记录，不要改写）
 - 任务：${task.title}
@@ -155,6 +196,9 @@ ${previousText}
 # 本次新增历史（turn#${decision.fromSeq} 至 turn#${decision.toSeq}，共 ${decision.turns.length} 条）
 ${renderTurnsForNote(decision.turns)}
 
+# 本次涉及的文件（程序从工具调用里提取，可直接引用）
+${opsBlock || '（本次没有文件操作）'}
+
 # 输出要求
 1. 输出一份累计记录：保留上一份里仍然有效的事实、决定、失败原因和来源引用，再加入本次新增内容。
 2. 与当前要求冲突的旧计划，写成「已失效：<原因>」，不要继续当作当前计划。
@@ -164,7 +208,8 @@ ${renderTurnsForNote(decision.turns)}
 6. 全文不超过 ${limits.noteMaxChars} 字符。放不下的细节只保留引用，不要堆砌原文。
 7. 只输出记录正文，不要前言、不要代码块围栏。
 
-建议小节：## 已完成 / ## 已确认事实 / ## 已作出的决定 / ## 已尝试但失败 / ## 未解决与等待中 / ## 下一步`;
+建议小节：## 已完成 / ## 已确认事实 / ## 已作出的决定 / ## 已尝试但失败 / ## 已读文件 / ## 已写文件 / ## 未解决与等待中 / ## 下一步
+8. 文件清单以程序给出的为准；不要凭印象添加没出现过的文件名。`;
 
   return [
     { role: 'system', content: system },

@@ -111,6 +111,13 @@ export interface Config {
   materialsDir: string;
   /** 只读根：Worker 读文件的上限范围（仓库根）。写操作仍限制在任务目录。 */
   readRoot: string;
+  /**
+   * Worker 的调度循环实现。
+   *
+   * pi：移植的 pi agent-loop（默认）；classic：本项目原来的 for 循环。
+   * 保留开关是为了出问题时能一条环境变量切回去，不是长期并存的方案。
+   */
+  workerLoop: 'pi' | 'classic';
   limits: Limits;
 }
 
@@ -271,6 +278,7 @@ export function loadConfig(options: { requireModel?: boolean } = {}): Config {
     workDir,
     materialsDir,
     readRoot,
+    workerLoop: strEnv('WORKER_LOOP', 'pi') === 'classic' ? 'classic' : 'pi',
     limits: {
       maxConcurrentRuns: intEnv('MAX_CONCURRENT_RUNS', 3),
       maxWorkersPerGroup: intEnv('MAX_WORKERS_PER_GROUP', 6),

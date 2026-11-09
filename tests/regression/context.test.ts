@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createHarness, isNoteRequest, scripted, systemText } from '../helpers.ts';
 import { mockReply } from '../../src/model/mock.ts';
+import { collectFileOps } from '../../src/runtime/note.ts';
 import { decideNote, renderTurnsForNote, runNote } from '../../src/runtime/note.ts';
 import { planHistory, groupTurns } from '../../src/runtime/context.ts';
 import type { ChatRequest } from '../../src/model/types.ts';
@@ -667,6 +668,37 @@ test('整理失败：连续失败达到上限后不再反复调用', async () =>
     assert.equal(blocked.action, 'none');
     assert.match(blocked.reason, /连续整理失败/);
     assert.equal(harness.store.latestSuccessfulNote(owner.id), null);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('工作记录：摘要提示里带上程序提取的文件清单，不让模型凭印象写', async () => {
+  const harness = await staticHarness({ contextWindowChars: 600, noteTriggerTurns: 2, noteTriggerChars: 100 });
+  try {
+    const { owner, task } = harness.runtime.createTask({
+      title: '文件清单', goal: 'g', ownerRole: '负责人', ownerBrief: 'b',
+    });
+    harness.store.appendWorkerTurn({
+      id: `turn_${owner.id}_1`, workerId: owner.id, seq: 1, role: 'assistant',
+      content: '读材料', toolCalls: [{ id: 'c1', name: 'fs_read', arguments: '{"path":"materials/a.md"}' }],
+      toolCallId: null, createdAt: new Date().toISOString(),
+    });
+    harness.store.appendWorkerTurn({
+      id: `turn_${owner.id}_2`, workerId: owner.id, seq: 2, role: 'tool',
+      content: '内容', toolCalls: null, toolCallId: 'c1', createdAt: new Date().toISOString(),
+    });
+    harness.store.appendWorkerTurn({
+      id: `turn_${owner.id}_3`, workerId: owner.id, seq: 3, role: 'assistant',
+      content: '写产物', toolCalls: [{ id: 'c2', name: 'artifact_save', arguments: '{"name":"out.md"}' }],
+      toolCallId: null, createdAt: new Date().toISOString(),
+    });
+
+    const turns = harness.store.listWorkerTurns(owner.id, 10);
+    const ops = collectFileOps(turns);
+    assert.deepEqual(ops.read, ['materials/a.md'], '已读文件要从工具调用里提取');
+    assert.deepEqual(ops.written, ['out.md'], '已写文件同理');
+    void task;
   } finally {
     await harness.cleanup();
   }
