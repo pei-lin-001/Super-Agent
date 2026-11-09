@@ -1731,6 +1731,16 @@ export class Runtime implements ToolHost {
         }
         return { ok: true, message: `任务 ${taskId} 已恢复调度` };
       }
+      case 'stop_task': {
+        // 运维停机：和 Router 的 stop_task 走同一条路径，终态与收尾规则一致。
+        // stopTask 的实现全同步，所以这里不需要 await，命令状态如实反映结果。
+        const taskId = str('taskId');
+        const task = this.store.getTask(taskId);
+        if (!task) return { ok: false, message: `任务不存在：${taskId}` };
+        if (isTerminalTask(task.status)) return { ok: false, message: `任务已 ${task.status}` };
+        void this.stopTask(taskId, str('reason') || '运维停机');
+        return { ok: true, message: `任务 ${taskId} 已停机` };
+      }
       case 'nudge_worker': {
         const workerId = str('workerId');
         const worker = this.store.getWorker(workerId);

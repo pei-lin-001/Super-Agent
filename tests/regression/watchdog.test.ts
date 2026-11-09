@@ -1079,3 +1079,40 @@ test('重复 tick：并发调用 resume 不会重复执行同一份进度', asyn
     await harness.cleanup();
   }
 });
+
+test('运维停机：stop_task 控制命令走与 Router 相同的终态路径', async () => {
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    router: () => mockReply({ text: '好' }),
+  });
+  try {
+    const { task } = harness.runtime.createTask({
+      title: '跑飞的任务', goal: 'g', ownerRole: '负责人', ownerBrief: 'b',
+    });
+    harness.store.insertControlCommand({
+      id: 'cc_stop',
+      command: 'stop_task',
+      payload: JSON.stringify({ taskId: task.id, reason: '跑飞了' }),
+      source: 'watchdog',
+    });
+    harness.runtime.tick();
+
+    assert.equal(harness.store.getTask(task.id)?.status, 'cancelled', '必须真的停机，不是挂起');
+    const command = harness.store.listRecentControls(5).find((item) => item.id === 'cc_stop')!;
+    assert.equal(command.status, 'done', '命令状态要如实反映执行结果');
+
+    // 重复下发：任务已是终态，命令如实失败而不是假成功
+    harness.store.insertControlCommand({
+      id: 'cc_stop_again',
+      command: 'stop_task',
+      payload: JSON.stringify({ taskId: task.id }),
+      source: 'watchdog',
+    });
+    harness.runtime.tick();
+    const again = harness.store.listRecentControls(5).find((item) => item.id === 'cc_stop_again')!;
+    assert.equal(again.status, 'failed');
+    assert.match(again.result ?? '', /已 cancelled/);
+  } finally {
+    await harness.cleanup();
+  }
+});
