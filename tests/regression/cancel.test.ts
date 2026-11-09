@@ -265,21 +265,25 @@ test('迟到响应：模型忽略取消，超过收尾期限后才返回，不�
     assert.ok(await waitFor(() => srv.requests() === 1, 8_000), '请求必须先发出');
     const before = h.store.getTask(task.id)?.status;
 
+    // 只撤销执行、不关闭存储：这样"迟到内容没写进去"只能是撤销边界挡住的，
+    // 而不是靠"存储已关闭"这种更粗的保护。
     await h.runtime.stop();
-    h.store.close();
 
     // 等到迟到响应真的回来
     await new Promise((r) => setTimeout(r, 10_000));
     assert.deepEqual(errors, [], `不应出现未处理异常：${errors.join('|')}`);
     // 记录必须在停机时就定稿，不能被迟到响应改写
-    const db = new (await import('node:sqlite')).DatabaseSync(h.store.path, { readOnly: true });
-    const rows = db.prepare('SELECT status FROM model_call ORDER BY started_at').all() as { status: string }[];
-    db.close();
+    const db0 = new (await import('node:sqlite')).DatabaseSync(h.store.path, { readOnly: true });
+    const rows = db0.prepare('SELECT status FROM model_call ORDER BY started_at').all() as { status: string }[];
+    const messages = db0.prepare('SELECT COUNT(*) AS c FROM message').get() as { c: number };
+    db0.close();
     assert.ok(rows.length >= 1, '应有调用记录');
     assert.ok(
       rows.every((row) => row.status !== 'ok'),
       `迟到响应不能把调用改写成成功：${rows.map((r) => r.status).join(',')}`,
     );
+    // 撤销之后迟到的内容不能进入业务表。
+    assert.equal(messages.c, 0, '迟到响应不能产生业务消息');
     assert.equal(before, 'active');
   } finally {
     process.off('unhandledRejection', onRejection);
