@@ -348,27 +348,36 @@ Router：`create_task` `send_to_worker` `stop_task` `list_tasks` `read_task`。
 > `scripts/accept-maintenance.ts` 单独验证，判据必须同时绑定**同一个问题**、
 > **命令回执**和**业务侧真实改善**，三者缺一不可（反例见 `accept-maintenance-negative.ts`）。
 
-工具链验收的初始实现**确实是坏的**：脚本在把项目交给模型之前，先在任务目录里跑一次
-`python3 -m pytest`，断言退出码非零并打印失败用例；如果初始实现已经能通过，脚本直接以非零退出——
-否则「修 bug」只是走过场。当前基线是 `2 failed, 2 passed`，缺陷写在代码注释的约定里
-（价格必须为正、返回值保留两位小数），修复要求写在 `done_criteria` 里，不需要模型自己发明要求。
+工具链验收的初始实现**确实是坏的**：脚本在把项目交给模型之前先跑一次基线检查
+（`runBaseline()`，在 `scripts/smoke-lib.ts`），并且区分三种情况：
+
+| 情况 | 判定 | 退出码 |
+|---|---|---|
+| 缺 pytest / 导入失败 / 收集失败 / 被信号终止 | 验收环境错误，不是缺陷复现 | 2 |
+| pytest 正常跑完，但失败用例与预期不符 | 场景不成立（fixture 被改过） | 1 |
+| pytest 正常跑完，且恰好是预期的两个用例失败、其余通过 | 基线成立，交给模型 | 继续 |
+
+当前基线是 `2 failed, 2 passed`（`test_discount_rounding`、`test_negative_price_rejected`），
+缺陷写在代码注释的约定里（价格必须为正、返回值保留两位小数），修复要求写在 `done_criteria` 里，
+不需要模型自己发明要求。判定依据是 `pytest -rA` 的机器可读行（`FAILED …` / `PASSED …`），不靠模糊匹配输出。
 
 
 `pnpm smoke:toolkit`（`scripts/smoke-toolkit.ts`，场景 A：小型代码维护）会造一个带失败测试的小项目，
 让真实模型自己跑测试、定位、改文件、复跑、拉协作者检查、登记真实文件、提交。
 
-实际一次通过运行（`toolkit-20261108130415-9917`，验收配置 `MAX_STEPS_PER_WORKER=44`）：
+实际一次通过运行（`toolkit-20261109083225-5dca`，本轮基线改动之后）：
 
 ```
-任务 task_079c76b7 → completed，验收脚本退出码 0
-负责人 w1_843106d7（38 步，done）｜检查者 w2 撞 44 步上限失败，w3 接手完成
-产物：calc.py v1（485B，82587695baac…）、test_calc.py v1（639B）、FIX_NOTES.md v1（4888B）
-交付引用：三份产物全部 approved（要求版本 0）
-作业：62 个，61 个 exited、1 个 failed（真实失败被读到并处理）
-工具使用：proc_run 71｜fs_read 36｜fs_stat 28｜fs_list 9｜fs_glob 5｜fs_edit 2｜
-          artifact_import 3｜create_worker 2｜wait_for 3｜env_capabilities 1｜submit_result 1
-交付代码复跑：cd work/toolkit-…/artifacts/v1 && python3 -m pytest → 4 passed
+初始基线：2 failed, 2 passed（test_discount_rounding、test_negative_price_rejected）
+任务 task_e5f69fa7 → completed，验收脚本退出码 0
+负责人 w1_30f6c196（31 步，done）｜检查者 w2_28473cb6（64 步）
+检查结论：changes_required ×4 → approved ×2（都针对具体产物版本与指纹）
+交付引用：calc.py v1（621B）、修复说明.md v3（4197B），指纹与登记一致
+交付代码复跑：把交付的 calc.py 与原始测试放进干净目录 → 4 passed
 ```
+
+> 统计口径：返修轮次按**正式请求 / 检查批次**计数。上面两条 `approved` 对应两次检查请求，
+> 不是两条 `review` 记录——同一批检查里每份产物各有一行记录。
 
 **默认配置（`MAX_STEPS_PER_WORKER=24`）下两次都没跑完**：第一次负责人 23 步后卡在等待（系统通知没唤醒等待者，
 已修）；第二次负责人 24 步耗尽。工具变多以后，这条链路本身就在 30–40 步量级。
@@ -504,6 +513,10 @@ pnpm watchdog --answer <问题ID>                # 查询之前提交的问题
 
 ### HTTP 尝试次数：失败也要带上
 
+> 测量口径：**直接测模型接口**的用例只检查抛出的错误对象（`tests/regression/attempts.test.ts` 前半）；
+> **经过 RecordingModel** 的用例必须查数据库里 `model_call` 最终落盘的状态与 `http_attempts`（同文件后半 + `recorder.test.ts`）。
+> 两者不能互相代替——只测错误对象测不到记账层，只测记账层测不到错误分类。
+
 一次 `chat()` 对应一条 `model_call`，`http_attempts` 是**真正发出去的请求数**：
 
 | 情况 | 入库值 |
@@ -516,6 +529,9 @@ pnpm watchdog --answer <问题ID>                # 查询之前提交的问题
 | 等待并发名额 | 不计入——没发出去就不是尝试 |
 
 失败与取消路径同样把次数带到错误对象上，记账层从结构化字段读，不靠猜。
+
+实现上只有**一个错误出口**（`normalizeFailure`）：退避等待只负责"立刻结束等待"，不再自己构造业务错误。
+这样网络失败、超时失败在退避期间被取消时，也会带着已经发出的请求数离开，而不是落成 `NULL`。
 
 判断「是不是本地取消」只看错误类别（`kind === 'cancelled'`），不看文字：
 上游返回 `request cancelled by upstream policy` 属于失败，不是取消。
