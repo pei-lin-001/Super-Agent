@@ -181,6 +181,23 @@ pnpm accept:channel
 ✓ 产物已登记，大小与登记一致
 ```
 
+### 真实平台联调前的自检
+
+```bash
+pnpm channel:doctor
+```
+
+只读检查，不发消息也不消费消息：Telegram 用 `getMe`/`getChat` 验证令牌与主人 id（并确认是私聊），微信读本地凭据用 `getconfig` 验证令牌仍有效。缺什么会直接写出补法：
+
+```
+✗ Telegram 已启用：TELEGRAM_ENABLED 不是 1
+    怎么补：在 .env.local 设 TELEGRAM_ENABLED=1
+✗ 微信凭据：凭据目录里没有账号（.data/channels/weixin）
+    怎么补：pnpm channel:weixin-login 扫码登录
+```
+
+它证明的是「凭据有效、目标正确」，**不证明消息能收发**——收发只能靠手机实测。
+
 ### 真实平台联调（需要你提供条件）
 
 以下三项由模拟测试**无法**证明，必须用真实账号跑：
@@ -188,6 +205,8 @@ pnpm accept:channel
 1. **Telegram**：需要一个 BotFather 机器人令牌，和你的数字 user id（`TELEGRAM_OWNER_IDS`）。
 2. **微信**：需要你用手机扫码确认登录，凭据由程序保存在 `CHANNEL_STATE_DIR`，不经过模型。
 3. **手机实测**：双向文字、发文件、任务跑完回文件、断网恢复各一次。
+
+顺序：`pnpm channel:doctor` 全绿 → 启动 daemon → 手机上发一条消息 → 发一个文件 → 等任务回文件。
 
 缺这些条件时，上面所有测试仍然只能证明"协议形状与状态机正确"，不能声称"真实平台已通过"。
 

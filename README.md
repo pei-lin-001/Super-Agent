@@ -897,6 +897,7 @@ Ollama Cloud 在模型未就绪或请求过密时会返回 `finish_reason: "load
 ```bash
 pnpm channel:weixin-login   # 微信扫码，凭据写入 CHANNEL_STATE_DIR（0600），不经过模型
 pnpm channel:status         # 账号、绑定、游标、待收发
+pnpm channel:doctor         # 真机联调前自检：令牌是否有效、主人 id 是否可达（只读）
 pnpm accept:channel         # 进程级验收：本地假平台，真实启动 daemon
 ```
 

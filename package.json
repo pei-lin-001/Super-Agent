@@ -20,7 +20,8 @@
     "format": "prettier --write .",
     "channel:weixin-login": "node --env-file-if-exists=.env.local scripts/weixin-login.ts",
     "channel:status": "node --env-file-if-exists=.env.local scripts/channel-status.ts",
-    "accept:channel": "node scripts/accept-channel.ts"
+    "accept:channel": "node scripts/accept-channel.ts",
+    "channel:doctor": "node --env-file-if-exists=.env.local scripts/channel-doctor.ts"
   },
   "devDependencies": {
     "@types/node": "^24.10.1",
