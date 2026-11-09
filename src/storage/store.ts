@@ -840,15 +840,35 @@ export class Store {
     );
   }
 
-  listModelCalls(limit = 50): { id: string; purpose: string; status: string; error: string | null }[] {
+  listModelCalls(
+    limit = 50,
+  ): {
+    id: string;
+    purpose: string;
+    status: string;
+    error: string | null;
+    model: string | null;
+    modelAlias: string | null;
+    responseModel: string | null;
+    workerId: string | null;
+    taskId: string | null;
+    httpAttempts: number | null;
+  }[] {
     return this.all(
-      'SELECT id, purpose, status, error FROM model_call ORDER BY started_at DESC LIMIT ?',
+      `SELECT id, purpose, status, error, model, model_alias, response_model, worker_id, task_id, http_attempts
+       FROM model_call ORDER BY started_at DESC, rowid DESC LIMIT ?`,
       limit,
     ).map((row) => ({
       id: str(row['id']),
       purpose: str(row['purpose']),
       status: str(row['status']),
       error: strOrNull(row['error']),
+      model: strOrNull(row['model']),
+      modelAlias: strOrNull(row['model_alias']),
+      responseModel: strOrNull(row['response_model']),
+      workerId: strOrNull(row['worker_id']),
+      taskId: strOrNull(row['task_id']),
+      httpAttempts: row['http_attempts'] === null ? null : Number(row['http_attempts']),
     }));
   }
 
