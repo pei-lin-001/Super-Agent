@@ -286,6 +286,8 @@ export class Router {
       const result = await execution.attach(
         new RecordingModel(this.model, this.runtime.store, 'router', {
           sessionId,
+          // Router 固定走默认模型配置；记下来，便于和 Worker 的调用区分核对。
+          modelAlias: this.config.defaultModelAlias,
         }).chat({
         model: this.config.routerModel,
         messages,
