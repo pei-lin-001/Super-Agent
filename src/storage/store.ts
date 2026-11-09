@@ -240,6 +240,7 @@ export class Store {
     };
     ensureColumn('task', 'review_epoch', 'review_epoch INTEGER NOT NULL DEFAULT 0');
     ensureColumn('task', 'maintenance', 'maintenance INTEGER NOT NULL DEFAULT 0');
+    ensureColumn('wd_action', 'command_id', 'wd_action.command_id TEXT');
     ensureColumn('worker', 'run_epoch', 'run_epoch INTEGER NOT NULL DEFAULT 0');
     ensureColumn('message', 'dedupe_key', 'dedupe_key TEXT');
     ensureColumn('message', 'broadcast_id', 'broadcast_id TEXT');
@@ -646,10 +647,26 @@ export class Store {
     this.run("UPDATE wd_issue SET status = 'closed', note = ?, last_seen = ? WHERE id = ?", note, nowIso(), id);
   }
 
-  appendWdAction(input: { id: string; issueId: string | null; action: string; reason: string; expected: string; result: string }): void {
+  appendWdAction(input: {
+    id: string;
+    issueId: string | null;
+    commandId?: string | null;
+    action: string;
+    reason: string;
+    expected: string;
+    result: string;
+  }): void {
     this.run(
-      `INSERT INTO wd_action (id, issue_id, action, reason, expected, result, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      input.id, input.issueId, input.action, input.reason, input.expected, input.result, nowIso(),
+      `INSERT INTO wd_action (id, issue_id, command_id, action, reason, expected, result, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      input.id,
+      input.issueId,
+      input.commandId ?? null,
+      input.action,
+      input.reason,
+      input.expected,
+      input.result,
+      nowIso(),
     );
   }
 

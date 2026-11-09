@@ -272,6 +272,7 @@ CREATE TABLE IF NOT EXISTS wd_question (
 CREATE INDEX IF NOT EXISTS idx_wd_question_status ON wd_question(status, asked_at);
 
 CREATE TABLE IF NOT EXISTS wd_action (
+  command_id TEXT,
   id         TEXT PRIMARY KEY,
   issue_id   TEXT,
   action     TEXT NOT NULL,

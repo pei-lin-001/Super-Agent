@@ -15,6 +15,7 @@ import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 
 const root = process.cwd();
@@ -38,6 +39,8 @@ function require_(condition: boolean, message: string): void {
 
 // ---- 本地受控模型：第一阶段写文件，之后提交 ----
 let modelCalls = 0;
+/** 恢复之后写了几次进度：用计数推进，避免依赖工具回显内容。 */
+let recoveredWrites = 0;
 const modelServer = createServer((req, res) => {
   let raw = '';
   req.on('data', (chunk) => {
@@ -91,6 +94,10 @@ const modelServer = createServer((req, res) => {
       }
     } else if (!hasProgress) {
       payload = reply('fs_write', { path: 'progress.txt', content: `stage1 call ${modelCalls}\n` }, `c${modelCalls}`);
+    } else if (recoveredWrites < 1) {
+      // 恢复之后必须真的推进一行业务证据，否则"继续推进"证明不了
+      recoveredWrites += 1;
+      payload = reply('fs_write', { path: 'progress.txt', content: `stage1 call _\nstage2 recovered\n` }, `c${modelCalls}`);
     } else if (!hasDeliverable) {
       payload = reply('artifact_save', { name: 'deliverable.md', content: '# 交付\n第二阶段完成\n' }, `c${modelCalls}`);
     } else if (!hasSubmit) {
@@ -214,6 +221,9 @@ try {
   require_(!alive, `主进程 ${mainPid} 已被 SIGKILL 且确认退出`);
 
   // ---- 4) Watchdog 拉起 ----
+  // 明确：这一步是「人工通过 --ask 触发恢复」，不是常驻 Watchdog 主动发现。
+  // 脚本没有任何常驻维护者，因此本轮证明的是「被叫醒的维护者能查到崩溃并拉起主系统」。
+  log('恢复触发方式：人工 --ask（非常驻主动发现）');
   const wd = spawn(process.execPath, ['src/watchdog/main.ts', '--ask', '主系统还在运行吗？不在的话请按策略恢复它。'], {
     cwd: root,
     env,
@@ -255,24 +265,71 @@ try {
   }
   require_(finalStatus === 'completed', `恢复后任务完成（最终状态 ${finalStatus || '未知'}）`);
 
-  // ---- 7) 产物与提交引用 ----
+  // ---- 7) 产物与提交引用：读真实文件，算真实摘要，按引用结构核对 ----
   let artifactOk = false;
   let submittedOk = false;
+  let fileOk = false;
   try {
     const db = new DatabaseSync(dbPath, { readOnly: true });
-    const artifact = db.prepare("SELECT name, sha256, bytes FROM artifact WHERE name = 'deliverable.md'").get() as
-      | { name: string; sha256: string; bytes: number }
+    // 限定本次任务：不接受别的任务留下的同名产物。
+    const artifact = db
+      .prepare("SELECT id, name, path, sha256, bytes, version FROM artifact WHERE name = 'deliverable.md' AND task_id = ?")
+      .get(taskId) as
+      | { id: string; name: string; path: string; sha256: string; bytes: number; version: number }
       | undefined;
-    const result = db.prepare("SELECT refs FROM message WHERE kind = 'result'").get() as { refs: string } | undefined;
+    const result = db
+      .prepare("SELECT refs FROM message WHERE kind = 'result' AND task_id = ? ORDER BY rowid DESC LIMIT 1")
+      .get(taskId) as { refs: string } | undefined;
     db.close();
-    artifactOk = Boolean(artifact && artifact.bytes > 0);
-    submittedOk = Boolean(result && result.refs.includes('deliverable.md'));
-    if (artifact) log(`产物 deliverable.md sha256=${artifact.sha256.slice(0, 12)} bytes=${artifact.bytes}`);
+
+    if (artifact) {
+      // 真实文件：字节数与 sha256 都要和登记记录一致
+      const filePath = artifact.path.startsWith('/') ? artifact.path : join(workDir, artifact.path);
+      if (existsSync(filePath)) {
+        const content = readFileSync(filePath);
+        const digest = createHash('sha256').update(content).digest('hex');
+        fileOk = content.length === artifact.bytes && digest === artifact.sha256;
+        log(`产物文件 ${filePath}`);
+        log(`  实际 bytes=${content.length} sha256=${digest.slice(0, 16)}`);
+        log(`  登记 bytes=${artifact.bytes} sha256=${artifact.sha256.slice(0, 16)}`);
+      } else {
+        log(`产物文件不存在：${filePath}`);
+      }
+      artifactOk = artifact.bytes > 0;
+    }
+
+    // 引用结构：refs 是数组，需要按结构找到这一版产物，而不是搜文件名子串
+    if (result?.refs) {
+      try {
+        const refs = JSON.parse(result.refs) as unknown;
+        // 实际结构是 {"artifacts":[{artifactId,name,version}]}；同时兼容裸数组。
+        const parsedRefs = refs as { artifacts?: unknown[] } | unknown[];
+        const list: unknown[] = Array.isArray(parsedRefs)
+          ? parsedRefs
+          : Array.isArray(parsedRefs?.artifacts)
+            ? (parsedRefs.artifacts as unknown[])
+            : [];
+        submittedOk = list.some((entry) => {
+          if (typeof entry === 'string') return artifact ? entry === artifact.id || entry === artifact.name : false;
+          if (entry && typeof entry === 'object') {
+            const item = entry as { id?: string; name?: string; version?: number; sha256?: string };
+            if (!artifact) return false;
+            if (item.id !== undefined) return item.id === artifact.id;
+            return item.name === artifact.name && (item.version === undefined || item.version === artifact.version);
+          }
+          return false;
+        });
+        log(`提交引用：${JSON.stringify(list)}`);
+      } catch {
+        log(`提交引用不是合法 JSON：${result.refs.slice(0, 120)}`);
+      }
+    }
   } catch (error) {
     log(`读取产物失败：${(error as Error).message}`);
   }
   require_(artifactOk, '交付产物已登记且非空');
-  require_(submittedOk, '提交引用包含该产物');
+  require_(fileOk, '真实文件字节数与 sha256 与登记一致');
+  require_(submittedOk, '提交引用里按结构包含这一版产物');
 
   // 阶段证据：进度文件行数应比第一阶段多
   const stage2 = existsSync(progressPath) ? readFileSync(progressPath, 'utf8') : '';

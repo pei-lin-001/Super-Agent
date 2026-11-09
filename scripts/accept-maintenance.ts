@@ -71,16 +71,37 @@ const server = createServer((req, res) => {
     let payload: unknown;
     if (isWatchdog) {
       wdCalls += 1;
-      // 第一次：确认主系统在跑；第二次：下发 nudge；之后：复查并给结论
-      // 按已有工具结果推进：先看主系统，再下发提醒，最后复查给结论。
-      if (toolOutputs === '') payload = reply('check_main', {}, `w${wdCalls}`);
-      else if (!toolOutputs.includes('nudge') && !toolOutputs.includes('维护')) {
+      // 严格围绕同一个 issue 推进；只有读到真实变化才关闭它。
+      const seenDeliverable = toolOutputs.includes('deliverable.md');
+      const issuedCommand = toolOutputs.includes('已提交维护命令');
+      if (!issuedCommand) {
         payload = reply(
           'maintain',
-          { action: 'nudge_worker', worker_id: 'w1_main', text: '维护者提醒：你在重复同一个动作，请改成交付产物并提交。', reason: '重复无效动作' },
+          {
+            action: 'nudge_worker',
+            issue_id: 'wdi_spin',
+            task_id: 'task_main',
+            worker_id: 'w1_main',
+            text: '维护者提醒：你在重复同一个动作，请改成交付产物并提交。',
+            reason: '负责人在重复同一个无效动作',
+            expected: '产出 deliverable.md 并提交',
+          },
           `w${wdCalls}`,
         );
-      } else payload = say('已下发提醒，业务侧有新的提交，问题可以关闭。');
+      } else if (!seenDeliverable) {
+        // 命令已入队但还没看到业务变化：继续观察，不关闭问题
+        payload = reply('inspect_task', { task_id: 'task_main' }, `w${wdCalls}`);
+      } else {
+        payload = reply(
+          'record',
+          {
+            issue_id: 'wdi_spin',
+            status: 'closed',
+            note: '复查到 deliverable.md 已登记且任务完成，问题解决',
+          },
+          `w${wdCalls}`,
+        );
+      }
     } else {
       busyCalls += 1;
       // 维护提示出现后，Worker 才会改变行为
@@ -140,6 +161,14 @@ try {
          });
          store.setTaskOwner('task_main', 'w1_main');
          store.appendEvent('task_main', 'w1_main', 'task.created', '维护闭环验收');
+         // 先记录一个具体的未解决问题：后面要检查的是这同一个问题被关闭。
+         store.upsertWdIssue({
+           id: 'wdi_spin',
+           taskId: 'task_main',
+           title: '负责人在重复同一个无效动作',
+           note: 'spins.txt 反复被写成同一行，没有产出',
+           checkAfter: null,
+         });
          store.close();
          console.log('injected');
        }).catch((e) => { console.error(e); process.exit(1); });`,
@@ -235,19 +264,41 @@ try {
   }
   check(finalStatus === 'completed', `阶段三：任务最终完成（${finalStatus}）`);
 
-  // ---- 5) 复查后关闭问题（阶段四） ----
-  // 维护者下一轮巡检应当基于变化给出结论并关闭事件；这里检查它确实又看了一次
-  const wdCallsBefore = wdCalls;
-  for (let i = 0; i < 600 && wdCalls === wdCallsBefore; i += 1) await sleep(100);
-  check(wdCalls > wdCallsBefore, '阶段四：维护者在下一轮巡检里复查了结果');
+  // ---- 5) 复查后关闭同一个问题（阶段四） ----
+  // 判定依据是"同一个 issue 从 open 变成 closed，且关闭前读到过真实变化"，
+  // 不是"模型又调用了一次"。
+  let issueClosed = false;
+  let issueNote = '';
+  for (let i = 0; i < 900; i += 1) {
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    const row = db.prepare("SELECT status, note FROM wd_issue WHERE id = 'wdi_spin'").get() as
+      | { status: string; note: string | null }
+      | undefined;
+    db.close();
+    if (row?.status === 'closed') {
+      issueClosed = true;
+      issueNote = row.note ?? '';
+      break;
+    }
+    await sleep(100);
+  }
+  check(issueClosed, '阶段四：同一个问题被关闭');
+  check(/deliverable/i.test(issueNote), `阶段四：关闭理由引用了真实业务证据（${issueNote.slice(0, 80)}）`);
 
+  // 关联检查：issue → action → command 必须是同一条链
   const db4 = new DatabaseSync(dbPath, { readOnly: true });
-  const actions = db4.prepare('SELECT action FROM wd_action').all() as { action: string }[];
-  const openIssues = db4.prepare('SELECT id FROM wd_issue WHERE status = ?').all('open') as { id: string }[];
+  const action = db4.prepare("SELECT issue_id, command_id, action FROM wd_action WHERE action = 'nudge_worker'").get() as
+    | { issue_id: string | null; command_id: string | null; action: string }
+    | undefined;
+  const command = action?.command_id
+    ? (db4.prepare('SELECT status FROM control_command WHERE id = ?').get(action.command_id) as { status: string } | undefined)
+    : undefined;
+  const issue = db4.prepare("SELECT status FROM wd_issue WHERE id = 'wdi_spin'").get() as { status: string } | undefined;
   db4.close();
-  log(`维护动作：${actions.map((a) => a.action).join('｜') || '（无）'}`);
-  log(`未解决事件：${openIssues.length}`);
-  check(actions.length > 0, '维护动作有记录');
+  check(action?.issue_id === 'wdi_spin', `维护动作关联到同一个问题（${action?.issue_id ?? '无'}）`);
+  check(action?.command_id === controlId, '维护动作关联到实际执行的命令');
+  check(command?.status === 'done', `命令执行回执为 done（实际 ${command?.status ?? '无'}）`);
+  check(issue?.status === 'closed', '问题状态最终为 closed');
 } catch (error) {
   check(false, `脚本异常：${(error as Error).message}`);
 } finally {

@@ -343,7 +343,8 @@ export class WatchdogSession {
       });
       store.appendWdAction({
         id: `wda_${randomBytes(4).toString('hex')}`,
-        issueId: str('issue_id') || null,
+        issueId: str('issue_id') || this.issueId(),
+        commandId,
         action,
         reason: str('reason') || str('text') || '',
         expected: str('expected') || '',

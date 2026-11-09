@@ -81,6 +81,12 @@ try {
   console.log(`\n--- 提问输出 ---\n${ask.out.slice(-2500)}\n`);
   check(ask.code === 0, `客户端提交并拿到回答（退出码 ${ask.code}）`);
   const answer = ask.out.split('---').slice(1).join('---').trim();
+  // 连续第二轮：会带上第一轮的对话历史，检验"历史结构合法、且能延续推理"。
+  const ask2 = await runCli(['--ask', '上一轮你说过哪些还不能确认的部分？只依据已有记录回答。'], 600_000);
+  check(ask2.code === 0, `第二轮客户端拿到回答（退出码 ${ask2.code}）`);
+  const answer2 = ask2.out.split('---').slice(1).join('---').trim();
+  check(answer2.length > 40, `第二轮回答有实质内容（${answer2.length} 字）`);
+  console.log(`\n--- 第二轮输出 ---\n${ask2.out.slice(-1500)}\n`);
   check(answer.length > 20, `回答有实质内容（${answer.length} 字）`);
 
   const id = /wdq_[a-z0-9]+/.exec(ask.out)?.[0] ?? '';
