@@ -176,3 +176,88 @@ test('生命周期：断网后恢复，业务继续推进', async () => {
     await harness.cleanup();
   }
 });
+
+test('群聊：只留痕、不进执行流程、也不在群里回话', async () => {
+  let routerCalls = 0;
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    router: () => {
+      routerCalls += 1;
+      return mockReply({ text: '好的' });
+    },
+  });
+  const service = serviceOf({ runtime: harness.runtime, store: harness.store, config: harness.config });
+  const adapter = new FakeAdapter('telegram', 'bot_1', ['owner-1']);
+  service.register(adapter);
+  service.start();
+  try {
+    adapter.batches.push({
+      events: [
+        {
+          source: {
+            channel: 'telegram',
+            accountId: 'bot_1',
+            peerId: '-100777',
+            senderId: 'owner-1',
+            platformMessageId: '31',
+            eventId: 'update:31',
+            threadId: null,
+          },
+          text: '帮我在群里跑个命令',
+          attachments: [],
+          unsupported: '仅支持与机器人的私聊，group 里的消息不处理',
+          receivedAt: new Date().toISOString(),
+          silent: true,
+        },
+      ],
+      cursor: '32',
+    });
+    await service.tick();
+    await service.waitForIdle(3_000);
+
+    assert.equal(routerCalls, 0, '群聊消息不能调用模型');
+    assert.equal(adapter.sent.length, 0, '群聊里不能回话');
+    const rows = harness.store.listPendingInbound(20);
+    assert.equal(rows.length, 0, '记录已处理完，不留在队列里');
+  } finally {
+    await service.stop();
+    await harness.cleanup();
+  }
+});
+
+test('Telegram 适配器：群聊消息标记为只读留痕', async () => {
+  const { TelegramAdapter } = await import('../../src/channels/telegram.ts');
+  const fetchImpl = (async () =>
+    new Response(
+      JSON.stringify({
+        ok: true,
+        result: [
+          {
+            update_id: 70,
+            message: {
+              message_id: 5,
+              date: 1_700_000_000,
+              chat: { id: -100777, type: 'group', title: '工作群' },
+              from: { id: 777001 },
+              text: '帮我跑一下',
+            },
+          },
+        ],
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    )) as unknown as typeof fetch;
+  const adapter = new TelegramAdapter({
+    token: '1:S',
+    ownerIds: ['777001'],
+    apiBase: 'http://127.0.0.1:9',
+    workDir: '/tmp',
+    pollTimeoutMs: 1000,
+    maxInboundBytes: 1024,
+    fetchImpl,
+  });
+  const result = await adapter.poll({ cursor: null, signal: new AbortController().signal });
+  assert.equal(result.events.length, 1, '群消息也要留痕');
+  assert.equal(result.events[0]!.silent, true, '不能回信');
+  assert.match(result.events[0]!.unsupported ?? '', /私聊/);
+  assert.equal(result.cursor, '71', '游标照常前移，避免卡住');
+});

@@ -202,6 +202,17 @@ export class TelegramAdapter implements ChannelAdapter {
 
   private async toEvent(update: TelegramUpdate, message: TelegramMessage): Promise<PlatformEvent> {
     const source = this.sourceOf(update, message);
+    // 本轮只支持私聊：群、超级群、频道里的消息只留痕，不进执行流程，也不在群里回话。
+    if (message.chat.type !== 'private') {
+      return {
+        source,
+        text: message.text ?? message.caption ?? '',
+        attachments: [],
+        unsupported: `仅支持与机器人的私聊，${message.chat.type} 里的消息不处理`,
+        receivedAt: new Date((message.date ?? Math.floor(Date.now() / 1000)) * 1000).toISOString(),
+        silent: true,
+      };
+    }
     const receivedAt = new Date((message.date ?? Math.floor(Date.now() / 1000)) * 1000).toISOString();
     const text = (message.text ?? message.caption ?? '').trim();
     const attachments: StoredAttachment[] = [];

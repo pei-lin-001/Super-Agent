@@ -226,6 +226,70 @@ test('产物路径：越出工作目录一律拒绝', async () => {
   }
 });
 
+test('入站文件 → 建任务：材料真的落进任务目录，且写进任务说明', async () => {
+  let created = 0;
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    router: () => {
+      if (created > 0) return mockReply({ text: '已经建过了' });
+      created += 1;
+      return mockReply({
+        toolCalls: [
+          { name: 'create_task', arguments: { title: '看材料', goal: '读一下', owner_role: '执行者', owner_brief: '读' } },
+        ],
+      });
+    },
+  });
+  const service = serviceOf({ runtime: harness.runtime, store: harness.store, config: harness.config });
+  const adapter = new FakeAdapter('telegram', 'bot_1', ['owner-1']);
+  service.register(adapter);
+  service.start();
+  try {
+    const payload = Buffer.from('销量,利润\n10,3\n', 'utf8');
+    const stored = writeInboundAttachment({
+      workDir: harness.config.workDir,
+      channel: 'telegram',
+      accountId: 'bot_1',
+      eventId: 'update:21',
+      name: '数据.csv',
+      kind: 'file',
+      mime: 'text/csv',
+      bytes: payload,
+    });
+    adapter.batches.push({
+      events: [
+        eventOf({
+          channel: 'telegram',
+          accountId: 'bot_1',
+          peerId: 'owner-1',
+          eventId: 'update:21',
+          text: '看下这个表',
+          attachments: [stored],
+        }),
+      ],
+      cursor: '22',
+    });
+    await service.tick();
+    await service.waitForIdle(8_000);
+
+    const tasks = harness.store.listTasks();
+    assert.equal(tasks.length, 1, '应建一个任务');
+    const taskId = tasks[0]!.id;
+    const materialPath = join(harness.config.workDir, taskId, 'materials', '数据.csv');
+    assert.ok(existsSync(materialPath), `材料应复制进任务目录（找的是 ${materialPath}）`);
+    assert.equal(readFileSync(materialPath, 'utf8'), payload.toString('utf8'), '材料内容必须一致');
+    assert.match(tasks[0]!.brief, /materials\/数据\.csv/, '任务说明要写明材料位置');
+    assert.match(tasks[0]!.brief, /sha256/, '任务说明要带指纹，便于核对版本');
+
+    // 同一份材料不会被第二个任务重复认领
+    const unclaimed = harness.store.listUnclaimedSessionAttachments(TG_KEY);
+    assert.equal(unclaimed.length, 0, '材料已被认领，不能重复附着到别的任务');
+  } finally {
+    await service.stop();
+    await harness.cleanup();
+  }
+});
+
 test('入站描述：附件只说明存在与大小，不编造内容', () => {
   const text = composeInboundText('这是什么', [
     { kind: 'image', name: 'shot.png', mime: 'image/png', bytes: 2048, path: '.inbox/x', sha256: 'a' },

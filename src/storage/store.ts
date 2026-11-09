@@ -250,6 +250,8 @@ export class Store {
     ensureColumn('task', 'source_account_id', 'source_account_id TEXT');
     ensureColumn('task', 'source_peer_id', 'source_peer_id TEXT');
     ensureColumn('task', 'source_session_key', 'source_session_key TEXT');
+    ensureColumn('channel_inbound', 'silent', 'silent INTEGER NOT NULL DEFAULT 0');
+    ensureColumn('channel_outbound', 'next_attempt_at', 'next_attempt_at TEXT');
     ensureColumn('router_turn', 'session_key', 'session_key TEXT');
     ensureColumn('router_session', 'session_key', 'session_key TEXT');
     ensureColumn('wd_action', 'command_id', 'command_id TEXT');
@@ -1449,6 +1451,8 @@ export class Store {
       body: string;
       attachments: unknown;
       unsupported: string | null;
+      /** 只留痕、不回信（例如群聊）。 */
+      silent?: boolean;
       receivedAt: string;
     }[];
     cursor: string | null;
@@ -1478,11 +1482,12 @@ export class Store {
         this.run(
           `INSERT INTO channel_inbound (id, channel, account_id, event_id, peer_id, sender_id,
              platform_message_id, session_key, thread_id, body, attachments, unsupported,
-             status, reason, received_at, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             silent, status, reason, received_at, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           event.id, input.channel, input.accountId, event.eventId, event.peerId, event.senderId,
           event.platformMessageId, event.sessionKey, event.threadId, event.body,
-          JSON.stringify(event.attachments), event.unsupported, status, reason, event.receivedAt, now,
+          JSON.stringify(event.attachments), event.unsupported,
+          event.silent === true ? 1 : 0, status, reason, event.receivedAt, now,
         );
         if (allowed) accepted.push(event.id);
         else rejected.push(event.id);
@@ -1518,6 +1523,7 @@ export class Store {
     body: string;
     attachments: unknown;
     unsupported: string | null;
+    silent: boolean;
     receivedAt: string;
   }[] {
     return this.all(
@@ -1534,6 +1540,7 @@ export class Store {
       body: str(row['body']),
       attachments: JSON.parse(str(row['attachments'] ?? '[]')),
       unsupported: strOrNull(row['unsupported']),
+      silent: num(row['silent'] ?? 0) === 1,
       receivedAt: str(row['received_at']),
     }));
   }
@@ -1587,8 +1594,8 @@ export class Store {
     const now = nowIso();
     this.run(
       `INSERT INTO channel_outbound (id, channel, account_id, peer_id, session_key, task_id,
-         body, segments, status, attempts, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+         body, segments, status, attempts, next_attempt_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, NULL, ?, ?)
        ON CONFLICT(id) DO NOTHING`,
       input.id, input.channel, input.accountId, input.peerId, input.sessionKey, input.taskId,
       input.body, JSON.stringify(input.segments), now, now,
@@ -1606,9 +1613,13 @@ export class Store {
     segments: unknown;
     attempts: number;
   }[] {
+    const now = nowIso();
     return this.all(
-      "SELECT * FROM channel_outbound WHERE status IN ('pending','partial') ORDER BY created_at ASC, rowid ASC LIMIT ?",
-      limit,
+      `SELECT * FROM channel_outbound
+       WHERE status IN ('pending','partial')
+         AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+       ORDER BY created_at ASC, rowid ASC LIMIT ?`,
+      now, limit,
     ).map((row) => ({
       id: str(row['id']),
       channel: str(row['channel']),
@@ -1633,6 +1644,7 @@ export class Store {
     segments: unknown;
     attempts: number;
     lastError: string | null;
+    nextAttemptAt: string | null;
   }[] {
     return this.all(
       'SELECT * FROM channel_outbound WHERE session_key = ? ORDER BY created_at ASC, rowid ASC LIMIT ?',
@@ -1648,6 +1660,7 @@ export class Store {
       segments: JSON.parse(str(row['segments'] ?? '[]')),
       attempts: num(row['attempts']),
       lastError: strOrNull(row['last_error']),
+      nextAttemptAt: strOrNull(row['next_attempt_at']),
     }));
   }
 
@@ -1657,14 +1670,16 @@ export class Store {
     status: 'pending' | 'partial' | 'sent' | 'failed' | 'unknown';
     attempts: number;
     lastError?: string | null;
+    /** 最早下次可尝试时间；null 表示立刻可试。 */
+    nextAttemptAt?: string | null;
   }): void {
     const now = nowIso();
     this.run(
       `UPDATE channel_outbound SET segments = ?, status = ?, attempts = ?, last_error = ?,
-         updated_at = ?, sent_at = CASE WHEN ? = 'sent' THEN ? ELSE sent_at END
+         next_attempt_at = ?, updated_at = ?, sent_at = CASE WHEN ? = 'sent' THEN ? ELSE sent_at END
        WHERE id = ?`,
       JSON.stringify(input.segments), input.status, input.attempts, input.lastError ?? null,
-      now, input.status, now, input.id,
+      input.nextAttemptAt ?? null, now, input.status, now, input.id,
     );
   }
 

@@ -100,6 +100,25 @@ export function eventOf(input: {
   };
 }
 
+/**
+ * 把退避时间拨到过去，模拟"等到了"。
+ *
+ * 渠道会按 retry_after / 指数退避延后重试，测试不该真的等，也不该绕过退避逻辑。
+ */
+export function expireOutboundBackoff(store: Store, sessionKey: string): void {
+  for (const row of store.listOutboundBySession(sessionKey)) {
+    if (row.status !== 'pending' && row.status !== 'partial') continue;
+    store.updateOutbound({
+      id: row.id,
+      segments: row.segments,
+      status: row.status,
+      attempts: row.attempts,
+      lastError: row.lastError,
+      nextAttemptAt: new Date(Date.now() - 1_000).toISOString(),
+    });
+  }
+}
+
 export function serviceOf(options: {
   runtime: Runtime;
   store: Store;

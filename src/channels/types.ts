@@ -60,6 +60,13 @@ export interface InboundAttachment {
 
 /** 平台送来的一条原始消息。 */
 export interface PlatformEvent {
+  /**
+   * 只记录、不回信。
+   *
+   * 用于群聊这类本轮不支持、也不该在群里回话的来源：消息仍落库留痕，
+   * 但不进入执行流程，也不向该会话发送任何内容。
+   */
+  silent?: boolean;
   source: SourceRef;
   /** 合并后的正文；纯附件消息为空字符串。 */
   text: string;

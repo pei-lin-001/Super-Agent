@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createHarness } from '../helpers.ts';
-import { FakeAdapter, serviceOf } from '../channel-helpers.ts';
+import { FakeAdapter, expireOutboundBackoff, serviceOf } from '../channel-helpers.ts';
 import { mockReply } from '../../src/model/mock.ts';
 import { sessionKeyOf, type OutboundSegment } from '../../src/channels/types.ts';
 import { splitText } from '../../src/channels/service.ts';
@@ -97,7 +97,8 @@ test('出站：中间一段失败，已发出的段不重发', async () => {
     const sentBefore = adapter.sent.length;
     assert.equal(sentBefore, 2, '只发到第二段就停了');
 
-    // 第二轮：只补未确认的段
+    // 第二轮：等退避到期后只补未确认的段
+    expireOutboundBackoff(harness.store, TG_KEY);
     await service.drainOutbound();
     const second = harness.store.listOutboundBySession(TG_KEY)[0]!;
     const segments = segmentsOf(second);
@@ -141,6 +142,43 @@ test('出站：平台限速时记录真实失败与建议等待时间，不假�
     assert.equal(segment.status, 'failed');
     assert.match(segment.error ?? '', /Too Many Requests/);
     assert.equal(row.attempts, 1);
+    // 平台给了 7 秒，就必须等 7 秒，不能立刻再打一次
+    assert.ok(row.nextAttemptAt, '应记录最早下次尝试时间');
+    const waitMs = Date.parse(row.nextAttemptAt!) - Date.now();
+    assert.ok(waitMs > 5_000 && waitMs <= 7_500, `等待时间应接近 retry_after（实际 ${waitMs}ms）`);
+
+    // 等待期内再推进不会重发
+    const sentBefore = adapter.sent.length;
+    await service.drainOutbound();
+    assert.equal(adapter.sent.length, sentBefore, '等待期内不能重试');
+    assert.equal(harness.store.listPendingOutbound(10).length, 0, '未到时间的记录不进入待发队列');
+  } finally {
+    await service.stop();
+    await harness.cleanup();
+  }
+});
+
+test('退避：没有 retry_after 时按尝试次数退避，不空转打接口', async () => {
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    router: () => mockReply({ text: '退避测试' }),
+  });
+  const service = serviceOf({ runtime: harness.runtime, store: harness.store, config: harness.config });
+  const adapter = new FakeAdapter('telegram', 'bot_1', ['owner-1']);
+  service.register(adapter);
+  service.start();
+  try {
+    adapter.sendPolicy = () => ({ status: 'failed', error: 'ECONNREFUSED', retryable: true });
+    await harness.router.handleUserMessage('发吧', { sessionKey: TG_KEY });
+    await service.drainOutbound();
+    const first = harness.store.listOutboundBySession(TG_KEY)[0]!;
+    const wait1 = Date.parse(first.nextAttemptAt ?? '') - Date.now();
+    assert.ok(wait1 > 1_000, `第一次失败后应退避（实际 ${wait1}ms）`);
+
+    // 立刻再推进：不重发
+    const sent = adapter.sent.length;
+    await service.drainOutbound();
+    assert.equal(adapter.sent.length, sent, '退避期内不能重试');
   } finally {
     await service.stop();
     await harness.cleanup();
@@ -203,6 +241,7 @@ test('出站：重启后已确认的段不重发，未确认的继续', async ()
   second.register(secondAdapter);
   second.start();
   try {
+    expireOutboundBackoff(harness.store, TG_KEY);
     await second.drainOutbound();
     const indexes = secondAdapter.sent.map((item) => item.segment.index);
     assert.ok(!indexes.includes(0), '重启后不能重发第一段');

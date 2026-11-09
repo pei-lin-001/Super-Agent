@@ -62,7 +62,7 @@ Router 回复 / send_file
 - 文本按码点切段，优先落在段落/换行/句子边界，不切坏代理对，不丢内容。Telegram 4000、微信 2000。
 - 文件段只能取**本任务已登记**的产物版本：名字要存在、路径在 `workDir` 内、`sha256` 与字节数都要与登记一致，否则拒绝发送并写明原因。
 - 段级重试：已 `sent` 跳过；`failed` 可重试的继续；`unknown` 不再重发。整条状态取 `sent | partial | unknown | failed | pending`。
-- 平台限速（Telegram 429）带 `retry_after`，记录建议等待时间；鉴权失败不进入忙重试。
+- 退避：失败后可重试的段写 `next_attempt_at`——平台给了 `retry_after`（Telegram 429）就按它等，否则 2s 起翻倍、最多 60s。未到时间的记录不进待发队列，不会对着限速接口空转。鉴权失败直接判死，不进入重试。
 
 ### 断与恢复
 
@@ -77,7 +77,7 @@ Router 回复 / send_file
 - 会话键格式：`encodeURIComponent(channel)|encodeURIComponent(accountId)|encodeURIComponent(peerId)[|thread:<id>]`。
 - 主人身份：`TELEGRAM_OWNER_IDS` / `WEIXIN_OWNER_IDS`；微信未显式配置时用扫码返回的 `ilink_user_id`。两者都没有 = 未绑定，任何消息都不执行。
 - 跨会话权限：`read_task` / `send_file` 只能操作本会话任务。跨会话只允许同一主人用明确任务号查询，模型改不了归属。
-- 群聊、频道消息、编辑消息不在本轮范围：不进执行流程。
+- 群聊、频道消息、编辑消息不在本轮范围：消息仍落库留痕（`channel_inbound` 里可查原因），但不进执行流程，**也不在群里回话**。Telegram 适配器把非私聊标记为 `silent`，回信环节直接跳过。
 
 ---
 
@@ -153,6 +153,9 @@ pnpm test
 | 文件收发 | 指纹与大小一致才发；越界路径与未登记名字拒绝 |
 | uint64 message_id | 不丢精度 |
 | 登录失效 | 停止轮询、保留结果、不忙重试 |
+| 群聊消息 | 只留痕：不调模型、不回话，游标照常前移 |
+| 等待重试期间 | 未到 `next_attempt_at` 的记录不重发 |
+| 聊天发文件 → 建任务 | 材料复制进 `materials/`，任务说明写明路径与指纹，且只被认领一次 |
 | 未启用 IM | 装配返回 null，行为不变 |
 
 ### 进程级验收（本地假平台，不是真实联调）

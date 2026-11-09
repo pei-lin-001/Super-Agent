@@ -216,6 +216,7 @@ export class ChannelService {
       body: event.text,
       attachments: event.attachments,
       unsupported: event.unsupported ?? null,
+      silent: event.silent === true,
       receivedAt: event.receivedAt,
     }));
     // 先事务性落库、再前移游标：写库失败时游标不动。
@@ -274,20 +275,24 @@ export class ChannelService {
       body: string;
       attachments: unknown;
       unsupported: string | null;
+      silent: boolean;
     }[],
   ): Promise<void> {
     const router = this.runtime.routerBridge;
     for (const item of items) {
       const attachments = (Array.isArray(item.attachments) ? item.attachments : []) as InboundAttachment[];
       if (item.unsupported) {
-        // 本轮不支持的平台类型：明确记录并给用户可理解的反馈，不交给模型猜。
+        // 本轮不支持的平台类型：记录原因，不交给模型猜。
         this.store.markInbound(item.id, 'rejected', item.unsupported);
-        this.enqueueOutbound(
-          sessionKey,
-          `${item.unsupported}。这条消息已记录，但没有交给执行流程。`,
-          null,
-          null,
-        );
+        if (!item.silent) {
+          // 群聊这类来源连回信都不发：只留痕，避免在别人的群里冒泡。
+          this.enqueueOutbound(
+            sessionKey,
+            `${item.unsupported}。这条消息已记录，但没有交给执行流程。`,
+            null,
+            null,
+          );
+        }
         continue;
       }
       if (!router) {
@@ -425,6 +430,7 @@ export class ChannelService {
     let lastError: string | null = null;
     let unknown = false;
     let fatal = false;
+    let waitMs: number | null = null;
 
     for (const segment of segments) {
       if (segment.status === 'sent') continue;
@@ -466,6 +472,8 @@ export class ChannelService {
       segment.error = outcome.error;
       lastError = outcome.error;
       fatal = !outcome.retryable;
+      // 平台给了等待时间就按它等；否则按尝试次数退避，别对着限速接口空转。
+      waitMs = fatal ? null : (outcome.retryAfterMs ?? backoffMs(attempts));
       break;
     }
 
@@ -475,7 +483,14 @@ export class ChannelService {
     else if (unknown) status = 'unknown';
     else if (fatal) status = 'failed';
     else status = sent > 0 ? 'partial' : 'pending';
-    this.store.updateOutbound({ id: record.id, segments, status, attempts, lastError });
+    this.store.updateOutbound({
+      id: record.id,
+      segments,
+      status,
+      attempts,
+      lastError,
+      nextAttemptAt: waitMs === null ? null : new Date(Date.now() + waitMs).toISOString(),
+    });
   }
 
   /** 文件段只能取本任务已登记的产物版本。 */
@@ -561,6 +576,11 @@ export class ChannelService {
       signal.addEventListener('abort', onAbort, { once: true });
     });
   }
+}
+
+/** 发送失败后的退避：2s 起翻倍，最多 60s。 */
+export function backoffMs(attempts: number): number {
+  return Math.min(60_000, 2_000 * 2 ** Math.max(0, Math.min(attempts - 1, 5)));
 }
 
 function sessionKeyFrom(source: { channel: string; accountId: string; peerId: string; threadId?: string | null }): string {

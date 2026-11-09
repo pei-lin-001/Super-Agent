@@ -175,6 +175,7 @@ CREATE TABLE IF NOT EXISTS channel_inbound (
   body                TEXT NOT NULL DEFAULT '',
   attachments         TEXT,
   unsupported         TEXT,
+  silent              INTEGER NOT NULL DEFAULT 0,
   status              TEXT NOT NULL,
   reason              TEXT,
   received_at         TEXT NOT NULL,
