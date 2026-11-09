@@ -5,6 +5,7 @@
  * 它只做三件事：观察主库（只读语义）、通过控制命令实施维护、把自己的会话与动作记录在自己的表里。
  * 主系统退出后它仍在运行，并能按需拉起主系统。
  */
+import { randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -18,7 +19,9 @@ import { ProcessService } from '../runtime/process.ts';
 import { WatchdogSession } from './session.ts';
 
 const config = loadConfig();
-const store = new Store(config.dbPath);
+// 维护者也是独立实例：它的调用记录不能被主系统的恢复流程误收敛。
+const instanceId = `watchdog_${randomBytes(8).toString('hex')}`;
+const store = new Store(config.dbPath, { instanceId });
 
 const model = new OpenAICompatibleModel({
   baseUrl: config.baseUrl,
@@ -146,7 +149,15 @@ process.on('exit', releaseLock);
 
 function holdLock(): void {
   holdingLock = true;
-  writeFileSync(pidFile, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }, null, 2), 'utf8');
+  writeFileSync(
+    pidFile,
+    JSON.stringify(
+      { pid: process.pid, startedAt: new Date().toISOString(), instanceId, kind: 'watchdog', stopped: false },
+      null,
+      2,
+    ),
+    'utf8',
+  );
 }
 
 // 维护者提问入口：写持久问题队列，由唯一的维护者串行处理。

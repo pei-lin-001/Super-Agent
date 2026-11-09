@@ -55,6 +55,14 @@ export function isPidAlive(pid: number): boolean {
 export type ProcessIdentity = 'match' | 'mismatch' | 'unknown';
 
 export function identifyProcess(pid: number, marker: string): ProcessIdentity {
+  // 先确认进程是否存在：不存在就直接是 mismatch，不能因为读不到命令行就当成 unknown。
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    const code = (error as { code?: string }).code;
+    // EPERM 说明进程在，只是没权限发信号；ESRCH 才是真的没了。
+    return code === 'EPERM' ? 'unknown' : 'mismatch';
+  }
   try {
     const cmdline = readFileSync(`/proc/${pid}/cmdline`, 'utf8');
     return cmdline.includes(marker) ? 'match' : 'mismatch';

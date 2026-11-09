@@ -18,6 +18,7 @@ import {
 } from '../domain/ids.ts';
 import { isTerminalTask, isTerminalWorker } from '../domain/state.ts';
 import { Execution, ExecutionRevoked } from './execution.ts';
+import { identifyProcess } from '../watchdog/observer.ts';
 import type {
   Artifact,
   ProcessJob,
@@ -2059,6 +2060,31 @@ export class Runtime implements ToolHost {
   }
 
   /**
+   * 判断某个实例是否还活着。
+   *
+   * 只有"读到实例文件且进程身份能对上"才算活着；
+   * 读不到或无法确认时一律当活，宁可留一条记录，也不误改别人的调用。
+   */
+  private isInstanceAlive(instanceId: string): boolean {
+    const instancePath = `${this.config.workDir}/.runtime/instance.json`;
+    const watchdogPath = `${this.config.workDir}/.runtime/watchdog.json`;
+    for (const path of [instancePath, watchdogPath]) {
+      try {
+        const info = JSON.parse(readFileSync(path, 'utf8')) as { instanceId?: string; pid?: number | null; stopped?: boolean };
+        if (info.instanceId !== instanceId) continue;
+        if (info.stopped === true) return false;
+        if (typeof info.pid !== 'number') return false;
+        // 进程在、且命令行确实是本程序才算活着；身份不明按活处理，不误改。
+        const verdict = identifyProcess(info.pid, path.includes('watchdog') ? 'watchdog/main.ts' : 'main.ts');
+        return verdict !== 'mismatch';
+      } catch {
+        continue;
+      }
+    }
+    return true;
+  }
+
+  /**
    * 重启恢复：按持久化状态分情况处理，而不是把所有 waiting 一律重跑。
    *
    * - running：上次进程在执行中被打断。转 queued 并写提示，由模型核对历史后决定下一步，
@@ -2074,6 +2100,9 @@ export class Runtime implements ToolHost {
     let interrupted = 0;
     let requeued = 0;
     let waiting = 0;
+    // 调用记录先按实例归属收敛：崩溃实例留下的 running 不能永远挂着，
+    // 但存活实例和归属未知的记录一律不动。
+    this.store.recoverModelCalls((instanceId) => this.isInstanceAlive(instanceId));
 
     for (const worker of this.store.listWorkers()) {
       if (isTerminalWorker(worker.status)) continue;

@@ -215,9 +215,10 @@ function mapTurn(row: Row): WorkerTurn {
 export class Store {
   readonly db: DatabaseSync;
 
-  constructor(path: string) {
+  constructor(path: string, options: { instanceId?: string } = {}) {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
     this.path = path;
+    this.instanceId = options.instanceId ?? `local_${process.pid}_${Date.now()}`;
     this.db = new DatabaseSync(path);
     // 多进程同时访问同一个库（主系统 + 维护者 + 命令行客户端）：
     // WAL 让读写不互相阻塞，busy_timeout 让短时的写冲突自动重试而不是直接失败。
@@ -242,6 +243,7 @@ export class Store {
     ensureColumn('task', 'review_epoch', 'review_epoch INTEGER NOT NULL DEFAULT 0');
     ensureColumn('task', 'maintenance', 'maintenance INTEGER NOT NULL DEFAULT 0');
     ensureColumn('wd_action', 'command_id', 'command_id TEXT');
+    ensureColumn('model_call', 'instance_id', 'instance_id TEXT');
     ensureColumn('worker', 'run_epoch', 'run_epoch INTEGER NOT NULL DEFAULT 0');
     ensureColumn('message', 'dedupe_key', 'dedupe_key TEXT');
     ensureColumn('message', 'broadcast_id', 'broadcast_id TEXT');
@@ -577,6 +579,8 @@ export class Store {
 
   private closed = false;
   readonly path: string;
+  /** 本进程的实例标识：用来区分"谁发起的调用"，重启后不会重复。 */
+  readonly instanceId: string;
 
   get isClosed(): boolean {
     return this.closed;
@@ -792,9 +796,16 @@ export class Store {
     sessionId?: string | null;
   }): void {
     this.run(
-      `INSERT INTO model_call (id, purpose, task_id, worker_id, session_id, model, status, started_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'running', ?)`,
-      input.id, input.purpose, input.taskId ?? null, input.workerId ?? null, input.sessionId ?? null, input.model, nowIso(),
+      `INSERT INTO model_call (id, instance_id, purpose, task_id, worker_id, session_id, model, status, started_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?)`,
+      input.id,
+      this.instanceId,
+      input.purpose,
+      input.taskId ?? null,
+      input.workerId ?? null,
+      input.sessionId ?? null,
+      input.model,
+      nowIso(),
     );
   }
 
@@ -831,6 +842,37 @@ export class Store {
       status: str(row['status']),
       error: strOrNull(row['error']),
     }));
+  }
+
+  /**
+   * 收敛已退出实例留下的 running 记录。
+   *
+   * 只处理"确认已经不在运行"的实例：
+   * - 没有实例标识的历史记录保持 running，如实表示归属未知；
+   * - 存活实例的调用一律不动；
+   * - 无法确认身份的实例也不动，宁可留一条可疑记录，也不能误伤正在跑的调用。
+   */
+  recoverModelCalls(isAlive: (instanceId: string) => boolean): { interrupted: number; kept: number } {
+    const rows = this.all("SELECT id, instance_id FROM model_call WHERE status = 'running'") as Row[];
+    let interrupted = 0;
+    let kept = 0;
+    for (const row of rows) {
+      const owner = strOrNull(row['instance_id']);
+      if (owner === null || owner === this.instanceId) {
+        kept += 1;
+        continue;
+      }
+      if (isAlive(owner)) {
+        kept += 1;
+        continue;
+      }
+      this.run(
+        `UPDATE model_call SET status = 'interrupted', error = COALESCE(error, '实例已退出，记录已收敛') WHERE id = ?`,
+        str(row['id']),
+      );
+      interrupted += 1;
+    }
+    return { interrupted, kept };
   }
 
   modelCallStats(): { purpose: string; calls: number; ok: number; failed: number; usageKnown: number }[] {

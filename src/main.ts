@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { ConfigError, loadConfig } from './config.ts';
 import { OpenAICompatibleModel } from './model/openai.ts';
 import { Router } from './runtime/router.ts';
@@ -21,11 +22,14 @@ async function main(): Promise<void> {
     throw error;
   }
 
-  const store = new Store(config.dbPath);
+  // 实例标识：进程重启后与上一次完全不同，用来判断"这条调用记录属于谁"。
+  const instanceId = `main_${randomBytes(8).toString('hex')}`;
+  const store = new Store(config.dbPath, { instanceId });
   // 实例文件：Watchdog 靠它判断主系统是活着、已退出，还是身份无法确认。
   const instancePath = join(config.workDir, '.runtime', 'instance.json');
   mkdirSync(dirname(instancePath), { recursive: true });
   const heartbeatPath = join(config.workDir, '.runtime', 'heartbeat.json');
+  const startedAt = new Date().toISOString();
   const writeInstance = (stopped: boolean): void => {
     try {
       writeFileSync(
@@ -33,10 +37,12 @@ async function main(): Promise<void> {
         JSON.stringify(
           {
             pid: stopped ? null : process.pid,
-            startedAt: new Date().toISOString(),
+            startedAt,
             dbPath: config.dbPath,
             stopped,
             heartbeat: heartbeatPath,
+            instanceId,
+            kind: 'main',
           },
           null,
           2,
