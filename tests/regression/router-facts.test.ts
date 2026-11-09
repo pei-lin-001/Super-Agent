@@ -182,3 +182,23 @@ test('决策检查点：崩溃后从已保存的工具结果续接，不重复�
     await harness.cleanup();
   }
 });
+
+test('信道规范：IM 回复有 100 词硬约束，且禁报告体', async () => {
+  let prompt = '';
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '在跑' }),
+    router: ({ request }: { request: ChatRequest }) => {
+      prompt = systemText(request);
+      return mockReply({ text: '好' });
+    },
+  });
+  try {
+    await harness.router.handleUserMessage('在吗', { sessionKey: TG_KEY });
+    assert.match(prompt, /100 词/, 'IM 信道要写明确的长度上限');
+    assert.match(prompt, /低打扰/, '要说明这是低打扰信道');
+    assert.match(prompt, /不用表格/, '要禁掉报告体排版');
+    assert.match(prompt, /例外/, '用户要求详细时要有例外，否则长任务说明会被硬截断');
+  } finally {
+    await harness.cleanup();
+  }
+});
