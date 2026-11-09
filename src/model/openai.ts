@@ -161,9 +161,13 @@ export class OpenAICompatibleModel implements ModelClient {
     let callAttempts = 0;
 
     while (attempt < maxAttempts) {
-      this.httpAttempts += 1;
-      callAttempts += 1;
+      // 等待并发名额不算一次 HTTP 尝试：只有真的发出请求才计数。
       await gate.acquire();
+      if (request.signal?.aborted === true) {
+        gate.release();
+        throw new ModelError('模型调用已被本地取消', { kind: 'cancelled', retryable: false });
+      }
+      callAttempts += 1;
       try {
         // 本地取消 + 单次超时合并成一个信号，两者任一触发都要中断请求。
         const timeout = AbortSignal.timeout(this.options.timeoutMs);
@@ -188,7 +192,7 @@ export class OpenAICompatibleModel implements ModelClient {
           if (retryable && attempt < maxAttempts - 1) {
             lastError = error;
             attempt += 1;
-            await sleep(400 * 2 ** attempt);
+            await this.sleepUnlessAborted(400 * 2 ** attempt, request.signal);
             continue;
           }
           throw error;
@@ -216,7 +220,7 @@ export class OpenAICompatibleModel implements ModelClient {
         if (choice.finish_reason === 'load') {
           loadWaits += 1;
           if (loadWaits <= MAX_LOAD_WAITS) {
-            await sleep(1_500 * loadWaits);
+            await this.sleepUnlessAborted(1_500 * loadWaits, request.signal);
             continue;
           }
           throw new ModelError('模型长时间处于加载状态（finish_reason=load），请稍后重试', {
@@ -236,7 +240,7 @@ export class OpenAICompatibleModel implements ModelClient {
           if (attempt < maxAttempts - 1) {
             lastError = new ModelError(detail, { status: response.status });
             attempt += 1;
-            await sleep(400 * 2 ** attempt);
+            await this.sleepUnlessAborted(400 * 2 ** attempt, request.signal);
             continue;
           }
           throw new ModelError(detail, { status: response.status, body: text.slice(0, 800) });
@@ -259,7 +263,9 @@ export class OpenAICompatibleModel implements ModelClient {
         };
       } catch (error) {
         // 本地取消优先判断：signal 已 abort 时，无论底层抛的是什么，都归类为取消。
-        if (request.signal?.aborted === true || (error instanceof Error && error.name === 'AbortError')) {
+        // 用函数读取，避免 TS 把前面的检查当成已收窄的字面量类型。
+        const abortedNow = (): boolean => request.signal?.aborted === true;
+        if (abortedNow() || (error instanceof Error && error.name === 'AbortError')) {
           throw new ModelError('模型调用已被本地取消', { kind: 'cancelled', cause: error, retryable: false });
         }
         if (error instanceof ModelError) throw error;
