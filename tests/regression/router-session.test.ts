@@ -38,14 +38,12 @@ async function makeHarness(rounds = 1): Promise<{
   const runtime = new Runtime({
     store,
     config,
-    workerModel: new MockModel(() => ({
-      text: null,
-      reasoning: null,
-      toolCalls: [],
-      finishReason: 'stop',
-      model: 'm',
-      usage: null,
-    })),
+    // 测试替身必须让出事件循环：立即返回会让 Worker 在微任务里连跑，
+    // 饿死定时器，表现为"测试挂起"而不是业务问题。
+    workerModel: new MockModel(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      return { text: null, reasoning: null, toolCalls: [], finishReason: 'stop' as const, model: 'm', usage: null };
+    }),
   });
   return {
     runtime,
@@ -240,6 +238,95 @@ test('新决策同名同参数：仍然产生第二次合法操作', async () =>
     await router.handleUserMessage('建两个同名任务').catch(() => undefined);
     const same = h.store.listTasks().filter((t) => t.title === '同名任务');
     assert.equal(same.length, 2, `参数相同的两次合法操作都应生效（实际 ${same.length}）`);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('普通请求直接完成：会话不遗留，tick/resume 不再产生额外调用', async () => {
+  const h = await makeHarness(6);
+  try {
+    let calls = 0;
+    const router = new Router(
+      h.runtime,
+      new MockModel(() => {
+        calls += 1;
+        if (calls === 1) {
+          return { text: null, reasoning: null, toolCalls: [createTaskCall('完成任务', 'n1')], finishReason: 'tool_calls', model: 'm', usage: null };
+        }
+        return { text: '已经建好任务', reasoning: null, toolCalls: [], finishReason: 'stop', model: 'm', usage: null };
+      }),
+      h.config,
+    );
+    await router.handleUserMessage('建一个任务').catch(() => undefined);
+    assert.equal(h.store.listTasks().length, 1);
+    const callsAfter = calls;
+
+    assert.equal(h.store.pendingRouterSession(), null, '普通请求完成后不应遗留待续接会话');
+
+    await router.resume().catch(() => undefined);
+    await router.resume().catch(() => undefined);
+    assert.equal(calls, callsAfter, '没有待续接会话时 resume 不应再调用模型');
+    assert.equal(h.store.listTasks().length, 1, '不应重复建任务');
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('自动汇报直接完成：同样不遗留待续接会话', async () => {
+  const h = await makeHarness(6);
+  try {
+    let calls = 0;
+    const router = new Router(
+      h.runtime,
+      new MockModel(() => {
+        calls += 1;
+        return { text: '汇报完毕', reasoning: null, toolCalls: [], finishReason: 'stop', model: 'm', usage: null };
+      }),
+      h.config,
+    );
+    // 造一条来自 Worker 的消息，触发自动汇报路径
+    const { task, owner } = h.runtime.createTask({ title: '汇报任务', goal: 'g', ownerRole: 'r', ownerBrief: 'b' });
+    h.runtime.report(owner, 'progress', '进度 50%');
+    await router.notify();
+
+    assert.ok(calls >= 1, '自动汇报应产生一次模型调用');
+    assert.equal(h.store.pendingRouterSession(), null, '自动汇报完成后不应遗留待续接会话');
+    void task;
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('续接与新用户消息相邻到达：两者都被处理，不互相覆盖上下文', async () => {
+  const h = await makeHarness(1);
+  try {
+    const texts: string[] = [];
+    let calls = 0;
+    const router = new Router(
+      h.runtime,
+      new MockModel((context) => {
+        calls += 1;
+        const last = [...(context.request.messages as ChatMessage[])].reverse().find((m) => m.role === 'user');
+        texts.push(last?.content ?? '');
+        if (calls === 1) {
+          return { text: null, reasoning: null, toolCalls: [createTaskCall('A', 'a1')], finishReason: 'tool_calls', model: 'm', usage: null };
+        }
+        if (calls === 2) {
+          return { text: '第一轮结束', reasoning: null, toolCalls: [], finishReason: 'stop', model: 'm', usage: null };
+        }
+        return { text: '第二轮结束', reasoning: null, toolCalls: [], finishReason: 'stop', model: 'm', usage: null };
+      }),
+      h.config,
+    );
+    await router.handleUserMessage('第一件事').catch(() => undefined);
+    // 续接与新消息几乎同时到达
+    await Promise.all([
+      router.resume().catch(() => undefined),
+      router.handleUserMessage('第二件事').catch(() => undefined),
+    ]);
+    assert.ok(calls >= 2, `两次请求都应执行（实际 ${calls}）`);
+    assert.ok(texts.some((t) => t.includes('第二件事')), '新用户消息必须被处理，不能被续接吞掉');
   } finally {
     await h.cleanup();
   }

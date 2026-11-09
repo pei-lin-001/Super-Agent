@@ -6,6 +6,7 @@ import type { RuntimeEvent } from '../domain/types.ts';
 import type { ChatMessage, ModelClient, ToolSchema } from '../model/types.ts';
 import type { Runtime } from './runtime.ts';
 import { Execution, ExecutionRevoked } from './execution.ts';
+
 import { routerSystemPrompt, taskCardLine } from './prompts.ts';
 
 const ROUTER_TOOLS: ToolSchema[] = [
@@ -87,15 +88,8 @@ export class Router {
   private readonly config: Config;
 
   private readonly readOnly: boolean;
-  private resumeMessages: ChatMessage[] | null = null;
-  private resumeSessionId: string | null = null;
-  private lastOutcome: 'done' | 'suspended' | 'failed' = 'done';
   /** 正在续接的会话：防止定时 tick 把同一个会话排成一串重复执行。 */
   private readonly resuming = new Set<string>();
-
-  private currentOutcome(): 'done' | 'suspended' | 'failed' {
-    return this.lastOutcome;
-  }
 
   constructor(runtime: Runtime, model: ModelClient, config: Config, options: { readOnly?: boolean } = {}) {
     this.runtime = runtime;
@@ -104,41 +98,63 @@ export class Router {
     this.readOnly = options.readOnly ?? false;
   }
 
-  handleUserMessage(content: string): Promise<void> {
-    const run = this.chain.then(() => this.run(content));
+  /** 把一个执行请求排进串行队列；返回这次执行的真实结果。 */
+  private enqueue(
+    userText: string | null,
+    context: { sessionId?: string; history?: ChatMessage[] } = {},
+  ): Promise<'done' | 'suspended' | 'failed'> {
+    const run = this.chain.then(() => this.run(userText, context));
     // 内部串行链吞掉失败，避免一次故障让后续所有消息都直接失败。
     this.chain = run.then(
       () => undefined,
       () => undefined,
     );
     return run.then(
-      (outcome) => {
-        this.lastOutcome = outcome;
-      },
+      (outcome) => outcome,
       (error: unknown) => {
-        this.lastOutcome = 'failed';
         this.publish({ type: 'router.notice', text: `Router 运行失败：${(error as Error).message}` });
-        throw error;
+        return 'failed' as const;
       },
     );
   }
 
-  /** Worker 有结果/失败/提问时触发一次自动汇报；多次通知会合并。 */
-  notify(): void {
-    if (this.notifyScheduled) return;
+  handleUserMessage(content: string): Promise<void> {
+    return this.enqueue(content).then(() => undefined);
+  }
+
+  /**
+   * Worker 有结果/失败/提问时触发一次自动汇报；多次通知会合并。
+   *
+   * 返回的 Promise 在本次汇报真正结束后 resolve，便于调用方（和测试）等待；
+   * 生产路径通常不 await 它。
+   */
+  notify(): Promise<void> {
+    if (this.notifyScheduled) return Promise.resolve();
     this.notifyScheduled = true;
-    setTimeout(() => {
-      this.notifyScheduled = false;
-      if (this.runtime.isStopped) return;
-      if (this.runtime.store.listRouterInbox().length === 0) return;
-      const next = this.chain.then(() => this.run(null));
-      this.chain = next.then(
-        () => undefined,
-        (error: unknown) => {
-          this.publish({ type: 'router.notice', text: `Router 自动汇报失败：${(error as Error).message}` });
-        },
-      );
-    }, 0);
+    return new Promise<void>((resolve) => {
+      setTimeout(() => {
+        this.notifyScheduled = false;
+        if (this.runtime.isStopped) {
+          resolve();
+          return;
+        }
+        if (this.runtime.store.listRouterInbox().length === 0) {
+          resolve();
+          return;
+        }
+        void this.enqueue(null).then(
+          (outcome) => {
+            if (outcome === 'failed') {
+              this.publish({ type: 'router.notice', text: 'Router 自动汇报失败，已保留会话等待续接。' });
+            }
+            resolve();
+          },
+          () => {
+            resolve();
+          },
+        );
+      }, 0);
+    });
   }
 
   private publish(event: RuntimeEvent): void {
@@ -152,11 +168,14 @@ export class Router {
    * 整段流程在 Execution 里跑：停机撤销之后，任何一次存储访问都会被挡住，
    * 包括异常分支和 finally。底层模型即使忽略取消，迟到结果也只被观察。
    */
-  private async run(userText: string | null): Promise<'done' | 'suspended'> {
+  private async run(
+    userText: string | null,
+    context: { sessionId?: string; history?: ChatMessage[] } = {},
+  ): Promise<'done' | 'suspended'> {
     const execution = new Execution('router');
     this.runtime.track(execution);
     try {
-      return await execution.run(() => this.runBody(userText, execution));
+      return await execution.run(() => this.runBody(userText, execution, context));
     } catch (error) {
       if (error instanceof ExecutionRevoked) return 'done';
       throw error;
@@ -165,7 +184,11 @@ export class Router {
     }
   }
 
-  private async runBody(userText: string | null, execution: Execution): Promise<'done' | 'suspended'> {
+  private async runBody(
+    userText: string | null,
+    execution: Execution,
+    context: { sessionId?: string; history?: ChatMessage[] } = {},
+  ): Promise<'done' | 'suspended'> {
     if (this.runtime.isStopped) return 'done';
     const inbox = this.runtime.store.listRouterInbox();
     if (userText === null && inbox.length === 0) return 'done';
@@ -177,9 +200,10 @@ export class Router {
       )
       .join('\n');
 
-    const history = this.resumeMessages
-      ? this.resumeMessages
-      : this.runtime.store.listRouterTurns(20).map((turn): ChatMessage => ({ role: turn.role, content: turn.content }));
+    // 历史只从参数来：不再读共享字段，避免前后两个执行互相看到对方的上下文。
+    const history =
+      context.history ??
+      this.runtime.store.listRouterTurns(20).map((turn): ChatMessage => ({ role: turn.role, content: turn.content }));
     const messages: ChatMessage[] = [
       {
         role: 'system',
@@ -203,7 +227,7 @@ export class Router {
     this.publish({ type: 'router.start' });
 
     // 一条协调会话贯穿多轮调度与重试。
-    const sessionId = this.resumeSessionId ?? `rs_${randomBytes(4).toString('hex')}`;
+    const sessionId = context.sessionId ?? `rs_${randomBytes(4).toString('hex')}`;
     // 会话在第一次模型请求前就落库：额度耗尽或失败时，续接入口始终存在。
     this.runtime.store.saveRouterSession({
       id: sessionId,
@@ -276,6 +300,7 @@ export class Router {
         const answer = result.text?.trim() ?? '';
         if (answer === '') {
           this.publish({ type: 'router.notice', text: 'Router 没有输出内容，已忽略本轮。' });
+          this.finishSession(sessionId, 'done', messages);
           return 'done';
         }
         messages.push({ role: 'assistant', content: answer });
@@ -287,6 +312,8 @@ export class Router {
         });
         this.publish({ type: 'router.reply', text: answer });
         for (const message of inbox) this.consume(message.id);
+        // 完成即收尾：会话不能停在"进行中"，否则 tick 会再续接一次并重复建任务。
+        this.finishSession(sessionId, 'done', messages);
         return 'done';
       }
 
@@ -325,7 +352,7 @@ export class Router {
       this.runtime.store.finishRouterDecision(decisionId);
     }
 
-    // 保存未完成的协调过程，下一轮继续；不依赖新的用户消息，也不重复已完成动作。
+    // 挂起：保存最新进度，下一轮续接。这是唯一保留待续接状态的路径。
     this.runtime.store.saveRouterSession({
       id: sessionId,
       taskId: null,
@@ -335,6 +362,26 @@ export class Router {
     this.runtime.store.appendEvent(null, null, 'router.suspended', `达到单轮调度额度 ${maxRounds}，已保存进度`);
     this.publish({ type: 'router.notice', text: `Router 达到单轮调度额度 ${maxRounds}，已保存进度，稍后继续。` });
     return 'suspended';
+  }
+
+  /**
+   * 会话的唯一收尾入口。
+   *
+   * 完成与失败都由这里决定会话的去留：完成关闭，可恢复失败保留。
+   * 之前只有 resume() 会关闭会话，普通请求走完一轮就停在"进行中"，
+   * 下一次 tick 又把它当成未完成继续协调，于是同一个业务动作被执行两次。
+   */
+  private finishSession(sessionId: string, outcome: 'done' | 'failed', messages: ChatMessage[]): void {
+    if (outcome === 'done') {
+      this.runtime.store.closeRouterSession(sessionId, 'done');
+      return;
+    }
+    this.runtime.store.saveRouterSession({
+      id: sessionId,
+      taskId: null,
+      messages: messages.filter((message) => message.role !== 'system'),
+      reason: '执行失败，等待续接',
+    });
   }
 
   /** 是否存在待续接的协调过程：以持久化状态为准，重启后依然成立。 */
@@ -349,33 +396,27 @@ export class Router {
     // 检查发生在任何 await 之前，所以同一 tick 内的多次唤醒都能被挡住。
     if (this.resuming.has(session.id)) return;
     this.resuming.add(session.id);
-    const restored = (session.messages as ChatMessage[]).filter(
-      (message): message is ChatMessage => typeof message === 'object' && message !== null && message.role !== 'system',
-    );
-    const local = this.resumeMessages;
-    const localSession = this.resumeSessionId;
-    this.resumeMessages = restored;
-    this.resumeSessionId = session.id;
-    this.lastOutcome = 'done';
     try {
-      await this.handleUserMessage('（继续上次未完成的协调工作，不要重复已经完成的操作）');
-      const outcome = this.currentOutcome();
-      if (outcome === 'failed') throw new Error('这一轮协调没有完成');
-      if (outcome === 'suspended') {
-        // 进度只由一个地方保存：run() 在挂起时已经把最新 messages 写进会话。
-        // 这里如果再用进入时的旧快照覆盖，就会丢掉本轮新产生的决策与结果。
-        return;
+      const outcome = await this.enqueue(
+        '（继续上次未完成的协调工作，不要重复已经完成的操作）',
+        { sessionId: session.id, history: this.parseHistory(session.messages) },
+      );
+      // 会话的关闭与保留已经由 runBody 统一处理，这里不再重复决定。
+      if (outcome === 'failed') {
+        this.runtime.store.appendEvent(null, null, 'router.resume_failed', '这一轮协调没有完成');
       }
-      // 只有这一轮真的跑完才关闭会话；失败时保留，下一轮还能恢复。
-      this.runtime.store.closeRouterSession(session.id, 'done');
-    } catch (error) {
-      this.runtime.store.appendEvent(null, null, 'router.resume_failed', (error as Error).message);
-      throw error;
     } finally {
-      this.resumeMessages = local;
-      this.resumeSessionId = localSession;
       this.resuming.delete(session.id);
     }
+  }
+
+  /** 会话里的历史只接受结构完整的消息，避免把半截记录塞进下一次请求。 */
+  private parseHistory(raw: unknown): ChatMessage[] {
+    if (!Array.isArray(raw)) return [];
+    return raw.filter(
+      (message): message is ChatMessage =>
+        typeof message === 'object' && message !== null && (message as ChatMessage).role !== 'system',
+    );
   }
 
   private consume(messageId: string): void {

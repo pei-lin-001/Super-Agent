@@ -445,7 +445,8 @@ test('Router 续接：重启后仍能发现待续接进度，失败时保留记�
       harness.config,
     );
     assert.equal(router.hasPendingSession(), true, '以持久化状态为准');
-    await assert.rejects(() => router.resume());
+    // resume 是内部调度入口：失败不向外抛，但必须保留待续接记录。
+    await router.resume();
     assert.ok(harness.store.pendingRouterSession(), '失败后记录必须保留，不能标成 abandoned');
     await router.resume();
     assert.equal(harness.store.pendingRouterSession(), null, '成功后才关闭会话');
