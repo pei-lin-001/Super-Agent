@@ -275,6 +275,19 @@ export class Store {
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_router_session_key ON router_session(session_key, status)');
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_router_turn_conversation ON router_turn(conversation_id, created_at)');
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_router_session_conversation ON router_session(conversation_id, status)');
+    // 话题上线前的历史收进该会话最早的话题：否则升级后按话题查历史什么都看不到。
+    // 只在会话已经有话题时收，且只收 conversation_id 为空的行，可重复执行。
+    this.db.exec(`
+      UPDATE router_turn
+         SET conversation_id = (
+           SELECT c.id FROM conversation c
+            WHERE c.session_key = router_turn.session_key
+            ORDER BY c.created_at ASC, c.rowid ASC LIMIT 1
+         )
+       WHERE conversation_id IS NULL
+         AND session_key IS NOT NULL
+         AND EXISTS (SELECT 1 FROM conversation c2 WHERE c2.session_key = router_turn.session_key)
+    `);
     ensureColumn('wd_action', 'command_id', 'command_id TEXT');
     ensureColumn('model_call', 'instance_id', 'instance_id TEXT');
     ensureColumn('model_call', 'model_alias', 'model_alias TEXT');

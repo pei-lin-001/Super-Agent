@@ -172,3 +172,46 @@ test('旧库升级后：主系统与维护入口都能正常初始化', async ()
     }
   }
 });
+
+test('迁移：老历史没有话题归属时，收进该会话最早的话题', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'super-agent-mig-'));
+  const path = join(dir, 'agent.db');
+  try {
+    // 先用当前结构建库，再手工造出"话题前"的历史
+    const store = new Store(path);
+    store.createConversation({
+      id: 'cv_first',
+      sessionKey: 'telegram|bot_1|owner-1',
+      title: '默认话题',
+      now: '2026-01-01T00:00:00.000Z',
+    });
+    store.appendRouterTurn({
+      id: 'rt_old',
+      role: 'user',
+      content: '升级前说过的话',
+      sessionKey: 'telegram|bot_1|owner-1',
+      createdAt: '2026-01-02T00:00:00.000Z',
+    });
+    store.appendRouterTurn({
+      id: 'rt_new',
+      role: 'user',
+      content: '已经有话题的话',
+      sessionKey: 'telegram|bot_1|owner-1',
+      conversationId: 'cv_first',
+      createdAt: '2026-01-03T00:00:00.000Z',
+    });
+    store.close();
+
+    // 重新打开 = 走一次迁移
+    const reopened = new Store(path);
+    const turns = reopened.listRouterTurns(20, 'telegram|bot_1|owner-1', 'cv_first');
+    assert.deepEqual(
+      turns.map((turn) => turn.content),
+      ['升级前说过的话', '已经有话题的话'],
+      '老历史应被收进第一个话题，且顺序不乱',
+    );
+    reopened.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
