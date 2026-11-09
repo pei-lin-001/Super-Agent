@@ -7,6 +7,7 @@
 import assert from 'node:assert/strict';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createServer } from 'node:http';
+import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -20,6 +21,7 @@ interface Env {
   dbPath: string;
   port: number;
   env: NodeJS.ProcessEnv;
+  stats: () => { count: number; maxActive: number };
   close: () => Promise<void>;
 }
 
@@ -29,17 +31,27 @@ async function makeEnv(): Promise<Env> {
   const dbPath = join(dir, 'db.sqlite');
   mkdirSync(join(workDir, '.runtime'), { recursive: true });
   let count = 0;
+  // 并发追踪：验证"同一时刻只有一个维护会话在动"不能只看代码顺序。
+  let active = 0;
+  let maxActive = 0;
   const server = createServer((req, res) => {
     req.resume();
     req.on('end', () => {
       count += 1;
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(
-        JSON.stringify({
-          choices: [{ message: { content: `维护结论 ${count}：数据层可读，调度层状态如上。` }, finish_reason: 'stop' }],
-          usage: { prompt_tokens: 5, completion_tokens: 5 },
-        }),
-      );
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      const reply = (): void => {
+        active -= 1;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            choices: [{ message: { content: `维护结论 ${count}：数据层可读，调度层状态如上。` }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 5, completion_tokens: 5 },
+          }),
+        );
+      };
+      // 每次请求都慢一点，让巡检与提问有机会重叠
+      setTimeout(reply, 250);
     });
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -60,6 +72,7 @@ async function makeEnv(): Promise<Env> {
     dbPath,
     port,
     env,
+    stats: () => ({ count, maxActive }),
     close: async () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
       rmSync(dir, { recursive: true, force: true });
@@ -220,3 +233,110 @@ test('巡检执行期间提交的问题按串行顺序处理', async () => {
     await ctx.close();
   }
 });
+
+test('巡检进行中同时提交两个问题：并发始终为 1，两个问题都被处理', async () => {
+  const ctx = await makeEnv();
+  let resident: ChildProcess | null = null;
+  try {
+    // 不写停机标记：让巡检真的跑起来，与提问竞争
+    resident = spawn(process.execPath, ['src/watchdog/main.ts'], { cwd: root, env: ctx.env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    resident.stdout?.on('data', (chunk: Buffer) => {
+      out += chunk.toString();
+    });
+    assert.ok(await waitFor(() => out.includes('Watchdog 启动'), 15_000), '维护者应启动');
+    // 等第一轮巡检真的开始（有模型请求）
+    assert.ok(await waitFor(() => ctx.stats().count >= 1, 20_000), '巡检应发起模型调用');
+
+    const [a, b] = await Promise.all([
+      runCli(ctx.env, ['--ask', '巡检期间的问题一：主系统还在吗？'], 120_000),
+      runCli(ctx.env, ['--ask', '巡检期间的问题二：有没有空转？'], 120_000),
+    ]);
+    assert.equal(a.code, 0, `问题一应被处理：${a.out.slice(-300)}`);
+    assert.equal(b.code, 0, `问题二应被处理：${b.out.slice(-300)}`);
+
+    const idA = /wdq_[a-z0-9]+/.exec(a.out)?.[0] ?? '';
+    const idB = /wdq_[a-z0-9]+/.exec(b.out)?.[0] ?? '';
+    assert.ok(idA !== '' && idB !== '', '两个问题都要有独立 ID');
+    assert.notEqual(idA, idB, '两个问题不能是同一个记录');
+
+    // 答案必须对应各自的问题：用数据库核对问答内容
+    const db = new DatabaseSync(ctx.dbPath, { readOnly: true });
+    const rows = db
+      .prepare("SELECT id, question, answer, status FROM wd_question WHERE id IN (?, ?)")
+      .all(idA, idB) as { id: string; question: string; answer: string | null; status: string }[];
+    db.close();
+    assert.equal(rows.length, 2, '两个问题都要落库');
+    for (const row of rows) {
+      assert.equal(row.status, 'done', `问题 ${row.id} 应处理完成`);
+      assert.match(row.answer ?? '', /维护结论/, `问题 ${row.id} 应有答案`);
+    }
+    const first = rows.find((row) => row.id === idA)!;
+    assert.match(first.question, /问题一/, '答案必须对应正确的问题');
+
+    // 关键：真实并发从未超过 1
+    const { maxActive } = ctx.stats();
+    assert.equal(maxActive, 1, `维护会话的最大并发必须是 1（实际 ${maxActive}）`);
+  } finally {
+    resident?.kill('SIGTERM');
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    await ctx.close();
+  }
+});
+
+test('--answer 纯查询：不恢复作业、不启动模型、不新增维护动作', async () => {
+  const ctx = await makeEnv();
+  let resident: ChildProcess | null = null;
+  try {
+    resident = spawn(process.execPath, ['src/watchdog/main.ts'], { cwd: root, env: ctx.env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    resident.stdout?.on('data', (chunk: Buffer) => {
+      out += chunk.toString();
+    });
+    assert.ok(await waitFor(() => out.includes('Watchdog 启动'), 15_000), '维护者应启动');
+
+    // 预置：一条 running 的业务作业 + 一条 running 的维护作业
+    const db0 = new DatabaseSync(ctx.dbPath);
+    const now = new Date().toISOString();
+    const jobSql = `INSERT INTO process_job
+        (id, task_id, worker_id, command, args_json, cwd, pid, status, exit_code, signal, scope,
+         stdout_path, stderr_path, timeout_ms, started_at, ended_at)
+        VALUES (?, ?, ?, 'sleep', '["60"]', '.', ?, 'running', NULL, NULL, ?, '', '', 60000, ?, NULL)`;
+    db0.prepare(jobSql).run('job_biz', 'task_x', 'w_x', process.pid, 'biz', now);
+    db0.prepare(jobSql).run('job_wd', 'watchdog', 'watchdog', process.pid, 'watchdog', now);
+    const questionId = 'wdq_query_only';
+    db0
+      .prepare("INSERT INTO wd_question (id, question, status, asked_at) VALUES (?, ?, 'done', ?)")
+      .run(questionId, '历史上问过的问题', now);
+    db0.close();
+
+    const before = snapshot(ctx.dbPath);
+    const answer = await runCli(ctx.env, ['--answer', questionId], 30_000);
+    assert.equal(answer.code, 0, `查询应成功：${answer.out}`);
+    const after = snapshot(ctx.dbPath);
+
+    assert.deepEqual(after.jobs, before.jobs, '查询不能改动任何作业状态');
+    assert.equal(after.modelCalls, before.modelCalls, '查询不能触发模型调用');
+    assert.equal(after.actions, before.actions, '查询不能新增维护动作');
+    assert.equal(after.questions, before.questions, '查询不能改动问题记录');
+  } finally {
+    resident?.kill('SIGTERM');
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    await ctx.close();
+  }
+});
+
+function snapshot(dbPath: string): {
+  jobs: { id: string; status: string }[];
+  modelCalls: number;
+  actions: number;
+  questions: number;
+} {
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  const jobs = db.prepare('SELECT id, status FROM process_job ORDER BY id').all() as { id: string; status: string }[];
+  const modelCalls = (db.prepare('SELECT COUNT(*) AS c FROM model_call').get() as { c: number }).c;
+  const actions = (db.prepare('SELECT COUNT(*) AS c FROM wd_action').get() as { c: number }).c;
+  const questions = (db.prepare('SELECT COUNT(*) AS c FROM wd_question').get() as { c: number }).c;
+  db.close();
+  return { jobs, modelCalls, actions, questions };
+}
