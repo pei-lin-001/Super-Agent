@@ -136,12 +136,20 @@ if (!weixin.enabled) {
         }),
       });
       const body = (await response.json().catch(() => null)) as { ret?: number; errmsg?: string } | null;
-      add({
-        name: `微信账号 ${accountId} 令牌有效`,
-        ok: response.ok && (body?.ret ?? 1) === 0,
-        detail: response.ok ? `ret=${body?.ret ?? '?'} ${body?.errmsg ?? ''}`.trim() : `HTTP ${response.status}`,
-        fix: response.ok && (body?.ret ?? 1) === 0 ? undefined : '令牌可能已过期，重新扫码登录',
-      });
+      const ret = body?.ret ?? null;
+      // ret=-4（GetTypingTicket rpc failed）出现在还没有过一次对话时：
+      // 服务端接受了请求，只是没有会话上下文。只有 HTTP 层失败才判定凭据有问题，
+      // 其余非 0 一律如实说"无法判定"，不猜成"令牌过期"。
+      const httpOk = response.ok;
+      const verdict =
+        !httpOk
+          ? { ok: false, detail: `HTTP ${response.status}`, fix: '检查网络；WEIXIN_API_BASE 是否可访问' }
+          : ret === 0
+            ? { ok: true, detail: '令牌可用' }
+            : ret === -4
+              ? { ok: true, detail: `令牌可用；尚无会话上下文（ret=-4），发一条消息后才有` }
+              : { ok: false, detail: `服务端返回 ret=${ret} ${body?.errmsg ?? ''}`.trim(), fix: '无法判定：先用手机给机器人发一条消息再复查，仍失败则重新扫码' };
+      add({ name: `微信账号 ${accountId} 令牌`, ...verdict });
     } catch (error) {
       add({
         name: `微信账号 ${accountId} 令牌有效`,

@@ -254,6 +254,9 @@ export class Store {
     ensureColumn('channel_outbound', 'next_attempt_at', 'next_attempt_at TEXT');
     ensureColumn('router_turn', 'session_key', 'session_key TEXT');
     ensureColumn('router_session', 'session_key', 'session_key TEXT');
+    // 索引必须建在补列之后：老库里这两列还不存在，先建索引会直接报 no such column。
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_router_turn_session ON router_turn(session_key, created_at)');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_router_session_key ON router_session(session_key, status)');
     ensureColumn('wd_action', 'command_id', 'command_id TEXT');
     ensureColumn('model_call', 'instance_id', 'instance_id TEXT');
     ensureColumn('model_call', 'model_alias', 'model_alias TEXT');

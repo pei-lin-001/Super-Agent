@@ -49,6 +49,11 @@ async function main(): Promise<void> {
       if (status === 'wait') return;
     },
     askVerifyCode: async () => {
+      // 后台运行时没有可交互的终端：不要假装能收输入，直接说明要重跑。
+      if (!process.stdin.isTTY) {
+        console.log('需要输入手机验证码，但当前没有可交互终端；请在前台重跑本命令。');
+        return null;
+      }
       const code = await rl.question('手机微信上显示的数字：');
       return code.trim() === '' ? null : code.trim();
     },

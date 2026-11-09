@@ -129,7 +129,6 @@ CREATE TABLE IF NOT EXISTS router_turn (
   session_key TEXT,
   created_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_router_turn_session ON router_turn(session_key, created_at);
 
 CREATE TABLE IF NOT EXISTS worker_note (
   id           TEXT PRIMARY KEY,
@@ -159,7 +158,6 @@ CREATE TABLE IF NOT EXISTS router_session (
   updated_at   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_router_session_status ON router_session(status);
-CREATE INDEX IF NOT EXISTS idx_router_session_key ON router_session(session_key, status);
 
 -- ---- 渠道层：入站、游标、发件与渠道会话 ----
 CREATE TABLE IF NOT EXISTS channel_inbound (

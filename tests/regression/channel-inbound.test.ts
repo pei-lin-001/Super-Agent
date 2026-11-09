@@ -255,3 +255,48 @@ test('入站：同一账号重复注册会被拒绝，不能悄悄抢收消息',
     await harness.cleanup();
   }
 });
+
+test('升级：老库没有 session_key 列时能正常迁移，不会在启动时炸', async () => {
+  const { DatabaseSync } = await import('node:sqlite');
+  type DbHandle = InstanceType<typeof DatabaseSync>;
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { Store } = await import('../../src/storage/store.ts');
+
+  const dir = await mkdtemp(join(tmpdir(), 'super-agent-migrate-'));
+  const dbPath = join(dir, 'old.db');
+  // 造一个「接入渠道之前」的库形状：这两张表还没有 session_key 列，也没有对应索引。
+  const raw = new DatabaseSync(dbPath);
+  raw.exec(`
+    CREATE TABLE router_turn (
+      id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL,
+      content TEXT, tool_name TEXT, created_at TEXT NOT NULL
+    );
+    CREATE TABLE router_session (
+      id TEXT PRIMARY KEY, status TEXT NOT NULL, outcome TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+  `);
+  raw.close();
+
+  try {
+    const store = new Store(dbPath);
+    // 迁移后的列可用：能按会话键查历史
+    const columns = (store as unknown as { db: DbHandle }).db
+      .prepare('PRAGMA table_info(router_turn)')
+      .all() as { name: string }[];
+    assert.ok(columns.some((item) => item.name === 'session_key'), 'session_key 应被补上');
+    const indexes = (store as unknown as { db: DbHandle }).db
+      .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_router_%'")
+      .all() as { name: string }[];
+    assert.ok(
+      indexes.some((item) => item.name === 'idx_router_turn_session'),
+      '补列之后才建索引，不能在建索引阶段报 no such column',
+    );
+    assert.deepEqual(store.listRouterTurns(5, 'telegram|bot|1'), []);
+    store.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
