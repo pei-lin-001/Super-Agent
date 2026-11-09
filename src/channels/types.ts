@@ -127,6 +127,7 @@ export class ChannelAuthError extends Error {
  * 微信对端回复上下文的存储。
  *
  * 这是渠道私有状态：只在适配器发送时读写，不进入模型提示词，也不进调用转储。
+ * 写入时机在收到消息那一刻——那时渠道会话可能还没建，所以实现必须能自己建。
  */
 export interface ContextTokenStore {
   get(sessionKey: string): string | null;

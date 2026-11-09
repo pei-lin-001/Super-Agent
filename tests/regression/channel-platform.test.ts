@@ -427,3 +427,79 @@ test('微信：下载文件用服务端给的地址和解密键', async () => {
   assert.deepEqual(decryptAesEcb(encrypted, parseAesKey(asHexBase64)), plain);
   await cleanup();
 });
+
+test('微信：经完整渠道服务跑一轮，回复带回该会话的 context_token', async () => {
+  const { createHarness } = await import('../helpers.ts');
+  const { ChannelService } = await import('../../src/channels/service.ts');
+  const { createContextTokenStore } = await import('../../src/channels/bootstrap.ts');
+  const { mockReply } = await import('../../src/model/mock.ts');
+
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    router: () => mockReply({ text: '回你一句' }),
+  });
+  const sent: { context_token?: string; to?: string }[] = [];
+  const fetchImpl = (async (url: string | URL, init?: RequestInit) => {
+    const target = String(url);
+    if (target.includes('getupdates')) {
+      return jsonResponse({
+        ret: 0,
+        get_updates_buf: 'buf-1',
+        msgs: [
+          {
+            message_id: 55,
+            from_user_id: 'wxid_owner',
+            message_type: 1,
+            context_token: 'ct-REAL',
+            item_list: [{ type: 1, text_item: { text: '你好' } }],
+          },
+        ],
+      });
+    }
+    if (target.includes('sendmessage')) {
+      const payload = JSON.parse(String(init?.body ?? '{}')) as { msg?: { context_token?: string; to_user_id?: string } };
+      sent.push({ context_token: payload.msg?.context_token, to: payload.msg?.to_user_id });
+      return jsonResponse({ ret: 0 });
+    }
+    return jsonResponse({ ret: 0 });
+  }) as unknown as typeof fetch;
+
+  const service = new ChannelService({ runtime: harness.runtime, store: harness.store, config: harness.config });
+  service.register(
+    new WeixinAdapter({
+      credentials: {
+        botToken: 'wx-token',
+        ilinkBotId: 'bot_abc',
+        baseUrl: 'http://127.0.0.1:9',
+        cdnBaseUrl: 'http://127.0.0.1:9/c2c',
+        ownerUserId: 'wxid_owner',
+        savedAt: new Date().toISOString(),
+      },
+      ownerIds: [],
+      workDir: harness.config.workDir,
+      pollTimeoutMs: 500,
+      maxInboundBytes: 1024,
+      contextTokens: createContextTokenStore(harness.store),
+      fetchImpl,
+    }),
+  );
+  service.start();
+  try {
+    await service.tick();
+    await service.waitForIdle(6_000);
+    await service.drainOutbound();
+
+    const sessionKey = 'weixin|bot_abc|wxid_owner';
+    assert.equal(
+      harness.store.getChannelSession(sessionKey)?.contextToken,
+      'ct-REAL',
+      '入站那一刻就要把回复上下文存下来，不能因为会话行还不存在就丢掉',
+    );
+    assert.ok(sent.length > 0, '应有回复发出');
+    assert.equal(sent[0]!.context_token, 'ct-REAL', '回复必须带上该会话的 context_token');
+    assert.equal(sent[0]!.to, 'wxid_owner');
+  } finally {
+    await service.stop();
+    await harness.cleanup();
+  }
+});

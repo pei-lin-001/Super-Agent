@@ -76,6 +76,7 @@ Router 回复 / send_file
 
 - 会话键格式：`encodeURIComponent(channel)|encodeURIComponent(accountId)|encodeURIComponent(peerId)[|thread:<id>]`。
 - 主人身份：`TELEGRAM_OWNER_IDS` / `WEIXIN_OWNER_IDS`；微信未显式配置时用扫码返回的 `ilink_user_id`。两者都没有 = 未绑定，任何消息都不执行。
+- 微信回复上下文：收到消息那一刻就把 `context_token` 写进 `channel_session`（会话行不存在时由渠道自己建），发送时带回。它不进入模型提示词，也不出现在调用转储里。
 - 跨会话权限：`read_task` / `send_file` 只能操作本会话任务。跨会话只允许同一主人用明确任务号查询，模型改不了归属。
 - 群聊、频道消息、编辑消息不在本轮范围：消息仍落库留痕（`channel_inbound` 里可查原因），但不进执行流程，**也不在群里回话**。Telegram 适配器把非私聊标记为 `silent`，回信环节直接跳过。
 
@@ -155,6 +156,7 @@ pnpm test
 | 登录失效 | 停止轮询、保留结果、不忙重试 |
 | 群聊消息 | 只留痕：不调模型、不回话，游标照常前移 |
 | 等待重试期间 | 未到 `next_attempt_at` 的记录不重发 |
+| 微信一轮完整收发 | 回复带回该会话的 `context_token`（会话行不存在也要先存下来） |
 | 聊天发文件 → 建任务 | 材料复制进 `materials/`，任务说明写明路径与指纹，且只被认领一次 |
 | 未启用 IM | 装配返回 null，行为不变 |
 

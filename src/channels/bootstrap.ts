@@ -9,16 +9,28 @@ import type { Store } from '../storage/store.ts';
 import { ChannelService } from './service.ts';
 import { TelegramAdapter } from './telegram.ts';
 import { WeixinAdapter, WeixinCredentialStore } from './weixin.ts';
-import type { ChannelAdapter, ContextTokenStore } from './types.ts';
+import { parseSessionKey, type ChannelAdapter, type ContextTokenStore } from './types.ts';
 import { join } from 'node:path';
 
-/** 用渠道会话表当 context_token 的存取点。 */
-function tokenStoreOf(store: Store): ContextTokenStore {
+/**
+ * 用渠道会话表当 context_token 的存取点。
+ *
+ * 入站那一刻会话行往往还不存在：不能因为"没有行"就把令牌丢掉，
+ * 否则回复时会缺上下文。这里按会话键自己把行建出来。
+ */
+export function createContextTokenStore(store: Store): ContextTokenStore {
   return {
     get: (sessionKey) => store.getChannelSession(sessionKey)?.contextToken ?? null,
     set: (sessionKey, token) => {
-      const session = store.getChannelSession(sessionKey);
-      if (!session) return;
+      const identity = parseSessionKey(sessionKey);
+      if (!identity) return;
+      store.upsertChannelSession({
+        sessionKey,
+        channel: identity.channel,
+        accountId: identity.accountId,
+        peerId: identity.peerId,
+        touch: 'inbound',
+      });
       store.setChannelContextToken(sessionKey, token);
     },
   };
@@ -85,7 +97,7 @@ export function createChannelService(options: {
         workDir: config.workDir,
         pollTimeoutMs: config.channels.pollTimeoutMs,
         maxInboundBytes: config.channels.maxInboundBytes,
-        contextTokens: tokenStoreOf(store),
+        contextTokens: createContextTokenStore(store),
       });
       adapters.push(adapter);
       const owners = adapter.ownerIds();
