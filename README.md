@@ -318,6 +318,17 @@ Router：`create_task` `send_to_worker` `stop_task` `list_tasks` `read_task`。
 
 ### 工具链的真实端到端验收
 
+> **两件事不要混在一起说**：`scripts/smoke-toolkit.ts` **不启动 Watchdog**。
+> 它验证的是「Worker 与协作者自己能不能把活干完」；Watchdog 的纠偏效果由
+> `scripts/accept-maintenance.ts` 单独验证，判据必须同时绑定**同一个问题**、
+> **命令回执**和**业务侧真实改善**，三者缺一不可（反例见 `accept-maintenance-negative.ts`）。
+
+工具链验收的初始实现**确实是坏的**：脚本在把项目交给模型之前，先在任务目录里跑一次
+`python3 -m pytest`，断言退出码非零并打印失败用例；如果初始实现已经能通过，脚本直接以非零退出——
+否则「修 bug」只是走过场。当前基线是 `2 failed, 2 passed`，缺陷写在代码注释的约定里
+（价格必须为正、返回值保留两位小数），修复要求写在 `done_criteria` 里，不需要模型自己发明要求。
+
+
 `pnpm smoke:toolkit`（`scripts/smoke-toolkit.ts`，场景 A：小型代码维护）会造一个带失败测试的小项目，
 让真实模型自己跑测试、定位、改文件、复跑、拉协作者检查、登记真实文件、提交。
 
