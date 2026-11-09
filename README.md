@@ -74,6 +74,10 @@ Message{ id, groupId, taskId?, fromKind, fromId, toKind, toId, kind, body, paylo
 ```
 Task:    pending → active ⇄ waiting → completed | failed | cancelled
 Worker:  idle → running ⇄ waiting → done | failed | cancelled
+
+停机与取消是两件事：`runtime.stop()` 取消在途请求，任务保持可恢复状态、不判失败；
+用户主动取消任务才进入 `cancelled`。任务终结后，仍在执行的协作者会被收敛为 `cancelled`
+并写明「任务已完成，协作终止」，不会伪装成 `done`。
 Message: queued → delivered → consumed
                   ↘ failed / expired
 ```
@@ -462,6 +466,7 @@ rollback_override key=worker.check_rules version=1
 |---|---|
 | `purpose` | router / worker / note / watchdog / context |
 | `status` | running / ok / failed / cancelled / interrupted |
+| `error` | 失败原因或取消原因；`cancelled` 时说明是停机还是任务取消 |
 | `usage_known` | 0 表示提供方没给 usage（**未知，不是 0**） |
 | `http_attempts` | 与重试次数分开计数 |
 
@@ -532,11 +537,12 @@ REPL 命令：
 
 ```bash
 pnpm typecheck                              # 类型检查
-pnpm test                                   # 101 个测试
+pnpm test                                   # 117 个测试
 node scripts/accept-crash.ts                # 崩溃恢复（真实杀进程 → 维护者拉起 → 业务完成）
 node scripts/accept-router-real.ts          # 真实模型：小额度跨多轮协调
 node scripts/accept-watchdog-real.ts        # 真实模型：常驻维护者回答问题
-node scripts/accept-maintenance.ts          # 维护闭环四阶段（本地受控模型），全部使用临时目录与模拟模型
+node scripts/accept-maintenance.ts          # 维护闭环：同一问题从记录到关闭（本地受控模型）
+node scripts/accept-maintenance-negative.ts # 反例：命令执行成功但业务未改善，问题保持未解决，全部使用临时目录与模拟模型
 pnpm smoke:mini                             # 真实模型最小链路
 pnpm smoke:real                             # 真实模型综合协作场景
 node scripts/verify-run.ts <db> [taskId]    # 对已有运行记录重新做严格判定，不调用模型
