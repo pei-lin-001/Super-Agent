@@ -77,7 +77,6 @@ export function testConfig(dir: string, overrides: Partial<Limits> = {}): Config
     workDir: join(dir, 'work'),
     materialsDir: join(dir, 'work', 'materials'),
     readRoot: dir,
-    workerLoop: 'pi',
     limits: { ...BASE_LIMITS, ...overrides },
   };
 }
@@ -98,7 +97,6 @@ export async function createHarness(options: {
 
   const config: Config = {
     readRoot: dir,
-    workerLoop: 'pi',
     provider: 'mock',
     baseUrl: 'http://127.0.0.1:0/v1',
     apiKey: 'test-key',

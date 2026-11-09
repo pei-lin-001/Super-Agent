@@ -1455,7 +1455,7 @@ export class Runtime implements ToolHost {
     const execution = new Execution(`worker:${workerId}`);
     this.runs.set(workerId, execution);
     try {
-      await execution.run(() => this.runWorkerBody(workerId, execution));
+      await execution.run(() => this.runWorkerBody(workerId));
     } catch (error) {
       if (error instanceof ExecutionRevoked || !execution.active) {
         // 执行已经被撤销（停机 / 任务终结 / 代次失效）：
@@ -1468,179 +1468,14 @@ export class Runtime implements ToolHost {
     }
   }
 
-  private async runWorkerBody(workerId: string, execution: Execution): Promise<void> {
-    if (this.config.workerLoop === 'pi') {
-      await this.runWorkerBodyPi(workerId, execution);
-      return;
-    }
-    const dbg = (m: string): void => {
-      if (process.env['DEBUG_RUN']) console.error(`[run:${workerId}] ${m}`);
-    };
-    dbg('enter');
-    let worker = this.store.getWorker(workerId);
-    if (!worker || isTerminalWorker(worker.status)) return;
-    let task = this.store.getTaskByGroup(worker.groupId);
-    if (!task) {
-      await this.failWorker(workerId, '任务不存在');
-      return;
-    }
-    if (isTerminalTask(task.status)) {
-      this.store.setWorkerStatus(workerId, 'cancelled', '任务已结束');
-      return;
-    }
-
-    this.store.setWorkerStatus(workerId, 'running');
-    this.emit({ type: 'worker.status', workerId, status: 'running' });
-
-    let nudges = 0;
-
-    // 本轮执行的代次：暂停、取消、恢复都会推进它，旧响应因此失去资格。
-    const epoch = this.store.getWorker(workerId)?.runEpoch ?? 0;
-    const runController = this.runs.get(workerId);
-    const stale = (): boolean => {
-      const current = this.store.getWorker(workerId);
-      if (!current) return true;
-      return (current.runEpoch ?? 0) !== epoch;
-    };
-
-    for (let stepIndex = 0; stepIndex < this.config.limits.maxStepsPerRun; stepIndex += 1) {
-      const gate = this.canRun(workerId, epoch);
-      if (!gate.ok) {
-        this.store.appendEvent(task.id, workerId, 'run.stale', `第 ${stepIndex} 步前停止：${gate.reason}`);
-        this.settleWorker(workerId, gate.reason);
-        return;
-      }
-      worker = this.store.getWorker(workerId)!;
-      task = this.store.getTaskByGroup(worker.groupId)!;
-      if (isTerminalTask(task.status)) {
-        this.store.setWorkerStatus(workerId, 'cancelled', `任务已 ${task.status}`);
-        return;
-      }
-      // 累计调用不再作为失败条件。阈值 >0 时只记录一次预算事件，任务继续推进。
-      this.noteBudget(worker, task);
-
-      this.ensureOpeningTurn(workerId);
-      const inbox = this.store.listInbox(workerId);
-      if (inbox.length > 0) {
-        // 先落入历史再标记已读：模型后续步骤仍能看到消息原文与编号。
-        this.recordInboxTurn(workerId, inbox);
-        for (const message of inbox) this.markConsumed(message.id);
-      }
-      dbg('before build');
-      const messages = await this.buildWorkerMessages(worker, task);
-      dbg(`after build (${messages.length})`);
-      // 上下文准备是异步的：发请求前再核一次资格，避免准备期间被暂停或停机。
-      const beforeRequest = this.canRun(workerId, epoch);
-      if (!beforeRequest.ok) {
-        this.store.appendEvent(task.id, workerId, 'run.stale', `准备完成后停止：${beforeRequest.reason}`);
-        this.settleWorker(workerId, beforeRequest.reason);
-        return;
-      }
-      dbg(`request model closed=${this.store.isClosed}`);
-      // 按 Worker 记录的模型别名解析：别名决定客户端与请求模型，二者必须一致。
-      const resolved = this.models.resolve(worker.model ?? this.config.defaultModelAlias);
-      const result = await execution.attach(
-        new RecordingModel(resolved.client, this.store, 'worker', {
-          taskId: task.id,
-          workerId,
-          modelAlias: resolved.alias,
-        }).chat({
-          model: resolved.model,
-          messages,
-          tools: this.tools.schemas(),
-          reasoningEffort: this.config.reasoningEffort,
-          signal: runController?.signal ?? null,
-        }),
-      );
-
-      dbg('model returned');
-      const afterModel = this.canRun(workerId, epoch);
-      if (!afterModel.ok) {
-        this.store.appendEvent(task.id, workerId, 'run.stale', `模型响应返回后停止：${afterModel.reason}`);
-        this.recordStaleResult(worker, result, afterModel.reason);
-        this.settleWorker(workerId, afterModel.reason);
-        return;
-      }
-      this.store.bumpWorkerStep(workerId);
-      this.recordAssistantTurn(worker, result);
-
-      if (result.toolCalls.length === 0) {
-        if (task.ownerWorkerId === workerId) {
-          nudges += 1;
-          if (nudges > this.config.limits.maxNudges && nudges === this.config.limits.maxNudges + 1) {
-            // 纯文本不等于完成，但也不等于失败：留下诊断信号，交给维护机制判断。
-            this.store.appendEvent(task.id, workerId, 'worker.text_only', `连续 ${nudges} 次只输出文本未调用工具`);
-          }
-          this.pushSystemNotice(workerId, '你还没有调用 submit_result。工作若已完成，请先 artifact_save 保存产物再提交；否则继续推进。');
-          continue;
-        }
-        this.store.setWorkerStatus(workerId, 'waiting');
-        this.emit({ type: 'worker.status', workerId, status: 'waiting' });
-        return;
-      }
-
-      for (let index = 0; index < result.toolCalls.length; index += 1) {
-        const call = result.toolCalls[index]!;
-        const beforeTool = this.canRun(workerId, epoch);
-        if (!beforeTool.ok) {
-          this.recordUnexecuted(worker, result.toolCalls.slice(index), `${beforeTool.reason}，剩余调用未执行`);
-          this.settleWorker(workerId, beforeTool.reason);
-          return;
-        }
-        const currentTask = this.store.getTaskByGroup(worker.groupId);
-        if (currentTask && Number(currentTask.maintenance ?? 0) === 1) {
-          this.recordUnexecuted(worker, result.toolCalls.slice(index), '任务处于维护挂起，剩余调用未执行');
-          this.store.setWorkerStatus(workerId, 'waiting');
-          return;
-        }
-        if (!currentTask || isTerminalTask(currentTask.status)) {
-          this.recordUnexecuted(worker, result.toolCalls.slice(index), '任务已结束，剩余调用未执行');
-          this.store.setWorkerStatus(workerId, 'cancelled', '任务已结束');
-          return;
-        }
-        const outcome = await this.tools.execute(call.name, call.arguments, this.toolContext(workerId));
-        this.recordToolTurn(worker, call, outcome.content);
-        if (outcome.type === 'wait' || outcome.type === 'finish') {
-          // 一批调用里只执行到一半就挂起时，剩下的调用必须留下明确记录，
-          // 否则对话里会出现没有结果的 tool_call，严格校验的端点会直接拒绝请求。
-          const rest = result.toolCalls.slice(index + 1);
-          if (rest.length > 0) {
-            this.recordUnexecuted(
-              worker,
-              rest,
-              outcome.type === 'wait' ? '本次运行因等待而提前结束，该调用未执行' : '本次运行因提交/停止而结束，该调用未执行',
-            );
-          }
-        }
-        if (outcome.type === 'wait') {
-          this.store.setWorkerStatus(workerId, 'waiting');
-          this.emit({ type: 'worker.status', workerId, status: 'waiting' });
-          this.checkGroupDeadlock(worker.groupId);
-          return;
-        }
-        if (outcome.type === 'finish') {
-          return;
-        }
-      }
-    }
-
-    // 单轮步数用完但整体预算还在：转回 queued 并请求下一轮。
-    const current = this.store.getWorker(workerId);
-    if (current && current.status === 'running') {
-      this.store.setWorkerStatus(workerId, 'queued');
-      this.emit({ type: 'worker.status', workerId, status: 'queued' });
-      this.enqueue(workerId);
-    }
-  }
-
   /**
-   * pi agent-loop 驱动的 Worker 调度。
+   * Worker 的一次调度。
    *
-   * 循环、工具批处理、步数截断后的工具作废都交给 pi 的 agent-loop（见 src/vendor/pi）；
-   * epoch 撤销、收件箱、步数计量、落库、等待/提交的终态仍然由这里决定——
-   * 「模型表达意图，程序决定事实」不因为换了循环而改变。
+   * 循环、工具批处理、输出被上限截断时的工具作废都交给 pi 的 agent-loop
+   * （见 src/vendor/pi）；epoch 撤销、收件箱、步数计量、落库、等待/提交的终态
+   * 仍然由这里决定——「模型表达意图，程序决定事实」不因为换了循环而改变。
    */
-  private async runWorkerBodyPi(workerId: string, execution: Execution): Promise<void> {
+  private async runWorkerBody(workerId: string): Promise<void> {
     let worker = this.store.getWorker(workerId);
     if (!worker || isTerminalWorker(worker.status)) return;
     let task = this.store.getTaskByGroup(worker.groupId);
