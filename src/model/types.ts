@@ -71,6 +71,8 @@ export class ModelError extends Error {
   /** true 表示提供方暂时不可用（例如模型正在装载），稍后可重试。 */
   readonly retryable: boolean;
   readonly kind: ModelErrorKind;
+  /** 这次调用真实发出的 HTTP 请求数；失败路径同样要带上，否则记账会落成 NULL。 */
+  httpAttempts: number | null = null;
 
   constructor(
     message: string,
@@ -80,6 +82,7 @@ export class ModelError extends Error {
       cause?: unknown;
       retryable?: boolean;
       kind?: ModelErrorKind;
+      httpAttempts?: number | null;
     } = {},
   ) {
     super(message, options.cause !== undefined ? { cause: options.cause } : undefined);
@@ -88,10 +91,18 @@ export class ModelError extends Error {
     this.body = options.body ?? null;
     this.retryable = options.retryable ?? false;
     this.kind = options.kind ?? 'unknown';
+    this.httpAttempts = options.httpAttempts ?? null;
   }
 
   /** 被本地取消：业务层应退出执行过程，而不是把它当成失败。 */
   get isCancelled(): boolean {
     return this.kind === 'cancelled';
   }
+}
+
+/** 给错误补上本次真实发出的请求数；已经有值就不覆盖。 */
+export function withAttempts(error: ModelError, attempts: number): ModelError {
+  if (error.httpAttempts !== null) return error;
+  error.httpAttempts = attempts;
+  return error;
 }

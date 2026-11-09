@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import type { Store } from '../storage/store.ts';
 import { outsideRevocation } from '../runtime/execution.ts';
+import { ModelError } from './types.ts';
 import type { ChatRequest, ModelClient, StepResult } from './types.ts';
 
 export type CallPurpose = 'router' | 'worker' | 'note' | 'watchdog' | 'context';
@@ -42,8 +43,10 @@ export class RecordingModel implements ModelClient {
       outsideRevocation(() => {
         this.store.startModelCall({ id, purpose: this.purpose, model: request.model, ...this.scope });
       });
-    } catch {
-      // 记账失败不能影响业务调用。
+    } catch (error) {
+      // 记账失败不能影响业务调用，但必须留下明确诊断：
+      // 静默漏记会让"调用次数"永久对不上，事后无从追查。
+      console.warn(`[记账] 开始记录调用 ${id} 失败，本次调用不会被统计：${(error as Error).message}`);
       return this.inner.chat(request);
     }
     try {
@@ -58,12 +61,14 @@ export class RecordingModel implements ModelClient {
       return result;
     } catch (error) {
       const message = (error as Error).message;
-      const cancelled = (error as Error).name === 'AbortError' || /abort|cancel|取消/i.test(message);
+      // 只看结构化类别：错误文字里出现 cancel 不代表这是本地取消。
+      const cancelled =
+        error instanceof ModelError ? error.kind === 'cancelled' : (error as Error).name === 'AbortError';
       this.safeFinish({
         id,
         status: cancelled ? 'cancelled' : 'failed',
         usage: null,
-        httpAttempts: ((error as { httpAttempts?: number }).httpAttempts ?? null) as number | null,
+        httpAttempts: error instanceof ModelError ? error.httpAttempts : null,
         error: message,
       });
       throw error;

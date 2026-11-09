@@ -1,4 +1,4 @@
-import { ModelError, type ChatMessage, type ChatRequest, type ModelClient, type StepResult, type ToolCall } from './types.ts';
+import { ModelError, withAttempts, type ChatMessage, type ChatRequest, type ModelClient, type StepResult, type ToolCall } from './types.ts';
 
 export interface OpenAICompatibleOptions {
   baseUrl: string;
@@ -165,7 +165,7 @@ export class OpenAICompatibleModel implements ModelClient {
       await gate.acquire();
       if (request.signal?.aborted === true) {
         gate.release();
-        throw new ModelError('模型调用已被本地取消', { kind: 'cancelled', retryable: false });
+        throw new ModelError('模型调用已被本地取消', { kind: 'cancelled', retryable: false, httpAttempts: callAttempts });
       }
       callAttempts += 1;
       try {
@@ -266,9 +266,15 @@ export class OpenAICompatibleModel implements ModelClient {
         // 用函数读取，避免 TS 把前面的检查当成已收窄的字面量类型。
         const abortedNow = (): boolean => request.signal?.aborted === true;
         if (abortedNow() || (error instanceof Error && error.name === 'AbortError')) {
-          throw new ModelError('模型调用已被本地取消', { kind: 'cancelled', cause: error, retryable: false });
+          throw new ModelError('模型调用已被本地取消', {
+            kind: 'cancelled',
+            cause: error,
+            retryable: false,
+            httpAttempts: callAttempts,
+          });
         }
-        if (error instanceof ModelError) throw error;
+        // 失败路径同样要带上本次实际发出的请求数，否则记账层只能落成 NULL。
+        if (error instanceof ModelError) throw withAttempts(error, callAttempts);
         const isTimeout = error instanceof Error && error.name === 'TimeoutError';
         const isNetwork = error instanceof TypeError;
         if ((isTimeout || isNetwork) && attempt < maxAttempts - 1) {
@@ -285,6 +291,7 @@ export class OpenAICompatibleModel implements ModelClient {
             body: null,
             cause: error,
             kind: isTimeout ? 'timeout' : isNetwork ? 'network' : 'unknown',
+            httpAttempts: callAttempts,
           },
         );
       } finally {
@@ -292,7 +299,9 @@ export class OpenAICompatibleModel implements ModelClient {
       }
     }
 
-    throw lastError instanceof ModelError ? lastError : new ModelError('模型调用重试耗尽', { cause: lastError });
+    throw lastError instanceof ModelError
+      ? withAttempts(lastError, callAttempts)
+      : new ModelError('模型调用重试耗尽', { cause: lastError, httpAttempts: callAttempts });
   }
 
   /** 退避等待也要响应取消：已经取消的调用不能继续重试。 */
