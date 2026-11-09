@@ -4,7 +4,7 @@ import { outsideRevocation } from '../runtime/execution.ts';
 import { ModelError } from './types.ts';
 import type { ChatRequest, ModelClient, StepResult } from './types.ts';
 
-export type CallPurpose = 'router' | 'worker' | 'note' | 'watchdog' | 'context';
+export type CallPurpose = 'router' | 'worker' | 'note' | 'router-note' | 'watchdog' | 'context';
 
 /**
  * 模型调用的独立记账。

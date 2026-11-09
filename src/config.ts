@@ -35,6 +35,14 @@ export interface Limits {
   contextWindowChars: number;
   /** 组装后允许的额外配对扩展量。 */
   pairingOvershootChars: number;
+  /** 模型上下文窗口（token）。按它算 Router 的压缩阈值。 */
+  contextWindowTokens: number;
+  /** Router 触发压缩前预留的 token。 */
+  routerReserveTokens: number;
+  /** Router 压缩后保留的近期对话 token（越大约不常压缩、越贵）。 */
+  routerKeepRecentTokens: number;
+  /** Router 摘要长度上限（字符）。 */
+  routerNoteMaxChars: number;
   /** 触发一次整理所需的新增历史条数与字符数，两者同时满足。 */
   noteTriggerTurns: number;
   noteTriggerChars: number;
@@ -288,6 +296,12 @@ export function loadConfig(options: { requireModel?: boolean } = {}): Config {
       watchdogIntervalMs: intEnv('WATCHDOG_INTERVAL_MS', 60_000),
       contextWindowChars: intEnv('CONTEXT_WINDOW_CHARS', 200_000),
       pairingOvershootChars: intEnv('CONTEXT_PAIRING_OVERSHOOT_CHARS', 8_000),
+      // Router 的压缩阈值取 min(窗口-reserve, 窗口*0.75)：窗口越大，前者越接近窗口本身，
+      // 于是永不触发。200k 窗口下阈值 150k，留 50k 给任务卡、待处理消息和输出。
+      contextWindowTokens: intEnv('CONTEXT_WINDOW_TOKENS', 200_000),
+      routerReserveTokens: intEnv('ROUTER_RESERVE_TOKENS', 16_384),
+      routerKeepRecentTokens: intEnv('ROUTER_KEEP_RECENT_TOKENS', 40_000),
+      routerNoteMaxChars: intEnv('ROUTER_NOTE_MAX_CHARS', 6_000),
       noteTriggerTurns: intEnv('NOTE_TRIGGER_TURNS', 10),
       noteTriggerChars: intEnv('NOTE_TRIGGER_CHARS', 3_000),
       noteMaxChars: intEnv('NOTE_MAX_CHARS', 10_000),

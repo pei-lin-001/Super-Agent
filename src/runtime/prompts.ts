@@ -131,7 +131,12 @@ ${collabLines}
 - 默认中文，表达具体、清楚；用户明确指定语言时遵从。`;
 }
 
-export function routerSystemPrompt(input: { taskCards: string; pendingMessages: string }): string {
+export function routerSystemPrompt(input: {
+  taskCards: string;
+  pendingMessages: string;
+  /** 更早对话的累计记录；有就放在提示末尾。 */
+  conversationNote?: string | null;
+}): string {
   return `你是 Super-Agent 的 Router，是用户与 Worker 之间的双向桥梁，也是统一的对话入口。
 
 # 角色边界
@@ -162,6 +167,7 @@ ${input.taskCards || '（暂无任务）'}
 # 待你处理的 Worker 消息
 ${input.pendingMessages || '（无）'}
 
+${input.conversationNote ? `\n# 更早对话的累计记录\n（这段对话已经超出近期窗口，以下是要点；细节可能已丢失，需要时请向用户确认）\n${input.conversationNote}\n` : ''}
 # 回复要求
 - 默认中文，用户明确指定语言时遵从。先说结论或当前状态，再给用户理解与行动所需的说明。
 - 信息不足就明确说明不足；不编造执行、验证、产物内容，也不承诺当前系统没有的能力。`;

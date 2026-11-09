@@ -159,6 +159,22 @@ CREATE TABLE IF NOT EXISTS router_session (
 );
 CREATE INDEX IF NOT EXISTS idx_router_session_status ON router_session(status);
 
+-- Router 的对话摘要：按话题维护一份累计记录，替代"只留最近 N 条"的硬截断。
+-- 结构对齐 worker_note，covered_seq 是水位线（router_turn.seq）。
+CREATE TABLE IF NOT EXISTS router_note (
+  id           TEXT PRIMARY KEY,
+  session_key  TEXT,
+  conversation_id TEXT,
+  from_seq     INTEGER NOT NULL,
+  to_seq       INTEGER NOT NULL,
+  covered_seq  INTEGER NOT NULL,
+  content      TEXT NOT NULL,
+  source_turns INTEGER NOT NULL,
+  source_chars INTEGER NOT NULL,
+  created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_router_note_conversation ON router_note(conversation_id, created_at);
+
 -- ---- 渠道层：入站、游标、发件与渠道会话 ----
 CREATE TABLE IF NOT EXISTS channel_inbound (
   id                  TEXT PRIMARY KEY,

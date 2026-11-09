@@ -10,6 +10,7 @@ import type { Runtime } from './runtime.ts';
 import { Execution, ExecutionRevoked } from './execution.ts';
 
 import { routerSystemPrompt, taskCardLine } from './prompts.ts';
+import { boundRouterHistory, planRouterContext, runRouterNote } from './router-context.ts';
 
 const ROUTER_TOOLS: ToolSchema[] = [
   {
@@ -366,21 +367,49 @@ export class Router {
       .join('\n');
 
     // 历史只从参数来：不再读共享字段，避免前后两个执行互相看到对方的上下文。
-    const history =
-      context.history ??
-      this.runtime.store
-        .listRouterTurns(20, sessionKey, conversationId)
-        .map((turn): ChatMessage => ({ role: turn.role, content: turn.content }));
+    //
+    // 正常轮按 token 预算装配（超出触发摘要）；续接轮沿用会话里保存的中途消息，
+    // 但走同一个预算裁剪——否则「崩溃恢复那一刻」才第一次爆窗口。
+    const assembled = context.history ? null : planRouterContext({
+      store: this.runtime.store,
+      sessionKey,
+      conversationId,
+      limits: this.runtime.config.limits,
+    });
+    const history = context.history
+      ? boundRouterHistory({ messages: context.history, limits: this.runtime.config.limits })
+      : (assembled?.history ?? []);
     const messages: ChatMessage[] = [
       {
         role: 'system',
         content: routerSystemPrompt({
           taskCards: this.renderTaskCards(sessionKey, conversationId),
           pendingMessages: pending,
+          conversationNote: assembled?.note ?? null,
         }),
       },
       ...history,
     ];
+
+    if (assembled?.toSummarize) {
+      // 超阈值：先把被挤出去的旧对话压进摘要，再发请求。
+      // 失败不阻断——旧摘要继续生效，窗口里少几条旧对话也比整轮失败好。
+      const note = await runRouterNote({
+        store: this.runtime.store,
+        model: this.model,
+        modelName: this.runtime.config.routerModel,
+        sessionKey,
+        conversationId,
+        previous: assembled.note,
+        turns: assembled.toSummarize.turns,
+        limits: this.runtime.config.limits,
+      });
+      if (note.ok && note.content) {
+        messages.push({ role: 'system', content: `# 更早对话的累计记录\n${note.content}` });
+      } else {
+        this.runtime.store.appendEvent(null, null, 'router.note_failed', note.reason ?? '摘要生成失败');
+      }
+    }
 
     if (userText !== null) {
       messages.push({ role: 'user', content: userText });

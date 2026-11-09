@@ -270,6 +270,18 @@ export class Store {
     // 话题归属：老记录为 NULL，按"本聊天任何话题都可见"处理（见 router 的 visibleTo）。
     ensureColumn('channel_session', 'current_conversation_id', 'current_conversation_id TEXT');
     ensureColumn('router_turn', 'conversation_id', 'conversation_id TEXT');
+    // 稳定水位线：router_turn 原来只有 created_at，同一毫秒的多条无法确定先后。
+    ensureColumn('router_turn', 'seq', 'seq INTEGER');
+    // 老记录按 (created_at, rowid) 回填序号，只在缺失时补，可重复执行。
+    this.db.exec(`
+      UPDATE router_turn
+         SET seq = (
+           SELECT COUNT(*) FROM router_turn r2
+            WHERE (r2.created_at < router_turn.created_at)
+               OR (r2.created_at = router_turn.created_at AND r2.rowid <= router_turn.rowid)
+         )
+       WHERE seq IS NULL
+    `);
     ensureColumn('router_session', 'conversation_id', 'conversation_id TEXT');
     ensureColumn('task', 'source_conversation_id', 'source_conversation_id TEXT');
     // 索引必须建在补列之后：老库里这两列还不存在，先建索引会直接报 no such column。
@@ -993,7 +1005,7 @@ export class Store {
 
   startModelCall(input: {
     id: string;
-    purpose: 'router' | 'worker' | 'note' | 'watchdog' | 'context';
+    purpose: 'router' | 'worker' | 'note' | 'router-note' | 'watchdog' | 'context';
     model: string;
     taskId?: string | null;
     workerId?: string | null;
@@ -1510,9 +1522,78 @@ export class Store {
   }
 
   appendRouterTurn(turn: RouterTurn & { sessionKey?: string | null; conversationId?: string | null }): void {
+    // seq 是单调水位线，压缩时用它记住"摘要覆盖到哪一条"。
+    const next = this.get('SELECT COALESCE(MAX(seq), 0) + 1 AS value FROM router_turn') as { value?: unknown } | null;
     this.run(
-      'INSERT INTO router_turn (id, role, content, session_key, conversation_id, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-      turn.id, turn.role, turn.content, turn.sessionKey ?? null, turn.conversationId ?? null, turn.createdAt,
+      'INSERT INTO router_turn (id, role, content, session_key, conversation_id, seq, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      turn.id, turn.role, turn.content, turn.sessionKey ?? null, turn.conversationId ?? null,
+      Number(next?.value ?? 1), turn.createdAt,
+    );
+  }
+
+  /** 按 seq 区间取对话历史（压缩用），按 seq 升序。 */
+  listRouterTurnsBySeq(conversationId: string | null, sessionKey: string | null, fromSeq: number, toSeq: number): (RouterTurn & { seq: number })[] {
+    const scope = conversationId !== null
+      ? { clause: 'conversation_id = ?', params: [conversationId] }
+      : sessionKey !== null
+        ? { clause: 'session_key = ?', params: [sessionKey] }
+        : { clause: 'session_key IS NULL', params: [] as unknown[] };
+    const rows = this.all(
+      `SELECT * FROM router_turn WHERE ${scope.clause} AND seq >= ? AND seq <= ? ORDER BY seq ASC`,
+      ...scope.params, fromSeq, toSeq,
+    );
+    return rows.map((row) => ({ ...toRouterTurn(row), seq: Number((row as { seq?: unknown }).seq ?? 0) }));
+  }
+
+  /** 水位线之后、且仍在窗口里的对话历史。 */
+  listRouterTurnsSince(conversationId: string | null, sessionKey: string | null, afterSeq: number): (RouterTurn & { seq: number })[] {
+    const scope = conversationId !== null
+      ? { clause: 'conversation_id = ?', params: [conversationId] }
+      : sessionKey !== null
+        ? { clause: 'session_key = ?', params: [sessionKey] }
+        : { clause: 'session_key IS NULL', params: [] as unknown[] };
+    const rows = this.all(
+      `SELECT * FROM router_turn WHERE ${scope.clause} AND seq > ? ORDER BY seq ASC`,
+      ...scope.params, afterSeq,
+    );
+    return rows.map((row) => ({ ...toRouterTurn(row), seq: Number((row as { seq?: unknown }).seq ?? 0) }));
+  }
+
+  /** 最新一份对话摘要。 */
+  latestRouterNote(conversationId: string | null, sessionKey: string | null): { content: string; coveredSeq: number; createdAt: string } | null {
+    const scope = conversationId !== null
+      ? { clause: 'conversation_id = ?', params: [conversationId] }
+      : sessionKey !== null
+        ? { clause: 'session_key = ?', params: [sessionKey] }
+        : { clause: 'session_key IS NULL', params: [] as unknown[] };
+    const row = this.get(
+      `SELECT content, covered_seq, created_at FROM router_note WHERE ${scope.clause} ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+      ...scope.params,
+    );
+    if (!row) return null;
+    return {
+      content: String((row as { content?: unknown }).content ?? ''),
+      coveredSeq: Number((row as { covered_seq?: unknown }).covered_seq ?? 0),
+      createdAt: String((row as { created_at?: unknown }).created_at ?? ''),
+    };
+  }
+
+  insertRouterNote(input: {
+    id: string;
+    sessionKey: string | null;
+    conversationId: string | null;
+    fromSeq: number;
+    toSeq: number;
+    coveredSeq: number;
+    content: string;
+    sourceTurns: number;
+    sourceChars: number;
+  }): void {
+    this.run(
+      `INSERT INTO router_note (id, session_key, conversation_id, from_seq, to_seq, covered_seq, content, source_turns, source_chars, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      input.id, input.sessionKey, input.conversationId, input.fromSeq, input.toSeq, input.coveredSeq,
+      input.content, input.sourceTurns, input.sourceChars, nowIso(),
     );
   }
 
