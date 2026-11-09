@@ -574,6 +574,33 @@ export class Store {
     this.run('INSERT INTO wd_turn (id, role, content, created_at) VALUES (?, ?, ?, ?)', turn.id, turn.role, turn.content, nowIso());
   }
 
+  /**
+   * 真正的对话轮次（只有 user / assistant）。
+   * 调查日志里的工具记录不在这里：它们没有调用标识，不能当正式 tool 消息重发。
+   */
+  listWdDialogue(limit = 10): { id: string; role: 'user' | 'assistant'; content: string }[] {
+    return this.all(
+      "SELECT id, role, content FROM wd_turn WHERE role IN ('user','assistant') ORDER BY created_at ASC, rowid ASC LIMIT ?",
+      limit,
+    ).map((row) => ({
+      id: str(row['id']),
+      role: str(row['role']) as 'user' | 'assistant',
+      content: str(row['content']),
+    }));
+  }
+
+  /** 调查日志（含工具记录），只用于给人看或作为文字背景。 */
+  listWdToolLog(limit = 12): { tool: string; summary: string }[] {
+    return this.all(
+      "SELECT content FROM wd_turn WHERE role = 'tool' ORDER BY created_at DESC, rowid DESC LIMIT ?",
+      limit,
+    ).map((row) => {
+      const text = str(row['content']);
+      const index = text.indexOf(': ');
+      return index > 0 ? { tool: text.slice(0, index), summary: text.slice(index + 2) } : { tool: '', summary: text };
+    });
+  }
+
   listWdTurns(limit = 20): { role: 'user' | 'assistant'; content: string; createdAt: string }[] {
     const rows = this.all('SELECT * FROM wd_turn ORDER BY created_at DESC LIMIT ?', limit);
     return rows

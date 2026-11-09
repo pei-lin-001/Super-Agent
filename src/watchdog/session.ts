@@ -247,6 +247,7 @@ export class WatchdogSession {
 
     if (name === 'check_main') {
       const health = this.deps.health?.();
+    const toolLog = store.listWdToolLog(12);
       if (!health) return '当前环境没有配置主系统健康探测';
       return `${health.state}｜${health.detail}${health.pid ? `｜pid=${health.pid}` : ''}` +
         `${health.heartbeatAgeMs === null ? '' : `｜心跳 ${Math.round(health.heartbeatAgeMs / 1000)} 秒前`}`;
@@ -384,9 +385,20 @@ export class WatchdogSession {
     const { store, config, model, modelName } = this.deps;
     const observation = observe(store, config);
     const health = this.deps.health?.();
+    const toolLog = store.listWdToolLog(12);
     const messages: ChatMessage[] = [
       { role: 'system', content: WATCHDOG_SYSTEM },
-      ...store.listWdTurns(10).map((turn): ChatMessage => ({ role: turn.role, content: turn.content })),
+      ...store.listWdDialogue(10).map((turn): ChatMessage => ({ role: turn.role, content: turn.content })),
+      ...(toolLog.length > 0
+        ? [
+            {
+              role: 'user' as const,
+              content:
+                '# 上一次调查的工具记录（仅作背景，不是重新发起的调用）\n' +
+                toolLog.map((entry) => `- ${entry.tool}：${entry.summary}`).join('\n'),
+            },
+          ]
+        : []),
       {
         role: 'user',
         content:
@@ -423,9 +435,10 @@ export class WatchdogSession {
         } catch (error) {
           output = `执行失败：${(error as Error).message}`;
         }
-        // 同一调用重复出现时把事实告诉模型：不是禁止，而是让它知道这条证据已经拿过了。
+        // 只报告"相同参数第 N 次调用"。是否与上次结果一致需要真的比较返回值，
+        // 不能凭调用名相同就断言——健康状态、作业输出本来就是会变的。
         if (seen > 1) {
-          output += `\n\n（同一条调用第 ${seen} 次出现，上面的结果与之前一致。如果证据已经够，直接给结论。）`;
+          output += `\n\n（相同参数第 ${seen} 次调用。上面是本次的真实结果，请据此判断，不要假设它和上次一样。）`;
         }
         store.appendWdTurn({
           id: `wdt_${randomBytes(4).toString('hex')}`,
@@ -441,6 +454,7 @@ export class WatchdogSession {
     const { store, config, model, modelName } = this.deps;
     const observation = observe(store, config);
     const now = Date.now();
+    const toolLog = store.listWdToolLog(12);
     const issues = store
       .listOpenIssues()
       .map((issue) => {
@@ -458,7 +472,17 @@ export class WatchdogSession {
 
     const messages: ChatMessage[] = [
       { role: 'system', content: WATCHDOG_SYSTEM },
-      ...store.listWdTurns(10).map((turn): ChatMessage => ({ role: turn.role, content: turn.content })),
+      ...store.listWdDialogue(10).map((turn): ChatMessage => ({ role: turn.role, content: turn.content })),
+      ...(toolLog.length > 0
+        ? [
+            {
+              role: 'user' as const,
+              content:
+                '# 上一次调查的工具记录（仅作背景，不是重新发起的调用）\n' +
+                toolLog.map((entry) => `- ${entry.tool}：${entry.summary}`).join('\n'),
+            },
+          ]
+        : []),
       {
         role: 'user',
         content: observationPrompt({
