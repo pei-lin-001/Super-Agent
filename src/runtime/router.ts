@@ -89,6 +89,8 @@ export class Router {
   private resumeMessages: ChatMessage[] | null = null;
   private resumeSessionId: string | null = null;
   private lastOutcome: 'done' | 'suspended' | 'failed' = 'done';
+  /** 正在续接的会话：防止定时 tick 把同一个会话排成一串重复执行。 */
+  private readonly resuming = new Set<string>();
 
   private currentOutcome(): 'done' | 'suspended' | 'failed' {
     return this.lastOutcome;
@@ -320,6 +322,10 @@ export class Router {
   async resume(): Promise<void> {
     const session = this.runtime.store.pendingRouterSession();
     if (!session) return;
+    // 同一会话已经有续接在跑：本次唤醒直接合并，不排进串行队列再跑一遍。
+    // 检查发生在任何 await 之前，所以同一 tick 内的多次唤醒都能被挡住。
+    if (this.resuming.has(session.id)) return;
+    this.resuming.add(session.id);
     const restored = (session.messages as ChatMessage[]).filter(
       (message): message is ChatMessage => typeof message === 'object' && message !== null && message.role !== 'system',
     );
@@ -333,13 +339,8 @@ export class Router {
       const outcome = this.currentOutcome();
       if (outcome === 'failed') throw new Error('这一轮协调没有完成');
       if (outcome === 'suspended') {
-        // 额度再次用完：会话必须继续保持待续接，不能在这里关掉。
-        this.runtime.store.saveRouterSession({
-          id: session.id,
-          taskId: null,
-          messages: restored,
-          reason: '额度用尽，等待续接',
-        });
+        // 进度只由一个地方保存：run() 在挂起时已经把最新 messages 写进会话。
+        // 这里如果再用进入时的旧快照覆盖，就会丢掉本轮新产生的决策与结果。
         return;
       }
       // 只有这一轮真的跑完才关闭会话；失败时保留，下一轮还能恢复。
@@ -350,6 +351,7 @@ export class Router {
     } finally {
       this.resumeMessages = local;
       this.resumeSessionId = localSession;
+      this.resuming.delete(session.id);
     }
   }
 
