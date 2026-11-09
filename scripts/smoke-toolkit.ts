@@ -4,7 +4,6 @@
  * 拉协作者核对 → 登记真实文件产物 → 对具体版本取得 approved → 提交。
  * 使用独立数据库与工作目录，退出码 0 表示验收脚本自身通过。
  */
-import { spawnSync } from 'node:child_process';
 import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -13,7 +12,7 @@ import { OpenAICompatibleModel } from '../src/model/openai.ts';
 import { Router } from '../src/runtime/router.ts';
 import { Runtime } from '../src/runtime/runtime.ts';
 import { Store } from '../src/storage/store.ts';
-import { judgeTask, isolateRun, report } from './smoke-lib.ts';
+import { judgeTask, isolateRun, report, runBaseline } from './smoke-lib.ts';
 
 const runId = `toolkit-${new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${Math.random().toString(16).slice(2, 6)}`;
 const config = isolateRun(loadConfig(), runId);
@@ -105,20 +104,43 @@ await writeFile(
   'utf8',
 );
 
-// 交给模型之前，先证明初始实现确实不通过：否则"修 bug"只是走过场。
-const baseline = spawnSync('python3', ['-m', 'pytest', '-q'], { cwd: taskDir, encoding: 'utf8' });
-const baselineOut = `${baseline.stdout ?? ''}${baseline.stderr ?? ''}`;
-log(`初始测试退出码：${baseline.status}`);
-if (baseline.status === 0) {
-  console.error('初始实现已经通过测试，这个验收场景无法复现缺陷，直接判定失败。');
-  console.error(baselineOut.slice(-800));
+const EXPECTED_FAILED = ['test_calc.py::test_discount_rounding', 'test_calc.py::test_negative_price_rejected'];
+const EXPECTED_PASSED = ['test_calc.py::test_discount', 'test_calc.py::test_total'];
+
+const baseline = runBaseline(taskDir);
+if (!baseline.ok) {
+  console.error(`验收环境错误：${baseline.reason}`);
+  console.error(baseline.summary);
+  await runtime.stop();
+  store.close();
+  process.exit(2);
+}
+log(`初始测试摘要：${baseline.summary}`);
+log(`初始失败用例：${baseline.failed.join('、') || '（无）'}`);
+log(`初始通过用例：${baseline.passed.join('、') || '（无）'}`);
+
+const missingFailures = EXPECTED_FAILED.filter((name) => !baseline.failed.includes(name));
+if (missingFailures.length > 0 || baseline.failed.length !== EXPECTED_FAILED.length) {
+  console.error(`初始实现没有按预期失败：缺少 ${missingFailures.join('、') || '（数量不符）'}`);
+  console.error('这个验收场景依赖"两个约定被违反"，请先确认 fixture 未被改动。');
   await runtime.stop();
   store.close();
   process.exit(1);
 }
-const failedNames = [...baselineOut.matchAll(/FAILED (\S+)/g)].map((match) => match[1]);
-log(`初始失败用例：${failedNames.join('、') || '（未解析到用例名）'}`);
-log(`初始失败摘要：${(baselineOut.match(/\d+ failed[^\n]*/) ?? ['（无）'])[0]}`);
+const unexpectedFailures = baseline.failed.filter((name) => !EXPECTED_FAILED.includes(name));
+if (unexpectedFailures.length > 0) {
+  console.error(`出现了预期之外的失败用例：${unexpectedFailures.join('、')}`);
+  await runtime.stop();
+  store.close();
+  process.exit(1);
+}
+const missingPassed = EXPECTED_PASSED.filter((name) => !baseline.passed.includes(name));
+if (missingPassed.length > 0) {
+  console.error(`原本应当通过的用例没有通过：${missingPassed.join('、')}`);
+  await runtime.stop();
+  store.close();
+  process.exit(1);
+}
 
 log(`任务 ${task.id}｜负责人 ${owner.id}`);
 runtime.enqueue(owner.id);

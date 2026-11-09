@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -93,4 +94,56 @@ export function report(verdict: SmokeVerdict): never {
   for (const line of verdict.lines) console.log(line);
   console.log(verdict.ok ? '结论：通过' : '结论：未通过');
   process.exit(verdict.code);
+}
+
+/**
+ * 基线检查：区分「预期的代码缺陷」和「验收环境问题」。
+ *
+ * 只有 pytest 正常跑完、并按预期失败的那几个用例，才算基线成立；
+ * 缺 pytest、导入失败、收集失败、被信号终止都属于环境错误，不能当成"缺陷已复现"。
+ */
+export interface BaselineReport {
+  ok: boolean;
+  reason: string;
+  failed: string[];
+  passed: string[];
+  summary: string;
+}
+
+export function runBaseline(cwd: string): BaselineReport {
+  const probe = spawnSync('python3', ['-c', 'import pytest; print(pytest.__version__)'], { cwd, encoding: 'utf8' });
+  if (probe.error || probe.status !== 0) {
+    return {
+      ok: false,
+      reason: `缺少可用的 pytest（退出码 ${probe.status}，错误 ${probe.error?.message ?? '无'}）：${(probe.stderr ?? '').trim().slice(0, 300)}`,
+      failed: [],
+      passed: [],
+      summary: '',
+    };
+  }
+  const run = spawnSync('python3', ['-m', 'pytest', '-q', '--no-header', '-rA'], { cwd, encoding: 'utf8' });
+  const out = `${run.stdout ?? ''}${run.stderr ?? ''}`;
+  if (run.error) {
+    return { ok: false, reason: `pytest 无法启动：${run.error.message}`, failed: [], passed: [], summary: '' };
+  }
+  if (run.signal) {
+    return { ok: false, reason: `pytest 被信号 ${run.signal} 终止`, failed: [], passed: [], summary: out.slice(-500) };
+  }
+  // 退出码语义：0 全过；1 有用例失败；2 被中断或收集中断；3 内部错误；4 用法错误；5 没有收集到用例
+  if (run.status === 5) {
+    return { ok: false, reason: 'pytest 没有收集到任何用例（收集失败或路径错误）', failed: [], passed: [], summary: out.slice(-500) };
+  }
+  if (run.status !== 0 && run.status !== 1) {
+    return {
+      ok: false,
+      reason: `pytest 异常退出（退出码 ${run.status}），属于验收环境或收集错误，不是代码缺陷`,
+      failed: [],
+      passed: [],
+      summary: out.slice(-500),
+    };
+  }
+  const failed = [...out.matchAll(/^FAILED (\S+)/gm)].map((match) => match[1]!);
+  const passed = [...out.matchAll(/^PASSED (\S+)/gm)].map((match) => match[1]!);
+  const summary = (out.match(/\d+ (?:failed|passed)[^\n]*/) ?? [''])[0]!;
+  return { ok: true, reason: '', failed, passed, summary };
 }
