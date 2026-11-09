@@ -1893,6 +1893,21 @@ export class Store {
     }));
   }
 
+  /**
+   * 把升级前的历史收进某个话题。
+   *
+   * 话题上线前 router_turn 没有 conversation_id；不收进来的话，升级后这些对话
+   * 在任何话题里都查不到——用户会觉得"机器人突然失忆了"。
+   * 按行数返回，便于日志与断言。
+   */
+  adoptOrphanRouterTurns(sessionKey: string, conversationId: string): number {
+    this.assertUsable();
+    const result = this.db
+      .prepare('UPDATE router_turn SET conversation_id = ? WHERE session_key = ? AND conversation_id IS NULL')
+      .run(conversationId, sessionKey);
+    return Number(result.changes ?? 0);
+  }
+
   renameConversation(id: string, title: string): void {
     this.run('UPDATE conversation SET title = ?, updated_at = ? WHERE id = ?', title, nowIso(), id);
   }

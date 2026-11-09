@@ -261,3 +261,26 @@ test('第一句话就是 /new 时，当前话题指针也要落库（否则后�
     await harness.cleanup();
   }
 });
+
+test('升级兼容：话题上线前的历史会被收进第一个话题，不丢上下文', async () => {
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    router: () => mockReply({ text: '好的' }),
+  });
+  const conversations = new ConversationService(harness.store);
+  try {
+    // 模拟升级前的数据：有会话键、没有话题归属
+    await harness.router.handleUserMessage('升级前说过的话', { sessionKey: TG_KEY });
+    const before = harness.store.listRouterTurns(20, TG_KEY, 'cv_nonexistent');
+    assert.equal(before.length, 0, '按不存在的话题查不到东西');
+
+    const first = conversations.ensureCurrent(TG_KEY, '升级后第一句');
+    const turns = harness.store.listRouterTurns(20, TG_KEY, first.id);
+    assert.ok(
+      turns.some((turn) => turn.content === '升级前说过的话'),
+      `升级前的历史应被收进第一个话题（实际 ${JSON.stringify(turns.map((t) => t.content))}）`,
+    );
+  } finally {
+    await harness.cleanup();
+  }
+});

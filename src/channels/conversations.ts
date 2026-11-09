@@ -75,7 +75,13 @@ export class ConversationService {
       this.store.setCurrentConversation(sessionKey, active.id);
       return active;
     }
-    return this.create(sessionKey, firstMessage === undefined ? '默认话题' : autoTitle(firstMessage));
+    const created = this.create(
+      sessionKey,
+      firstMessage === undefined ? '默认话题' : autoTitle(firstMessage),
+    );
+    // 第一次有话题时，把升级前的历史收进来，避免"升级后突然失忆"。
+    this.store.adoptOrphanRouterTurns(sessionKey, created.id);
+    return created;
   }
 
   /**
