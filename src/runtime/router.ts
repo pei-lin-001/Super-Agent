@@ -150,7 +150,8 @@ export class Router {
    * 排队会把别的聊天一起卡住。
    */
   private readonly chains = new Map<string, Promise<void>>();
-  private notifyScheduled = false;
+  /** 正在进行的自动汇报：并发调用共享它，避免重复跑。 */
+  private notifyRun: Promise<void> | null = null;
 
   private readonly runtime: Runtime;
   private readonly model: ModelClient;
@@ -259,37 +260,34 @@ export class Router {
    * 生产路径通常不 await 它。
    */
   notify(): Promise<void> {
-    if (this.notifyScheduled) return Promise.resolve();
-    this.notifyScheduled = true;
-    return new Promise<void>((resolve) => {
-      setTimeout(() => {
-        this.notifyScheduled = false;
-        if (this.runtime.isStopped) {
-          resolve();
-          return;
-        }
-        // 按来源会话+话题分组汇报：多条聊天交错时，不能把别人的材料混进一次总结。
-        const targets = this.runtime.store.routerInboxTargets();
-        if (targets.length === 0) {
-          resolve();
-          return;
-        }
-        const runs = targets.map((target) =>
+    // 合并多次通知，但**返回同一个 Promise**：已经排过一次时，
+    // 后来者要能等到这次汇报结束，而不是拿到一个立刻 resolve 的空承诺。
+    if (this.notifyRun) return this.notifyRun;
+    this.notifyRun = this.runNotifications();
+    return this.notifyRun;
+  }
+
+  private async runNotifications(): Promise<void> {
+    try {
+      // 让同一 tick 内的多条汇报合并成一次。
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      if (this.runtime.isStopped) return;
+      // 按来源会话+话题分组汇报：多条聊天交错时，不能把别人的材料混进一次总结。
+      const targets = this.runtime.store.routerInboxTargets();
+      if (targets.length === 0) return;
+      const outcome = await Promise.all(
+        targets.map((target) =>
           this.enqueue(null, { sessionKey: target.sessionKey, conversationId: target.conversationId }),
-        );
-        void Promise.all(runs).then(
-          (outcome) => {
-            if (outcome.some((item) => item === 'failed')) {
-              this.publish({ type: 'router.notice', text: 'Router 自动汇报失败，已保留会话等待续接。' });
-            }
-            resolve();
-          },
-          () => {
-            resolve();
-          },
-        );
-      }, 0);
-    });
+        ),
+      );
+      if (outcome.some((item) => item === 'failed')) {
+        this.publish({ type: 'router.notice', text: 'Router 自动汇报失败，已保留会话等待续接。' });
+      }
+    } catch {
+      // 自动汇报失败不该把调用方（Worker 的报告路径）拖垮；状态已按待续接保存。
+    } finally {
+      this.notifyRun = null;
+    }
   }
 
   private publish(event: RuntimeEvent): void {

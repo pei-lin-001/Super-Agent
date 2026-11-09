@@ -18,6 +18,14 @@ import {
 } from '../domain/ids.ts';
 import { isTerminalTask, isTerminalWorker } from '../domain/state.ts';
 import { Execution, ExecutionRevoked } from './execution.ts';
+
+/**
+ * 进度汇报唤醒 Router 的最小间隔。
+ *
+ * 不节流的话，一个每步都汇报的 Worker 会把每条聊天刷成进度条；
+ * 完全不唤醒又让用户以为任务卡死。3 分钟是"看得出在动"与"别刷屏"之间。
+ */
+const PROGRESS_NOTIFY_INTERVAL_MS = 3 * 60 * 1000;
 import { ModelRegistry } from '../model/registry.ts';
 import { stageMaterials, type StoredAttachment } from '../channels/storage.ts';
 import { identifyProcess } from '../watchdog/observer.ts';
@@ -141,6 +149,10 @@ export class Runtime implements ToolHost {
   private readonly lifecycle = new AbortController();
   /** 所有登记过的执行过程（含 Router 与工作记录整理），停机时统一撤销。 */
   private readonly executions = new Set<Execution>();
+  /** 启动时补报未送达的 Worker 消息，只做一次。 */
+  private inboxCatchUpDone = false;
+  /** 上次因进度唤醒 Router 的时间（按任务），用于节流。 */
+  private readonly progressNotifyAt = new Map<string, number>();
 
   /** 登记一次执行过程：停机时会被统一撤销，之后不会再写库。 */
   track(execution: Execution): void {
@@ -1241,7 +1253,15 @@ export class Runtime implements ToolHost {
     if (kind === 'fail' && task.ownerWorkerId === worker.id) {
       void this.failTask(task.id, `负责人报告失败：${body.slice(0, 200)}`);
     }
-    if (kind === 'fail' || kind === 'question') this.router?.notify();
+    // 进度也要唤醒 Router：Worker 报了进度却没人叫醒它，进度就一直躺在收件箱里，
+    // 用户只能自己来问——在他眼里就是"跑完了你没发"。节流是为了不让话密的 Worker 刷屏。
+    const now = Date.now();
+    if (kind === 'fail' || kind === 'question') {
+      this.router?.notify();
+    } else if (now - (this.progressNotifyAt.get(task.id) ?? 0) >= PROGRESS_NOTIFY_INTERVAL_MS) {
+      this.progressNotifyAt.set(task.id, now);
+      this.router?.notify();
+    }
     return { ok: true, messageId: message.id };
   }
 
@@ -1640,7 +1660,16 @@ export class Runtime implements ToolHost {
   private pumpRouter(): void {
     const router = this.router;
     if (!router || this.stopped) return;
-    if (!router.hasPendingSession?.()) return;
+    if (!router.hasPendingSession?.()) {
+      // 没有断点，但收件箱里有没送达的 Worker 消息：启动后补报一次，
+      // 否则它们会一直躺着，直到用户自己来问"跑完了吗"。
+      // 只做一次：汇报失败时消息仍留在收件箱，反复重试会变成无限模型调用。
+      if (!this.inboxCatchUpDone) {
+        this.inboxCatchUpDone = true;
+        if (this.store.routerInboxTargets().length > 0) void this.router?.notify?.();
+      }
+      return;
+    }
     void router.resume?.().catch((error: unknown) => {
       this.store.appendEvent(null, null, 'router.resume_failed', (error as Error).message);
     });

@@ -313,3 +313,84 @@ test('不重复回复：一条用户消息只产生一次回信', async () => {
     await harness.cleanup();
   }
 });
+
+test('Worker 报进度会主动叫醒 Router，且 3 分钟内不重复打断用户', async () => {
+  const runs: string[] = [];
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    router: (context) => {
+      runs.push(systemText(context.request));
+      return mockReply({ text: '进展：它读完了三个文件' });
+    },
+  });
+  const service = serviceOf({ runtime: harness.runtime, store: harness.store, config: harness.config });
+  const adapter = new FakeAdapter('telegram', 'bot_1', ['owner-1']);
+  service.register(adapter);
+  service.start();
+  try {
+    const { owner } = harness.runtime.createTask({
+      title: '长任务',
+      goal: 'g',
+      ownerRole: 'r',
+      ownerBrief: 'b',
+      source: { channel: 'telegram', accountId: 'bot_1', peerId: 'owner-1', sessionKey: TG_KEY },
+    });
+
+    harness.runtime.report(owner, 'progress', '进度一：读完了三个文件');
+    // report 已经排了一次自动汇报；这里拿到的是同一个 Promise，能真正等到它跑完。
+    await harness.router.notify();
+    await service.drainOutbound();
+
+    assert.equal(runs.length, 1, '进度汇报必须自己叫醒 Router，不能等用户来问');
+    assert.ok(runs[0]!.includes('进度一'), '汇报里要有 Worker 的进度原文');
+    const sent = adapter.sent.map((item) => item.segment.text);
+    assert.equal(sent.length, 1, `用户应真的收到一条消息（实际 ${JSON.stringify(sent)}）`);
+    assert.match(sent[0]!, /读完了三个文件/);
+
+    // 节流窗口内再报一次：不新增模型调用，但进度不能丢
+    harness.runtime.report(owner, 'progress', '进度二：还在读剩下的');
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(runs.length, 1, '3 分钟内不该再打断用户一次');
+    assert.equal(
+      harness.store
+        .listRouterInbox(TG_KEY, null)
+        .filter((item: { kind: string }) => item.kind === 'progress').length >= 1,
+      true,
+      '被节流压住的进度仍留在收件箱，用户下次说话时能看到',
+    );
+  } finally {
+    await service.stop();
+    await harness.cleanup();
+  }
+});
+
+test('重启补报：收件箱里没送达的 Worker 消息会在启动后主动发出', async () => {
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    router: () => mockReply({ text: '它把推文读完了，但链接是拦截页' }),
+  });
+  const service = serviceOf({ runtime: harness.runtime, store: harness.store, config: harness.config });
+  const adapter = new FakeAdapter('telegram', 'bot_1', ['owner-1']);
+  service.register(adapter);
+  service.start();
+  try {
+    const { owner } = harness.runtime.createTask({
+      title: '重启补报',
+      goal: 'g',
+      ownerRole: 'r',
+      ownerBrief: 'b',
+      source: { channel: 'telegram', accountId: 'bot_1', peerId: 'owner-1', sessionKey: TG_KEY },
+    });
+    // 直接写一条"Worker 早就报过、但进程当时没送达"的消息
+    harness.runtime.report(owner, 'progress', '进度：链接是拦截页');
+    harness.runtime.tick();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    await service.drainOutbound();
+    const sent = adapter.sent.map((item) => item.segment.text);
+    assert.equal(sent.length, 1, `启动后应补报一次（实际 ${JSON.stringify(sent)}）`);
+    assert.match(sent[0]!, /拦截页/);
+  } finally {
+    await service.stop();
+    await harness.cleanup();
+  }
+});
