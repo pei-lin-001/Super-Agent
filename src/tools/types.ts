@@ -128,6 +128,14 @@ export interface ToolContext {
   task: Task;
   workDir: string;
   materialsDir: string;
+  /**
+   * 只读根：Worker 能读到任务目录之外的地方（仓库源码、配置）。
+   *
+   * pi 的 read 工具按 cwd 解析任意路径；我们保留写操作在任务目录，
+   * 但读取必须能到仓库根——否则分析代码的任务只能靠 shell 读文件，
+   * 输出无界、还会被上下文窗口截断。
+   */
+  readRoot: string;
   /** 任务取消、Worker 停止或执行超时时触发；长操作必须响应它。 */
   signal?: AbortSignal | null;
 }

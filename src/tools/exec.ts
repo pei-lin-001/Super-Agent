@@ -12,9 +12,12 @@ import {
   type ToolOutcome,
 } from './types.ts';
 import { taskDir } from './files.ts';
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateTail } from '../vendor/pi/truncate.ts';
 
 const MAX_READ = 20_000;
 const DEFAULT_READ = 8_000;
+/** wait=true 时一次最多取回的输出量：够看完整的报错结尾，又不至于撑爆上下文。 */
+const WAIT_READ_BYTES = DEFAULT_MAX_BYTES;
 
 function ok(content: string): ToolOutcome {
   return { type: 'ok', content };
@@ -96,13 +99,25 @@ export const execTools: ToolDefinition[] = [
         await new Promise((resolveSleep) => setTimeout(resolveSleep, 300));
         current = context.host.getJob(job.id);
       }
-      const stdout = context.host.readJob(job.id, 'stdout', 0, DEFAULT_READ);
-      const stderr = context.host.readJob(job.id, 'stderr', 0, DEFAULT_READ);
+      // 取输出的**尾部**：报错和最终结论在结尾，只给开头等于让人猜。
+      const stdout = context.host.readJob(job.id, 'stdout', 0, Math.max(WAIT_READ_BYTES, DEFAULT_READ));
+      const stderr = context.host.readJob(job.id, 'stderr', 0, Math.max(WAIT_READ_BYTES, DEFAULT_READ));
       const stillRunning = current?.status === 'running';
+      const render = (label: string, stream: { text: string; hasMore: boolean; total: number } | null): string => {
+        if (!stream?.text) return `--- ${label} ---\n(空)`;
+        const clipped = truncateTail(stream.text, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
+        const hint = clipped.truncated
+          ? `\n…（${label} 共 ${stream.total} 字符，这里只给末尾 ${formatSize(clipped.outputBytes)}；` +
+            `要看开头用 proc_read offset=0）`
+          : stream.hasMore
+            ? `\n…（${label} 共 ${stream.total} 字符，继续用 proc_read offset=（从头部读））`
+            : '';
+        return `--- ${label} ---\n${clipped.content}${hint}`;
+      };
       const lines = [
         `作业 ${job.id}｜${current?.status ?? 'unknown'}｜退出码 ${current?.exitCode ?? '-'}`,
-        stdout?.text ? `--- stdout ---\n${stdout.text}${stdout.hasMore ? `\n…（stdout 共 ${stdout.total} 字符，继续用 proc_read offset=${stdout.nextOffset}）` : ''}` : '--- stdout ---\n(空)',
-        stderr?.text ? `--- stderr ---\n${stderr.text}${stderr.hasMore ? `\n…（stderr 共 ${stderr.total} 字符，继续用 proc_read offset=${stderr.nextOffset}）` : ''}` : '',
+        render('stdout', stdout),
+        stderr?.text ? render('stderr', stderr) : '',
       ];
       if (stillRunning) {
         lines.push(`命令仍在运行，已等待 ${waitSeconds} 秒。用 proc_wait 继续等，或 proc_read 看进度。`);

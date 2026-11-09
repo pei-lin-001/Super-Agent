@@ -25,7 +25,13 @@ export interface Limits {
   maxRouterRounds: number;
   /** Watchdog 巡检间隔（毫秒）。 */
   watchdogIntervalMs: number;
-  /** 近期历史窗口的字符预算（字符数，不是 token）。 */
+  /**
+   * 近期历史窗口的字符预算（字符数，不是 token）。
+   *
+   * 按 pi 的经验换算约 4 字符 = 1 token：默认 200k 字符 ≈ 50k token，
+   * 足够装下一整篇文章加当前工作历史。窗口给小了会迫使模型反复重读同一份材料
+   * ——那看起来像"跑不完"，实际是工作记忆装不下工作集。
+   */
   contextWindowChars: number;
   /** 组装后允许的额外配对扩展量。 */
   pairingOvershootChars: number;
@@ -103,6 +109,8 @@ export interface Config {
   dbPath: string;
   workDir: string;
   materialsDir: string;
+  /** 只读根：Worker 读文件的上限范围（仓库根）。写操作仍限制在任务目录。 */
+  readRoot: string;
   limits: Limits;
 }
 
@@ -216,6 +224,8 @@ export function loadConfig(options: { requireModel?: boolean } = {}): Config {
   const root = process.cwd();
   const workDir = resolve(root, strEnv('WORK_DIR', 'work'));
   const materialsDir = resolve(workDir, 'materials');
+  // 默认是整个工程根：worker 要像 pi 一样能读仓库，而不是只看得见自己的任务目录。
+  const readRoot = resolve(root, strEnv('READ_ROOT', '.')).replace(/[\\/]+$/, '');
 
   const models = loadModelProfiles({ provider, baseUrl, apiKey, modelName });
   const channels: ChannelsConfig = {
@@ -260,6 +270,7 @@ export function loadConfig(options: { requireModel?: boolean } = {}): Config {
     dbPath: resolve(root, strEnv('DB_PATH', '.data/agent.db')),
     workDir,
     materialsDir,
+    readRoot,
     limits: {
       maxConcurrentRuns: intEnv('MAX_CONCURRENT_RUNS', 3),
       maxWorkersPerGroup: intEnv('MAX_WORKERS_PER_GROUP', 6),
@@ -275,12 +286,12 @@ export function loadConfig(options: { requireModel?: boolean } = {}): Config {
       maxNudges: 3,
       maxRouterRounds: intEnv('MAX_ROUTER_ROUNDS', 6),
       watchdogIntervalMs: intEnv('WATCHDOG_INTERVAL_MS', 60_000),
-      contextWindowChars: intEnv('CONTEXT_WINDOW_CHARS', 16_000),
-      pairingOvershootChars: intEnv('CONTEXT_PAIRING_OVERSHOOT_CHARS', 2_000),
+      contextWindowChars: intEnv('CONTEXT_WINDOW_CHARS', 200_000),
+      pairingOvershootChars: intEnv('CONTEXT_PAIRING_OVERSHOOT_CHARS', 8_000),
       noteTriggerTurns: intEnv('NOTE_TRIGGER_TURNS', 10),
       noteTriggerChars: intEnv('NOTE_TRIGGER_CHARS', 3_000),
-      noteMaxChars: intEnv('NOTE_MAX_CHARS', 6_000),
-      noteInputChars: intEnv('NOTE_INPUT_CHARS', 24_000),
+      noteMaxChars: intEnv('NOTE_MAX_CHARS', 10_000),
+      noteInputChars: intEnv('NOTE_INPUT_CHARS', 80_000),
       noteRetryMs: intEnv('NOTE_RETRY_MS', 120_000),
       noteMaxFailures: intEnv('NOTE_MAX_FAILURES', 3),
     },

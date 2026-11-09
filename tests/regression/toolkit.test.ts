@@ -47,6 +47,7 @@ async function setup(): Promise<Fixture> {
     task: created.task,
     workDir: harness.config.workDir,
     materialsDir: harness.config.materialsDir,
+      readRoot: harness.config.readRoot,
     signal: null,
   };
   return { harness, context, taskId: created.task.id, worker: created.owner, task: created.task, dir };

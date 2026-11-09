@@ -76,6 +76,7 @@ export function testConfig(dir: string, overrides: Partial<Limits> = {}): Config
     dbPath: join(dir, '.data', 'agent.db'),
     workDir: join(dir, 'work'),
     materialsDir: join(dir, 'work', 'materials'),
+    readRoot: dir,
     limits: { ...BASE_LIMITS, ...overrides },
   };
 }
@@ -95,6 +96,7 @@ export async function createHarness(options: {
   }
 
   const config: Config = {
+    readRoot: dir,
     provider: 'mock',
     baseUrl: 'http://127.0.0.1:0/v1',
     apiKey: 'test-key',

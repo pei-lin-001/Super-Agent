@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import test from 'node:test';
 import { createHarness, scripted, systemText, toolResult, workerIdOf } from '../helpers.ts';
@@ -195,6 +196,7 @@ test('产物：fs_write 不能覆盖已登记的产物目录', async () => {
       task,
       workDir: harness.config.workDir,
       materialsDir: harness.config.materialsDir,
+      readRoot: harness.config.readRoot,
     };
     const writeTool = fileTools.find((tool) => tool.name === 'fs_write')!;
     const relativeArtifactPath = saved.path.replace(`${task.id}/`, '');
@@ -586,7 +588,8 @@ test('对话：一批工具调用被等待打断时，未执行的调用留下�
 });
 
 test('对话：fs_read 支持 offset 续读，能取回后半段的关键信息', async () => {
-  const filler = 'A'.repeat(9000);
+  // 超长文件 = 超过一次返回上限的行数（默认 2000 行）。
+  const filler = Array.from({ length: 2600 }, (_, i) => `第 ${i + 1} 行填充内容`).join('\n');
   const harness = await createHarness({
     limits: { maxConcurrentRuns: 0 },
     materials: { 'long.md': `${filler}\n关键结论：尾部标记 TAIL-MARKER\n` },
@@ -605,6 +608,7 @@ test('对话：fs_read 支持 offset 续读，能取回后半段的关键信息'
       task,
       workDir: harness.config.workDir,
       materialsDir: harness.config.materialsDir,
+      readRoot: harness.config.readRoot,
     };
     const readTool = fileTools.find((tool) => tool.name === 'fs_read')!;
     const first = await readTool.run({ path: 'materials/long.md' }, context);
@@ -743,6 +747,39 @@ test('数据库迁移：旧库缺少新列时补齐，不删除数据', async ()
     } catch {
       // 迁移测试里已经手动关闭过
     }
+    await harness.cleanup();
+  }
+});
+
+test('fs_read 能读任务目录之外：仓库文件直接读，越界拒绝', async () => {
+  const harness = await createHarness({ limits: { maxConcurrentRuns: 0 }, worker: () => mockReply({ text: 'x' }) });
+  try {
+    const { task, owner } = harness.runtime.createTask({
+      title: '读仓库', goal: 'g', ownerRole: 'r', ownerBrief: 'b',
+    });
+    writeFileSync(join(harness.config.readRoot, 'repo-file.md'), '仓库里的内容 REPO-MARKER', 'utf8');
+    const context: ToolContext = {
+      host: harness.runtime,
+      worker: owner,
+      task,
+      workDir: harness.config.workDir,
+      materialsDir: harness.config.materialsDir,
+      readRoot: harness.config.readRoot,
+    };
+    const readTool = fileTools.find((tool) => tool.name === 'fs_read')!;
+
+    // 仓库相对路径
+    const relative = await readTool.run({ path: 'repo-file.md' }, context);
+    assert.equal(relative.type, 'ok');
+    assert.match(relative.content, /REPO-MARKER/, '应能直接读仓库文件，不必走 shell');
+
+    // 绝对路径
+    const absolute = await readTool.run({ path: join(harness.config.readRoot, 'repo-file.md') }, context);
+    assert.match(absolute.content, /REPO-MARKER/);
+
+    // 越界：readRoot 之外必须拒绝
+    await assert.rejects(async () => readTool.run({ path: '/etc/hosts' }, context), /之外|越界|不允许/);
+  } finally {
     await harness.cleanup();
   }
 });

@@ -1,6 +1,8 @@
+import { existsSync } from 'node:fs';
 import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
-import { basename, dirname, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, resolve } from 'node:path';
 import { assertInsideRoot, normalizeRelativePath, resolveInside } from './paths.ts';
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateHead } from '../vendor/pi/truncate.ts';
 import {
   argOptionalNumber,
   argOptionalString,
@@ -23,13 +25,27 @@ export function taskDir(context: ToolContext): string {
   return resolve(context.workDir, context.task.id);
 }
 
-/** 逻辑路径 → 实际路径。`materials/` 前缀映射到只读材料目录，其余落在任务目录。 */
+/**
+ * 逻辑路径 → 实际路径（只读）。
+ *
+ * `materials/` 映射到只读材料目录；绝对路径必须在 readRoot 内；
+ * 相对路径先看任务目录，没有就按仓库根解释——这样 Worker 像用 pi 一样
+ * 直接读代码库，而不是被迫走 shell（shell 输出无界，会撑爆上下文窗口）。
+ */
 function resolveReadPath(context: ToolContext, logicalPath: string): string {
   if (logicalPath === 'materials' || logicalPath.startsWith('materials/')) {
     const rest = logicalPath.slice('materials'.length).replace(/^\/+/, '');
     return resolveInside(context.materialsDir, rest);
   }
-  return resolveInside(taskDir(context), logicalPath);
+  const trimmed = logicalPath.trim();
+  if (isAbsolute(trimmed)) {
+    const absolute = resolve(trimmed);
+    assertInsideRoot(context.readRoot, absolute);
+    return absolute;
+  }
+  const inTask = resolveInside(taskDir(context), trimmed);
+  if (existsSync(inTask)) return inTask;
+  return resolveInside(context.readRoot, trimmed);
 }
 
 async function readTextFile(absolute: string): Promise<string> {
@@ -69,28 +85,44 @@ export const fileTools: ToolDefinition[] = [
   {
       name: 'fs_read',
       description:
-        '读取文本文件内容。路径相对任务目录；以 materials/ 开头表示只读材料目录。' +
-        '内容较长时按 offset/limit 分段返回，返回尾部会提示下一次的 offset。',
+        '读取文本文件。路径可以是任务目录相对、仓库相对或绝对路径；以 materials/ 开头表示只读材料目录。' +
+        `一次最多返回 ${DEFAULT_MAX_LINES} 行或 ${DEFAULT_MAX_BYTES / 1024}KB（先到者为准），` +
+        '超出时尾部会提示下一次的行号，用 offset 续读直到读完。',
       parameters: {
         type: 'object',
         properties: {
-          path: { type: 'string', description: '相对路径' },
-          offset: { type: 'number', description: '字符偏移，默认 0' },
-          limit: { type: 'number', description: '本次读取字符数，默认 8000' },
+          path: { type: 'string', description: '路径（任务目录相对 / 仓库相对 / 绝对）' },
+          offset: { type: 'number', description: '起始行号，从 1 开始，默认 1' },
+          limit: { type: 'number', description: `本次最多读多少行，默认 ${DEFAULT_MAX_LINES}` },
         },
         required: ['path'],
       },
       async run(args, context) {
         const logical = argString(args, 'path');
-        const offset = Math.max(0, argOptionalNumber(args, 'offset') ?? 0);
-        const limit = Math.max(1, Math.min(40_000, argOptionalNumber(args, 'limit') ?? DEFAULT_READ_LIMIT));
+        const offset = Math.max(1, Math.trunc(argOptionalNumber(args, 'offset') ?? 1));
+        const limit = Math.max(1, Math.min(DEFAULT_MAX_LINES, Math.trunc(argOptionalNumber(args, 'limit') ?? DEFAULT_MAX_LINES)));
         const absolute = resolveReadPath(context, logical);
         const text = await readTextFile(absolute);
-        const slice = text.slice(offset, offset + limit);
-        const end = offset + slice.length;
-        const suffix =
-          end < text.length ? `\n…（共 ${text.length} 字符，已读到 ${end}；继续请用 offset=${end}）` : '';
-        return ok(`${slice}${suffix}`);
+        const all = text.split('\n');
+        // 行号越界直接说清楚，不要返回空串让模型以为文件是空的。
+        if (offset > all.length) {
+          return ok(`（文件共 ${all.length} 行，offset=${offset} 超出末尾）`);
+        }
+        const slice = all.slice(offset - 1, offset - 1 + limit).join('\n');
+        const clipped = truncateHead(slice, { maxLines: limit, maxBytes: DEFAULT_MAX_BYTES });
+        const lastLine = offset - 1 + clipped.outputLines;
+        const parts: string[] = [clipped.content];
+        if (clipped.firstLineExceedsLimit) {
+          parts.push(`\n…（第 ${offset} 行就超过 ${formatSize(DEFAULT_MAX_BYTES)}，无法整行返回）`);
+        } else if (clipped.truncated) {
+          parts.push(
+            `\n…（本次按${clipped.truncatedBy === 'lines' ? '行数' : '字节数'}截断到第 ${lastLine} 行；继续请用 offset=${lastLine + 1}）`,
+          );
+        }
+        if (lastLine < all.length) {
+          parts.push(`\n…（文件共 ${all.length} 行；继续请用 offset=${lastLine + 1}）`);
+        }
+        return ok(parts.join(''));
       },
   },
   {

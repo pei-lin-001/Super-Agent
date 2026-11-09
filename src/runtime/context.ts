@@ -111,17 +111,32 @@ export function planHistory(input: {
  * 每次模型调用都附带的稳定执行请求。
  * 历史窗口可能把 user 轮次挤出预算，这里保证请求里始终有一条明确的 user 消息。
  */
-export function renderExecutionDirective(input: { task: Task; worker: Worker; isOwner: boolean }): string {
+export function renderExecutionDirective(input: {
+  task: Task;
+  worker: Worker;
+  isOwner: boolean;
+  /** 已执行的步数；不传则不展示。 */
+  stepCount?: number;
+}): string {
   const { task, worker, isOwner } = input;
-  return [
+  const lines = [
     '（稳定执行上下文，每次调用都会重复提供，不是新消息，不需要回应它）',
     `- 任务：${task.title}`,
     `- 你的职责：${worker.role}`,
     `- 具体工作：${worker.brief}`,
     `- 当前要求版本：${task.reviewEpoch}`,
     `- 角色：${isOwner ? '负责人' : '协作者'}`,
-    '请结合下面的历史继续推进当前工作。',
-  ].join('\n');
+  ];
+  // 步数对模型可见：不告诉它成本，它就会把预算花在反复勘察上。
+  // 这是信息，不是限制——没有步数上限时也不会中断执行。
+  if (typeof input.stepCount === 'number' && input.stepCount > 0) {
+    lines.push(`- 已执行：${input.stepCount} 步`);
+    if (input.stepCount >= 40) {
+      lines.push('- 提醒：步数已经不少了。若关键事实已经够用，就把结论落成产物并交付；不要重复勘察同一份材料。');
+    }
+  }
+  lines.push('请结合下面的历史继续推进当前工作。');
+  return lines.join('\n');
 }
 
 /** 程序事实：任务状态、要求版本、提交门槛。模型不能改写这些内容。 */

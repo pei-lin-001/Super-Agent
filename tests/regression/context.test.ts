@@ -305,6 +305,7 @@ test('检索：摘要之外的关键依据能通过原文读取取回', async ()
     const context = {
       host: harness.runtime, worker: owner, task: harness.store.getTaskByGroup(owner.groupId)!,
       workDir: harness.config.workDir, materialsDir: harness.config.materialsDir,
+      readRoot: harness.config.readRoot,
     };
     const firstRead = await readTool.run({ from_seq: 1, limit: 500 }, context);
     assert.equal(firstRead.type, 'ok');
@@ -331,6 +332,7 @@ test('检索：按消息 id 读全文，支持分页', async () => {
     const context = {
       host: harness.runtime, worker: owner, task: harness.store.getTaskByGroup(owner.groupId)!,
       workDir: harness.config.workDir, materialsDir: harness.config.materialsDir,
+      readRoot: harness.config.readRoot,
     };
     const first = await readTool.run({ message_id: message.messageId!, limit: 400 }, context);
     assert.equal(first.type, 'ok');
@@ -600,6 +602,7 @@ test('工具：note_read 能读回工作记录与失败记录', async () => {
     const readTool = historyTools.find((tool) => tool.name === 'note_read')!;
     const context = {
       host: harness.runtime, worker: owner, task, workDir: harness.config.workDir, materialsDir: harness.config.materialsDir,
+      readRoot: harness.config.readRoot,
     };
     const outcome = await readTool.run({}, context);
     assert.equal(outcome.type, 'ok');
@@ -624,6 +627,7 @@ test('搜索：history_search 只返回自己的历史，并给出可读的序�
       host: harness.runtime, worker: owner,
       task: harness.store.getTaskByGroup(owner.groupId)!,
       workDir: harness.config.workDir, materialsDir: harness.config.materialsDir,
+      readRoot: harness.config.readRoot,
     };
     const outcome = await searchTool.run({ query: '乙方材料' }, context);
     assert.equal(outcome.type, 'ok');

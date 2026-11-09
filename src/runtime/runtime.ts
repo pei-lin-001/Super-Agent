@@ -1937,7 +1937,7 @@ export class Runtime implements ToolHost {
     // 无论窗口怎么裁，请求里都必须有一条 user 轮次，否则提供方可能返回空结果。
     const directive: ChatMessage = {
       role: 'user',
-      content: renderExecutionDirective({ task, worker, isOwner }),
+      content: renderExecutionDirective({ task, worker, isOwner, stepCount: worker.stepCount }),
     };
     return [{ role: 'system', content: system }, directive, ...history];
   }
@@ -2010,7 +2010,9 @@ export class Runtime implements ToolHost {
       workerId,
       seq,
       role: 'user',
-      content: '请开始你的工作。材料在 materials/ 目录，产物写到任务目录（相对路径即可）。完成后按规则交付。',
+      content:
+        '请开始你的工作。材料在 materials/ 目录；读代码或文本用 fs_read（支持任务目录、materials/、仓库相对与绝对路径，超长会提示 offset 续读）。' +
+        '产物写到任务目录（相对路径即可），完成后按规则交付。',
       toolCalls: null,
       toolCallId: null,
       createdAt: nowIso(),
@@ -2089,6 +2091,7 @@ export class Runtime implements ToolHost {
       task,
       workDir: this.config.workDir,
       materialsDir: this.config.materialsDir,
+      readRoot: this.config.readRoot,
       signal: this.runs.get(workerId)?.signal ?? null,
     };
   }
