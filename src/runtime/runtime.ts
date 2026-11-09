@@ -119,6 +119,8 @@ export class Runtime implements ToolHost {
   private readonly jobs: ProcessService;
   /** 每个 Worker 当前的取消信号；停止任务或 Worker 失败时触发。 */
   private readonly aborts = new Map<string, AbortController>();
+  /** 进程级取消：覆盖不挂在单个 Worker 上的执行（Router、工作记录整理）。 */
+  private readonly lifecycle = new AbortController();
   private readonly budgetNoted = new Set<string>();
   private runningCount = 0;
   private workerSequence = 0;
@@ -171,6 +173,11 @@ export class Runtime implements ToolHost {
     this.router = router;
   }
 
+  /** 供 Router 等进程级执行使用的取消信号。 */
+  get lifecycleSignal(): AbortSignal {
+    return this.lifecycle.signal;
+  }
+
   start(): void {
     if (this.timer) return;
     this.timer = setInterval(() => this.tick(), 1000);
@@ -187,6 +194,7 @@ export class Runtime implements ToolHost {
     this.queue.length = 0;
     this.rerunRequested.clear();
     // 2) 取消在途模型请求：不取消的话，等 15 秒也只是等到数据库被关掉
+    this.lifecycle.abort();
     for (const controller of this.aborts.values()) {
       try {
         controller.abort();
@@ -940,7 +948,8 @@ export class Runtime implements ToolHost {
     this.stopTaskJobs(task.id, '任务已完成');
     this.store.appendEvent(task.id, worker.id, 'task.completed', summary.slice(0, 200));
     this.emit({ type: 'task.status', taskId: task.id, status: 'completed', reason: summary });
-    this.closeGroup(task.groupId, '任务已完成', worker.id);
+    // 协作者必须一起收敛：任务已完成，还在跑的协作者不能继续占着执行槽改业务。
+    this.convergeGroup(task.groupId, '任务已完成，协作终止');
     this.router?.notify();
     return { ok: true, artifactIds };
   }
@@ -1080,6 +1089,25 @@ export class Runtime implements ToolHost {
     this.closeGroup(task.groupId, `任务失败：${reason}`);
     this.router?.notify();
     return true;
+  }
+
+  /**
+   * 任务终结后收敛组内协作者。
+   *
+   * - 已经拿到真实结果的保留原状态（done / failed）；
+   * - 还在执行或等待的，进入 cancelled 并写明原因；
+   * - 取消它们正在进行的模型请求，阻止后续工具调用落地。
+   *
+   * 这不改变任务本身的结果：任务状态在调用前就已经定了。
+   */
+  private convergeGroup(groupId: string, reason: string): void {
+    for (const worker of this.store.listGroupWorkers(groupId)) {
+      if (isTerminalWorker(worker.status)) continue;
+      this.store.clearWaitsForWorker(worker.id);
+      this.aborts.get(worker.id)?.abort();
+      this.store.setWorkerStatus(worker.id, 'cancelled', reason);
+      this.emit({ type: 'worker.status', workerId: worker.id, status: 'cancelled' });
+    }
   }
 
   private closeGroup(groupId: string, reason: string, exceptWorkerId?: string): void {
@@ -1461,7 +1489,12 @@ export class Runtime implements ToolHost {
     if (!worker || isTerminalWorker(worker.status)) return;
     if (worker.status !== 'running') return;
     const task = this.store.getTaskByGroup(worker.groupId);
-    if (this.stopped || (task && isTerminalTask(task.status))) return;
+    if (this.stopped) return;
+    if (task && isTerminalTask(task.status)) {
+      // 任务已经结束：仍在执行的协作者要收敛，不能一直挂在 running。
+      this.store.setWorkerStatus(workerId, 'cancelled', `任务已 ${task.status}，协作终止`);
+      return;
+    }
     if (task && Number(task.maintenance ?? 0) === 1) {
       this.store.setWorkerStatus(workerId, 'waiting', reason);
       return;
@@ -1538,6 +1571,7 @@ export class Runtime implements ToolHost {
       model: this.workerModel,
       modelName: worker.model ?? this.config.workerModel,
       store: this.store,
+      signal: this.lifecycle.signal,
       worker,
       task,
       decision,
@@ -1823,6 +1857,17 @@ export class Runtime implements ToolHost {
 
   /** 提供方暂时不可用时保留任务，退避后重排；其它错误一律明确失败。 */
   private async handleRunError(workerId: string, error: unknown): Promise<void> {
+    // 本地取消不是业务失败：停机、任务取消、代次失效都属于这一类。
+    // 判活的唯一依据是结构化类别，不看错误文字。
+    if (error instanceof ModelError && error.isCancelled) {
+      this.settleCancelledRun(workerId, error.message);
+      return;
+    }
+    if (this.stopped) {
+      // 停机过程中出现的其它异常同样不判死：保留可恢复状态，交给下次启动。
+      this.settleCancelledRun(workerId, `停机中断：${(error as Error).message}`);
+      return;
+    }
     const retryable = error instanceof ModelError && error.retryable;
     if (!retryable) {
       await this.failWorker(workerId, (error as Error).message);
@@ -1847,6 +1892,29 @@ export class Runtime implements ToolHost {
     });
     this.pushSystemNotice(workerId, `模型提供方暂时不可用：${(error as Error).message}。已安排 60 秒后自动重试。`);
     this.emit({ type: 'error', text: `Worker ${workerId} 等待模型恢复：${(error as Error).message}` });
+  }
+
+  /**
+   * 一次执行被取消后的收尾：不判死，留下可解释、可恢复的状态。
+   * - 任务已终结：Worker 直接收敛到终态；
+   * - 系统停机：保持 queued，下次启动由 recover() 接管；
+   * - 其它（代次失效）：交给 settleWorker 依据任务状态决定。
+   */
+  private settleCancelledRun(workerId: string, reason: string): void {
+    const worker = this.store.getWorker(workerId);
+    if (!worker || isTerminalWorker(worker.status)) return;
+    const task = this.store.getTaskByGroup(worker.groupId);
+    if (task) this.store.appendEvent(task.id, workerId, 'run.cancelled', reason);
+    if (!task || isTerminalTask(task.status)) {
+      this.store.setWorkerStatus(workerId, task ? 'done' : 'cancelled', task ? '任务已结束' : '任务不存在');
+      return;
+    }
+    if (this.stopped) {
+      // 停机：回到 queued，恢复时会被重新调度。
+      this.store.setWorkerStatus(workerId, 'queued');
+      return;
+    }
+    this.store.setWorkerStatus(workerId, 'waiting');
   }
 
   private async failWorker(workerId: string, reason: string): Promise<void> {

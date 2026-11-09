@@ -216,6 +216,7 @@ export class Store {
 
   constructor(path: string) {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
+    this.path = path;
     this.db = new DatabaseSync(path);
     // 多进程同时访问同一个库（主系统 + 维护者 + 命令行客户端）：
     // WAL 让读写不互相阻塞，busy_timeout 让短时的写冲突自动重试而不是直接失败。
@@ -557,6 +558,7 @@ export class Store {
   }
 
   private closed = false;
+  readonly path: string;
 
   get isClosed(): boolean {
     return this.closed;
@@ -725,6 +727,18 @@ export class Store {
       nowIso(),
       input.id,
     );
+  }
+
+  listModelCalls(limit = 50): { id: string; purpose: string; status: string; error: string | null }[] {
+    return this.all(
+      'SELECT id, purpose, status, error FROM model_call ORDER BY started_at DESC LIMIT ?',
+      limit,
+    ).map((row) => ({
+      id: str(row['id']),
+      purpose: str(row['purpose']),
+      status: str(row['status']),
+      error: strOrNull(row['error']),
+    }));
   }
 
   modelCallStats(): { purpose: string; calls: number; ok: number; failed: number; usageKnown: number }[] {

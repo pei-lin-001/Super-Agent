@@ -200,6 +200,7 @@ export async function runNote(input: {
   model: ModelClient;
   modelName: string;
   store: Store;
+  signal?: AbortSignal | null;
   worker: Worker;
   task: Task;
   decision: NoteDecision;
@@ -218,6 +219,7 @@ export async function runNote(input: {
       messages: buildNotePrompt({ task, worker, decision, limits }),
       tools: [],
       reasoningEffort: 'low',
+      signal: input.signal ?? null,
     });
     content = (result.text ?? '').trim();
     if (content === '') {

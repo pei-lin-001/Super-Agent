@@ -53,20 +53,45 @@ export interface ModelClient {
   chat(request: ChatRequest): Promise<StepResult>;
 }
 
+/**
+ * 调用失败的类别。上游必须按类别分支，不能靠错误文字里有没有 abort/cancel 猜。
+ *
+ * - cancelled：本地主动取消（停机、任务取消、代次失效）。不是业务失败，不重试。
+ * - timeout：单次请求超时。
+ * - network：连接层错误。
+ * - provider：提供方返回错误状态。
+ * - protocol：响应结构不合法。
+ * - unknown：兜底。
+ */
+export type ModelErrorKind = 'cancelled' | 'timeout' | 'network' | 'provider' | 'protocol' | 'unknown';
+
 export class ModelError extends Error {
   readonly status: number | null;
   readonly body: string | null;
   /** true 表示提供方暂时不可用（例如模型正在装载），稍后可重试。 */
   readonly retryable: boolean;
+  readonly kind: ModelErrorKind;
 
   constructor(
     message: string,
-    options: { status?: number | null; body?: string | null; cause?: unknown; retryable?: boolean } = {},
+    options: {
+      status?: number | null;
+      body?: string | null;
+      cause?: unknown;
+      retryable?: boolean;
+      kind?: ModelErrorKind;
+    } = {},
   ) {
     super(message, options.cause !== undefined ? { cause: options.cause } : undefined);
     this.name = 'ModelError';
     this.status = options.status ?? null;
     this.body = options.body ?? null;
     this.retryable = options.retryable ?? false;
+    this.kind = options.kind ?? 'unknown';
+  }
+
+  /** 被本地取消：业务层应退出执行过程，而不是把它当成失败。 */
+  get isCancelled(): boolean {
+    return this.kind === 'cancelled';
   }
 }

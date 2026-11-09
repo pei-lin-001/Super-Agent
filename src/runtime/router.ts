@@ -243,6 +243,8 @@ export class Router {
         messages,
         tools: this.readOnly ? [] : ROUTER_TOOLS,
         reasoningEffort: this.config.reasoningEffort,
+        // 进程级取消：停机时 Router 的请求同样要停下，不能只在库里留下脏写。
+        signal: this.runtime.lifecycleSignal,
       });
 
       if (result.toolCalls.length === 0) {

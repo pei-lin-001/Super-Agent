@@ -258,25 +258,54 @@ export class OpenAICompatibleModel implements ModelClient {
           httpAttempts: callAttempts,
         };
       } catch (error) {
-        const isAbort = error instanceof Error && error.name === 'TimeoutError';
-        const isNetwork = error instanceof TypeError;
-        if ((isAbort || isNetwork) && attempt < maxAttempts - 1) {
-          lastError = error;
-          attempt += 1;
-          await sleep(400 * 2 ** attempt);
-          continue;
+        // 本地取消优先判断：signal 已 abort 时，无论底层抛的是什么，都归类为取消。
+        if (request.signal?.aborted === true || (error instanceof Error && error.name === 'AbortError')) {
+          throw new ModelError('模型调用已被本地取消', { kind: 'cancelled', cause: error, retryable: false });
         }
         if (error instanceof ModelError) throw error;
-        throw new ModelError(isAbort ? `模型调用超时（>${this.options.timeoutMs}ms）` : '模型调用失败', {
-          status: null,
-          body: null,
-          cause: error,
-        });
+        const isTimeout = error instanceof Error && error.name === 'TimeoutError';
+        const isNetwork = error instanceof TypeError;
+        if ((isTimeout || isNetwork) && attempt < maxAttempts - 1) {
+          lastError = error;
+          attempt += 1;
+          // 退避期间同样要能被打断
+          await this.sleepUnlessAborted(400 * 2 ** attempt, request.signal);
+          continue;
+        }
+        throw new ModelError(
+          isTimeout ? `模型调用超时（>${this.options.timeoutMs}ms）` : '模型调用失败',
+          {
+            status: null,
+            body: null,
+            cause: error,
+            kind: isTimeout ? 'timeout' : isNetwork ? 'network' : 'unknown',
+          },
+        );
       } finally {
         gate.release();
       }
     }
 
     throw lastError instanceof ModelError ? lastError : new ModelError('模型调用重试耗尽', { cause: lastError });
+  }
+
+  /** 退避等待也要响应取消：已经取消的调用不能继续重试。 */
+  private async sleepUnlessAborted(ms: number, signal?: AbortSignal | null): Promise<void> {
+    if (!signal) {
+      await sleep(ms);
+      return;
+    }
+    if (signal.aborted) throw new ModelError('模型调用已被本地取消', { kind: 'cancelled', retryable: false });
+    await new Promise<void>((resolve, reject) => {
+      const onAbort = (): void => {
+        clearTimeout(timer);
+        reject(new ModelError('模型调用已被本地取消', { kind: 'cancelled', retryable: false }));
+      };
+      const timer = setTimeout(() => {
+        signal.removeEventListener('abort', onAbort);
+        resolve();
+      }, ms);
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
   }
 }
