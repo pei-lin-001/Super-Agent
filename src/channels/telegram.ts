@@ -18,6 +18,7 @@ import type {
 } from './types.ts';
 import { ChannelAuthError } from './types.ts';
 import { writeInboundAttachment, type StoredAttachment } from './storage.ts';
+import { toPlainText, toTelegramHtml } from './render.ts';
 
 interface TelegramUser {
   id: number;
@@ -95,7 +96,7 @@ function classifyFailure(error: unknown): SendOutcome {
 export class TelegramAdapter implements ChannelAdapter {
   readonly name = 'telegram' as const;
   readonly accountId: string;
-  readonly capabilities = { typing: true, edit: true };
+  readonly capabilities = { typing: true, edit: true, draft: true };
 
   private readonly options: TelegramAdapterOptions;
   private readonly fetchImpl: typeof fetch;
@@ -174,7 +175,7 @@ export class TelegramAdapter implements ChannelAdapter {
       const message = update.message;
       // 本轮只处理私聊文字与普通文件；编辑、频道消息、群聊都不交给执行流程。
       if (!message) continue;
-      const event = await this.toEvent(update, message).catch((error: Error) => {
+      const event = await this.toEvent(update, message, input.signal).catch((error: Error) => {
         return {
           source: this.sourceOf(update, message),
           text: '',
@@ -201,7 +202,11 @@ export class TelegramAdapter implements ChannelAdapter {
     };
   }
 
-  private async toEvent(update: TelegramUpdate, message: TelegramMessage): Promise<PlatformEvent> {
+  private async toEvent(
+    update: TelegramUpdate,
+    message: TelegramMessage,
+    signal: AbortSignal,
+  ): Promise<PlatformEvent> {
     const source = this.sourceOf(update, message);
     // 本轮只支持私聊：群、超级群、频道里的消息只留痕，不进执行流程，也不在群里回话。
     if (message.chat.type !== 'private') {
@@ -224,7 +229,7 @@ export class TelegramAdapter implements ChannelAdapter {
       if ((doc.file_size ?? 0) > this.options.maxInboundBytes) {
         unsupported = `文件 ${doc.file_name ?? doc.file_id} 超过 ${Math.round(this.options.maxInboundBytes / 1024 / 1024)}MB 上限，未下载`;
       } else {
-        const bytes = await this.downloadFile(doc.file_id);
+        const bytes = await this.downloadFile(doc.file_id, signal);
         attachments.push(
           writeInboundAttachment({
             workDir: this.options.workDir,
@@ -247,7 +252,7 @@ export class TelegramAdapter implements ChannelAdapter {
       if ((largest.file_size ?? 0) > this.options.maxInboundBytes) {
         unsupported = `图片超过 ${Math.round(this.options.maxInboundBytes / 1024 / 1024)}MB 上限，未下载`;
       } else {
-        const bytes = await this.downloadFile(largest.file_id);
+        const bytes = await this.downloadFile(largest.file_id, signal);
         attachments.push(
           writeInboundAttachment({
             workDir: this.options.workDir,
@@ -270,15 +275,13 @@ export class TelegramAdapter implements ChannelAdapter {
     return { source, text, attachments, unsupported, receivedAt };
   }
 
-  private async downloadFile(fileId: string): Promise<Buffer> {
-    const info = await this.call<{ file_path?: string }>(
-      'getFile',
-      { file_id: fileId },
-      new AbortController().signal,
-    );
+  private async downloadFile(fileId: string, signal: AbortSignal): Promise<Buffer> {
+    const info = await this.call<{ file_path?: string }>('getFile', { file_id: fileId }, signal);
     if (!info.file_path) throw new Error('getFile 没有返回 file_path');
+    // 停机时不能把大文件下载跑完：取消信号要传到实际下载请求上。
     const response = await this.fetchImpl(
       `${this.options.apiBase.replace(/\/+$/, '')}/file/bot${this.options.token}/${info.file_path}`,
+      { signal },
     );
     if (!response.ok) throw new Error(`下载文件失败：HTTP ${response.status}`);
     return Buffer.from(await response.arrayBuffer());
@@ -292,12 +295,7 @@ export class TelegramAdapter implements ChannelAdapter {
     const { target, segment, signal } = input;
     try {
       if (segment.kind === 'text') {
-        const result = await this.call<{ message_id: number }>(
-          'sendMessage',
-          { chat_id: target.peerId, text: segment.text ?? '' },
-          signal,
-        );
-        return { status: 'sent', platformMessageId: String(result.message_id) };
+        return await this.sendText(target.peerId, segment.text ?? '', signal);
       }
       const path = segment.path;
       if (!path) return { status: 'failed', error: '文件段缺少本地路径', retryable: false };
@@ -333,6 +331,70 @@ export class TelegramAdapter implements ChannelAdapter {
     }
   }
 
+  /**
+   * 发文本：先按 HTML 渲染。
+   *
+   * 平台解析实体失败（400 can't parse entities）时退回纯文本——
+   * 宁可少渲染，也不能让整条消息发不出去。
+   */
+  private async sendText(chatId: string, markdown: string, signal: AbortSignal): Promise<SendOutcome> {
+    const html = toTelegramHtml(markdown);
+    try {
+      const result = await this.call<{ message_id: number }>(
+        'sendMessage',
+        { chat_id: chatId, text: html, parse_mode: 'HTML' },
+        signal,
+      );
+      return { status: 'sent', platformMessageId: String(result.message_id) };
+    } catch (error) {
+      if (!/parse entities|can't parse|unsupported start tag|unclosed/i.test((error as Error).message)) {
+        throw error;
+      }
+      const fallback = await this.call<{ message_id: number }>(
+        'sendMessage',
+        { chat_id: chatId, text: toPlainText(markdown) },
+        signal,
+      );
+      return { status: 'sent', platformMessageId: String(fallback.message_id) };
+    }
+  }
+
+  /**
+   * 流式预览：sendMessageDraft。
+   *
+   * 它是临时草稿（30 秒后自行消失、没有 message_id），最终答案仍要正常 send。
+   * 好处是不用先发一条占位消息再改写——聊天里不会多出一颗真实气泡。
+   */
+  async draft(input: {
+    target: OutboundTarget;
+    draftId: number;
+    text: string;
+    signal: AbortSignal;
+  }): Promise<SendOutcome> {
+    const chatId = Number(input.target.peerId);
+    if (!Number.isFinite(chatId)) {
+      return { status: 'failed', error: `草稿只支持数字 chat_id，实际 ${input.target.peerId}`, retryable: false };
+    }
+    try {
+      await this.call(
+        'sendMessageDraft',
+        {
+          chat_id: chatId,
+          draft_id: input.draftId,
+          // 草稿是临时预览：用纯文本，避免半截 Markdown 触发解析错误。
+          text: [...toPlainText(input.text)].slice(0, 4000).join(''),
+        },
+        input.signal,
+      );
+      return { status: 'sent', platformMessageId: null };
+    } catch (error) {
+      if (error instanceof ChannelAuthError) {
+        return { status: 'failed', error: (error as Error).message, retryable: false };
+      }
+      return { status: 'failed', error: (error as Error).message, retryable: true };
+    }
+  }
+
   /** "正在输入"：平台侧约 5 秒后自动消失，上层负责按节奏补发。 */
   async typing(input: { target: OutboundTarget; signal: AbortSignal }): Promise<void> {
     await this.call(
@@ -352,7 +414,12 @@ export class TelegramAdapter implements ChannelAdapter {
     try {
       await this.call(
         'editMessageText',
-        { chat_id: input.target.peerId, message_id: Number(input.messageId), text: input.text },
+        {
+          chat_id: input.target.peerId,
+          message_id: Number(input.messageId),
+          text: toTelegramHtml(input.text),
+          parse_mode: 'HTML',
+        },
         input.signal,
       );
       return { status: 'sent', platformMessageId: input.messageId };
@@ -361,6 +428,23 @@ export class TelegramAdapter implements ChannelAdapter {
       // "消息内容未变化"是平台侧的幂等提示，不是失败。
       if (/message is not modified/i.test(message)) {
         return { status: 'sent', platformMessageId: input.messageId };
+      }
+      if (/parse entities|can't parse|unsupported start tag|unclosed/i.test(message)) {
+        // 渲染失败就退回纯文本改写，不让占位消息停在半成品。
+        try {
+          await this.call(
+            'editMessageText',
+            {
+              chat_id: input.target.peerId,
+              message_id: Number(input.messageId),
+              text: toPlainText(input.text),
+            },
+            input.signal,
+          );
+          return { status: 'sent', platformMessageId: input.messageId };
+        } catch (fallbackError) {
+          return classifyFailure(fallbackError);
+        }
       }
       if (error instanceof ChannelAuthError) return { status: 'failed', error: message, retryable: false };
       return classifyFailure(error);

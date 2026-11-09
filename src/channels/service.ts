@@ -17,8 +17,13 @@ import type {
 } from './types.ts';
 import { ChannelAuthError, parseSessionKey } from './types.ts';
 import { resolveArtifactPath, sha256Of } from './storage.ts';
-import { randomBytes } from 'node:crypto';
+import { ConversationService } from './conversations.ts';
+import { randomBytes, randomInt } from 'node:crypto';
 import { nowIso } from '../domain/ids.ts';
+import type { OutboundArtifact } from '../domain/types.ts';
+
+/** 占位消息延迟：短任务只显示"正在输入"，不额外冒一条消息。 */
+const PLACEHOLDER_DELAY_MS = 2_500;
 
 /** 平台单条文本上限。超过就分段，不静默截断。 */
 const TEXT_LIMITS: Record<string, number> = {
@@ -71,6 +76,8 @@ interface AdapterRuntime {
 
 export class ChannelService {
   private readonly runtime: Runtime;
+  /** 话题：一个聊天窗口里可以有多个互相独立的话题。 */
+  private readonly conversations: ConversationService;
   private readonly store: Store;
   private readonly config: Config;
   private readonly log: (message: string) => void;
@@ -90,13 +97,20 @@ export class ChannelService {
     string,
     {
       adapter: ChannelAdapter;
+      /** draft：发临时草稿，最终答案正常发送；edit：先发占位消息再改写。 */
+      mode: 'draft' | 'edit';
       messageId: string | null;
+      draftId: number;
       lastText: string;
       lastEditAt: number;
       editing: boolean;
+      /** 草稿调用失败过：这个会话本轮不再尝试，避免每条进度都撞一次。 */
+      draftBroken?: boolean;
     }
   >();
   private readonly typingTimers = new Map<string, NodeJS.Timeout>();
+  /** 占位消息的延迟创建定时器：短任务直接跳过。 */
+  private readonly placeholderTimers = new Map<string, NodeJS.Timeout>();
   private unsubscribe: (() => void) | null = null;
   private readonly sleeps = new Set<NodeJS.Timeout>();
 
@@ -109,6 +123,7 @@ export class ChannelService {
     this.runtime = options.runtime;
     this.store = options.store;
     this.config = options.config;
+    this.conversations = new ConversationService(options.store);
     this.log = options.log ?? ((message) => console.log(`[渠道] ${message}`));
   }
 
@@ -151,6 +166,17 @@ export class ChannelService {
         return;
       }
       if (event.type !== 'channel.outbound') return;
+      const conversationId = event.conversationId ?? null;
+      // 旧话题的回信不能写进当前话题的占位消息里：那会把两个话题的答案混在一起。
+      if (conversationId !== null && conversationId !== this.store.currentConversationId(event.sessionKey)) {
+        this.enqueueOutbound(
+          event.sessionKey,
+          this.labelTopic(conversationId, event.text),
+          event.taskId,
+          event.artifact,
+        );
+        return;
+      }
       // 已经有占位消息的平台：把占位消息改成最终答案，不再多发一条。
       void this.finishLive(event.sessionKey, event.text).then((handled) => {
         if (!handled) {
@@ -191,6 +217,8 @@ export class ChannelService {
     this.sleeps.clear();
     for (const timer of this.typingTimers.values()) clearInterval(timer);
     this.typingTimers.clear();
+    for (const timer of this.placeholderTimers.values()) clearTimeout(timer);
+    this.placeholderTimers.clear();
     this.live.clear();
     await Promise.allSettled([...this.runtimes.values()].map((entry) => entry.loop ?? Promise.resolve()));
     // 发送中的调用交给它自己结束：这里只关连接，不改业务状态。
@@ -340,12 +368,23 @@ export class ChannelService {
         this.store.markInbound(item.id, 'failed', 'Router 尚未就绪');
         continue;
       }
+      // 显式命令走代码：新建/列出/切换话题必须是确定的，不能让模型自由发挥。
+      const commandReply = this.conversations.handleCommand(sessionKey, item.body);
+      if (commandReply !== null) {
+        this.store.markInbound(item.id, 'handed');
+        this.enqueueOutbound(sessionKey, commandReply, null, null);
+        continue;
+      }
+      // 话题归属在这一刻定下来：之后的追问、任务、续接都挂到同一个话题上。
+      const conversation = this.conversations.ensureCurrent(sessionKey, item.body);
+      this.store.touchConversation(conversation.id);
       const text = composeInboundText(item.body, attachments);
       this.dbg(`calling router for ${item.id}`);
       let accepted = false;
       try {
         await router.handleUserMessage(text, {
           sessionKey,
+          conversationId: conversation.id,
           // 用户输入一旦持久化就标记已交接：之后崩溃走续接，不重复派工。
           onAccepted: () => {
             accepted = true;
@@ -378,9 +417,40 @@ export class ChannelService {
     const target = this.targetOf(sessionKey);
     if (!target) return;
     this.startTyping(sessionKey, target.adapter, target.outbound);
+    // 平台支持草稿（Telegram sendMessageDraft）：进度用临时预览，最终答案正常发送。
+    // 不再先发一条"正在处理…"的真实消息——那会多出一颗气泡，还得再改写它。
+    if (target.adapter.capabilities?.draft && target.adapter.draft) {
+      this.live.set(sessionKey, {
+        adapter: target.adapter,
+        mode: 'draft',
+        messageId: null,
+        draftId: randomInt(1, 2 ** 31 - 1),
+        lastText: '',
+        lastEditAt: 0,
+        editing: false,
+      });
+      return;
+    }
     if (!target.adapter.capabilities?.edit || !target.adapter.edit) return;
-    const outcome = await this.dispatch(sessionKey, target.adapter, {
-      target: target.outbound,
+    // 占位消息不能一上来就发：短任务里它只会变成一条一闪而过的"正在处理…"气泡，
+    // 看起来就像"正在输入被当成消息发出来了"。先等一会儿，真的慢了再建。
+    const timer = setTimeout(() => {
+      this.placeholderTimers.delete(sessionKey);
+      void this.createPlaceholder(sessionKey, target.adapter, target.outbound);
+    }, PLACEHOLDER_DELAY_MS);
+    timer.unref?.();
+    this.placeholderTimers.set(sessionKey, timer);
+  }
+
+  /** 任务确实慢了，才建一条占位消息，后续用改写的方式展示进展。 */
+  private async createPlaceholder(
+    sessionKey: string,
+    adapter: ChannelAdapter,
+    outbound: OutboundTarget,
+  ): Promise<void> {
+    if (this.live.has(sessionKey)) return;
+    const outcome = await this.dispatch(sessionKey, adapter, {
+      target: outbound,
       segment: {
         index: 0,
         kind: 'text',
@@ -393,8 +463,10 @@ export class ChannelService {
     });
     if (outcome.status === 'sent' && outcome.platformMessageId) {
       this.live.set(sessionKey, {
-        adapter: target.adapter,
+        adapter,
+        mode: 'edit',
         messageId: outcome.platformMessageId,
+        draftId: 0,
         lastText: '正在处理…',
         lastEditAt: Date.now(),
         editing: false,
@@ -403,13 +475,25 @@ export class ChannelService {
   }
 
   /** 进度：把占位消息改成当前进展（限流，避免打爆平台）。 */
+  /** 旧话题的回信加上话题名，用户才知道这是哪件事的答案。 */
+  private labelTopic(conversationId: string, text: string): string {
+    if (text.trim() === '') return text;
+    const title = this.conversations.titleOf(conversationId);
+    return title === null ? text : `【${title}】${text}`;
+  }
+
   private updateLive(sessionKey: string | null, text: string): void {
     if (sessionKey === null) return;
     const entry = this.live.get(sessionKey);
     if (!entry) return;
-    if (!entry.adapter.edit || entry.messageId === null) return;
     const composed = text.trim();
     if (composed === '' || composed === entry.lastText) return;
+    if (entry.mode === 'draft') {
+      if (entry.draftBroken || !entry.adapter.draft) return;
+    } else if (!entry.adapter.edit || entry.messageId === null) {
+      return;
+    }
+    // 平台限流：同一会话每秒最多一次改写/草稿更新。
     if (Date.now() - entry.lastEditAt < 1_000) return;
     if (entry.editing) return;
     entry.editing = true;
@@ -420,7 +504,38 @@ export class ChannelService {
       entry.editing = false;
       return;
     }
-    void entry.adapter
+    const adapter = entry.adapter;
+    const done = (): void => {
+      entry.editing = false;
+    };
+    if (entry.mode === 'draft' && adapter.draft) {
+      void adapter
+        .draft({
+          target: target.outbound,
+          draftId: entry.draftId,
+          text: composed,
+          signal: new AbortController().signal,
+        })
+        .then((outcome) => {
+          // 平台不支持或参数不认：本轮不再试，最终答案照常发送，用户不会看到报错。
+          if (outcome.status === 'failed') {
+            entry.draftBroken = true;
+            // 留一条日志：否则"为什么没有草稿预览"只能靠猜。
+            this.log(`草稿预览不可用（${outcome.error}），本轮改为只发最终答案`);
+          }
+        })
+        .catch((error: unknown) => {
+          entry.draftBroken = true;
+          this.log(`草稿预览不可用（${(error as Error).message}），本轮改为只发最终答案`);
+        })
+        .finally(done);
+      return;
+    }
+    if (!adapter.edit || entry.messageId === null) {
+      done();
+      return;
+    }
+    void adapter
       .edit({
         target: target.outbound,
         messageId: entry.messageId,
@@ -428,15 +543,24 @@ export class ChannelService {
         signal: new AbortController().signal,
       })
       .catch(() => undefined)
-      .finally(() => {
-        entry.editing = false;
-      });
+      .finally(done);
   }
 
   /** 最终答案：改写占位消息。返回 false 表示这个会话没有占位消息，需要正常发送。 */
   private async finishLive(sessionKey: string, text: string): Promise<boolean> {
     this.stopTyping(sessionKey);
+    const pending = this.placeholderTimers.get(sessionKey);
+    if (pending) {
+      clearTimeout(pending);
+      this.placeholderTimers.delete(sessionKey);
+    }
     const entry = this.live.get(sessionKey);
+    // 草稿没有 message_id，也不需要"变成"最终答案：答案要作为一条真实消息发送，
+    // 平台在 bot 发消息时会自动收掉草稿。
+    if (entry?.mode === 'draft') {
+      this.live.delete(sessionKey);
+      return false;
+    }
     if (!entry || entry.messageId === null || !entry.adapter.edit) {
       this.live.delete(sessionKey);
       return false;
@@ -519,7 +643,7 @@ export class ChannelService {
     sessionKey: string,
     text: string,
     taskId: string | null,
-    artifact: string | null,
+    artifact: OutboundArtifact | null,
   ): void {
     const session = this.store.getChannelSession(sessionKey);
     const parts = sessionKey.split('|').map((part) => decodeURIComponent(part));
@@ -539,7 +663,12 @@ export class ChannelService {
       segments.push({
         index,
         kind: 'file',
-        name: artifact,
+        name: artifact.name,
+        // 版本、指纹、大小在这里就写死：发送时只核验，不再挑"最新版本"。
+        artifactId: artifact.artifactId,
+        version: artifact.version,
+        sha256: artifact.sha256,
+        bytes: artifact.bytes,
         status: 'pending',
         platformMessageId: null,
         error: null,
@@ -616,22 +745,65 @@ export class ChannelService {
     let fatal = false;
     let waitMs: number | null = null;
 
+    // 每段一有结果就落库：第一段已拿到平台回执、后一段还在等的时候崩溃，
+    // 重启后必须知道第一段已经发出去了，不能整条重来再发一遍。
+    const persist = (nextAttemptAt: string | null = null): void => {
+      const sent = segments.filter((segment) => segment.status === 'sent').length;
+      // 还有没送完的段就保持可调度：unknown 只代表那一段不确定，
+      // 不能因为一段 unknown 把后面确定没发的段一起冻结。
+      const remaining = segments.some(
+        (segment) => segment.status === 'pending' || segment.status === 'sending' || (segment.status === 'failed' && !fatal),
+      );
+      let status: 'pending' | 'partial' | 'sent' | 'failed' | 'unknown';
+      if (sent === segments.length) status = 'sent';
+      else if (fatal) status = 'failed';
+      else if (remaining) status = sent > 0 ? 'partial' : 'pending';
+      // 整条是否有"可能已到达但没拿到回执"的段，以分段状态为准：
+      // 这一轮跳过了上次留下的 unknown 段，本地标记并不能反映它。
+      else if (segments.some((segment) => segment.status === 'unknown')) status = 'unknown';
+      else status = sent > 0 ? 'partial' : 'failed';
+      this.store.updateOutbound({
+        id: record.id,
+        segments,
+        status,
+        attempts,
+        lastError,
+        nextAttemptAt,
+      });
+    };
+
+    persist();
     for (const segment of segments) {
-      if (segment.status === 'sent') continue;
+      // 已确认的和结果未知的都不再重发：unknown 可能已经到达平台。
+      if (segment.status === 'sent' || segment.status === 'unknown') continue;
       if (fatal) break;
+      // 上次进程把这一段交给了平台却没等到回执：结果未知，不能重发。
+      if (segment.status === 'sending') {
+        segment.status = 'unknown';
+        segment.error = '进程在发送途中中断，无法确认平台是否收到';
+        unknown = true;
+        lastError = segment.error;
+        persist();
+        continue;
+      }
       if (segment.kind === 'file' && !segment.path) {
-        // 引用真实产物版本，文件不存在或指纹不符就不发。
-        const resolved = this.resolveArtifactSegment(record.taskId, segment.name ?? '');
+        // 只认排队时固定的产物版本；文件不存在或指纹不符就不发。
+        const resolved = this.resolveArtifactSegment(segment);
         if (!resolved.ok) {
           segment.status = 'failed';
           segment.error = resolved.reason;
           lastError = resolved.reason;
           fatal = true;
+          persist();
           break;
         }
         segment.path = resolved.path;
       }
       attempts += 1;
+      // 先记为"已交给平台"，再真正发：否则进程在等待回执时死掉，
+      // 数据库里还是 pending，重启会重发一条平台其实已经收到的消息。
+      segment.status = 'sending';
+      persist();
       let outcome: SendOutcome;
       try {
         outcome = await adapter.send({ target, segment, signal: new AbortController().signal });
@@ -642,14 +814,17 @@ export class ChannelService {
         segment.status = 'sent';
         segment.platformMessageId = outcome.platformMessageId;
         segment.error = null;
+        persist();
         continue;
       }
       if (outcome.status === 'unknown') {
-        // 平台可能已经收到：不再重复发送这一段，记录真实的不确定状态。
+        // 平台可能已经收到：不再重复发送这一段，记录真实的不确定状态，
+        // 但后面的段照常发，不陪着一起停。
         segment.status = 'unknown';
         segment.error = outcome.error;
         unknown = true;
         lastError = outcome.error;
+        persist();
         continue;
       }
       segment.status = 'failed';
@@ -658,36 +833,30 @@ export class ChannelService {
       fatal = !outcome.retryable;
       // 平台给了等待时间就按它等；否则按尝试次数退避，别对着限速接口空转。
       waitMs = fatal ? null : (outcome.retryAfterMs ?? backoffMs(attempts));
+      persist(waitMs === null ? null : new Date(Date.now() + waitMs).toISOString());
       break;
     }
 
-    const sent = segments.filter((segment) => segment.status === 'sent').length;
-    let status: 'pending' | 'partial' | 'sent' | 'failed' | 'unknown';
-    if (sent === segments.length) status = 'sent';
-    else if (unknown) status = 'unknown';
-    else if (fatal) status = 'failed';
-    else status = sent > 0 ? 'partial' : 'pending';
-    this.store.updateOutbound({
-      id: record.id,
-      segments,
-      status,
-      attempts,
-      lastError,
-      nextAttemptAt: waitMs === null ? null : new Date(Date.now() + waitMs).toISOString(),
-    });
+    persist(waitMs === null ? null : new Date(Date.now() + waitMs).toISOString());
   }
 
-  /** 文件段只能取本任务已登记的产物版本。 */
-  private resolveArtifactSegment(
-    taskId: string | null,
-    name: string,
-  ): { ok: true; path: string } | { ok: false; reason: string } {
-    if (!taskId) return { ok: false, reason: '没有关联任务，不能发送文件' };
-    const artifact = this.store
-      .listArtifacts(taskId)
-      .filter((item) => item.name === name)
-      .at(-1);
-    if (!artifact) return { ok: false, reason: `任务没有名为 ${name} 的产物` };
+  /**
+   * 文件段只认排队时固定的那一份产物。
+   *
+   * 以前是按名字现场挑"最新版本"，于是用户说"发 v1"、Worker 随后又存了 v2，
+   * 真正发出去的是 v2——指纹校验只能证明 v2 自身没被篡改，证明不了它就是承诺的那份。
+   */
+  private resolveArtifactSegment(segment: OutboundSegment): { ok: true; path: string } | { ok: false; reason: string } {
+    const artifactId = segment.artifactId;
+    if (!artifactId) return { ok: false, reason: '文件段没有固定的产物版本，拒绝发送' };
+    const artifact = this.store.getArtifact(artifactId);
+    if (!artifact) return { ok: false, reason: `产物记录不存在：${artifactId}` };
+    if (segment.version !== undefined && artifact.version !== segment.version) {
+      return { ok: false, reason: `产物版本不符：排队时是 v${segment.version}，登记是 v${artifact.version}` };
+    }
+    if (segment.sha256 !== undefined && artifact.sha256 !== segment.sha256) {
+      return { ok: false, reason: '产物指纹与排队时登记的不一致，拒绝发送' };
+    }
     const absolute = resolveArtifactPath(this.config.workDir, artifact.path);
     if (!absolute) return { ok: false, reason: `产物文件不在工作目录内或已不存在：${artifact.path}` };
     const size = statSync(absolute).size;

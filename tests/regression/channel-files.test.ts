@@ -162,7 +162,8 @@ test('出站文件：只发已登记且指纹一致的产物', async () => {
       createdAt: new Date().toISOString(),
     });
 
-    service.enqueueOutbound(TG_KEY, '文件给你', created.task.id, 'report.md');
+    const pinned = { artifactId: 'art_1', name: 'report.md', version: 1, sha256: sha256Of(bytes), bytes: bytes.byteLength };
+    service.enqueueOutbound(TG_KEY, '文件给你', created.task.id, pinned);
     await service.drainOutbound();
 
     const fileSends = adapter.sent.filter((item) => item.segment.kind === 'file');
@@ -172,7 +173,7 @@ test('出站文件：只发已登记且指纹一致的产物', async () => {
 
     // 产物被改坏后不能再发
     writeFileSync(join(harness.config.workDir, rel), '# 被改过\n', 'utf8');
-    service.enqueueOutbound(TG_KEY, '再发一次', created.task.id, 'report.md');
+    service.enqueueOutbound(TG_KEY, '再发一次', created.task.id, pinned);
     await service.drainOutbound();
     const rows = harness.store.listOutboundBySession(TG_KEY);
     const last = rows.at(-1)!;
@@ -200,13 +201,19 @@ test('出站文件：没有登记过的名字与越界路径都不发', async ()
       ownerBrief: 'b',
       source: { channel: 'telegram', accountId: 'bot_1', peerId: 'owner-1', sessionKey: TG_KEY },
     });
-    service.enqueueOutbound(TG_KEY, '发个不存在的', created.task.id, '../secrets.txt');
+    service.enqueueOutbound(TG_KEY, '发个不存在的', created.task.id, {
+      artifactId: 'art_missing',
+      name: '../secrets.txt',
+      version: 1,
+      sha256: 'deadbeef',
+      bytes: 1,
+    });
     await service.drainOutbound();
     const row = harness.store.listOutboundBySession(TG_KEY).at(-1)!;
     const segments = (Array.isArray(row.segments) ? row.segments : []) as OutboundSegment[];
     const fileSegment = segments.find((segment) => segment.kind === 'file')!;
     assert.equal(fileSegment.status, 'failed');
-    assert.match(fileSegment.error ?? '', /没有名为/);
+    assert.match(fileSegment.error ?? '', /产物记录不存在/);
     assert.equal(adapter.sent.filter((item) => item.segment.kind === 'file').length, 0);
   } finally {
     await service.stop();
@@ -300,4 +307,263 @@ test('入站描述：附件只说明存在与大小，不编造内容', () => {
   assert.match(text, /没有视觉输入/, '必须如实说明模型读不了图');
   assert.match(text, /data\.csv/);
   assert.doesNotMatch(text, /内容是/, '不能编造文件内容');
+});
+
+test('出站文件：排队后登记了新版本，也只发排队时固定的那一份', async () => {
+  const harness = await createHarness({ worker: () => mockReply({ text: '收到' }) });
+  const service = serviceOf({ runtime: harness.runtime, store: harness.store, config: harness.config });
+  const adapter = new FakeAdapter('telegram', 'bot_1', ['owner-1']);
+  service.register(adapter);
+  service.start();
+  try {
+    const created = harness.runtime.createTask({
+      title: 't',
+      goal: 'g',
+      ownerRole: 'r',
+      ownerBrief: 'b',
+      source: { channel: 'telegram', accountId: 'bot_1', peerId: 'owner-1', sessionKey: TG_KEY },
+    });
+    const write = (rel: string, body: string): { bytes: Buffer; sha: string } => {
+      writeFileSync(join(harness.config.workDir, rel), body, 'utf8');
+      const bytes = readFileSync(join(harness.config.workDir, rel));
+      return { bytes, sha: sha256Of(bytes) };
+    };
+
+    const v1Rel = `${created.task.id}/artifacts/v1/report.md`;
+    mkdirSync(join(harness.config.workDir, created.task.id, 'artifacts', 'v1'), { recursive: true });
+    const v1 = write(v1Rel, '# 第一版\n');
+    harness.store.insertArtifact({
+      id: 'art_v1',
+      taskId: created.task.id,
+      workerId: created.owner.id,
+      name: 'report.md',
+      path: v1Rel,
+      version: 1,
+      bytes: v1.bytes.byteLength,
+      sha256: v1.sha,
+      createdAt: new Date().toISOString(),
+    });
+
+    // 用户此刻说"发我这份"：排队时就固定 v1。
+    service.enqueueOutbound(TG_KEY, '发你 v1', created.task.id, {
+      artifactId: 'art_v1',
+      name: 'report.md',
+      version: 1,
+      sha256: v1.sha,
+      bytes: v1.bytes.byteLength,
+    });
+
+    const v2Rel = `${created.task.id}/artifacts/v2/report.md`;
+    mkdirSync(join(harness.config.workDir, created.task.id, 'artifacts', 'v2'), { recursive: true });
+    const v2 = write(v2Rel, '# 第二版，还没人看\n');
+    harness.store.insertArtifact({
+      id: 'art_v2',
+      taskId: created.task.id,
+      workerId: created.owner.id,
+      name: 'report.md',
+      path: v2Rel,
+      version: 2,
+      bytes: v2.bytes.byteLength,
+      sha256: v2.sha,
+      createdAt: new Date().toISOString(),
+    });
+
+    await service.drainOutbound();
+
+    const fileSend = adapter.sent.find((item) => item.segment.kind === 'file')!;
+    assert.ok(fileSend, '文件段应该发出去');
+    assert.equal(fileSend.segment.version, 1, '发出去的必须是排队时的 v1');
+    assert.equal(
+      readFileSync(fileSend.segment.path!, 'utf8'),
+      '# 第一版\n',
+      '发出去的内容必须是 v1，不能被后来的 v2 顶替',
+    );
+  } finally {
+    await service.stop();
+    await harness.cleanup();
+  }
+});
+
+test('出站文件：工作目录里指向外部的符号链接不能骗过路径检查', async () => {
+  const harness = await createHarness({ worker: () => mockReply({ text: '收到' }) });
+  const service = serviceOf({ runtime: harness.runtime, store: harness.store, config: harness.config });
+  const adapter = new FakeAdapter('telegram', 'bot_1', ['owner-1']);
+  service.register(adapter);
+  service.start();
+  try {
+    const created = harness.runtime.createTask({
+      title: 't',
+      goal: 'g',
+      ownerRole: 'r',
+      ownerBrief: 'b',
+      source: { channel: 'telegram', accountId: 'bot_1', peerId: 'owner-1', sessionKey: TG_KEY },
+    });
+    // 目录外的真实文件 + 任务目录内指向它的软链
+    const outside = join(harness.dir, 'outside-secret.txt');
+    writeFileSync(outside, '不该发出去的内容\n', 'utf8');
+    const outsideBytes = readFileSync(outside);
+    const linkRel = `${created.task.id}/link.md`;
+    mkdirSync(join(harness.config.workDir, created.task.id), { recursive: true });
+    const { symlinkSync } = await import('node:fs');
+    symlinkSync(outside, join(harness.config.workDir, linkRel));
+
+    harness.store.insertArtifact({
+      id: 'art_link',
+      taskId: created.task.id,
+      workerId: created.owner.id,
+      name: 'link.md',
+      path: linkRel,
+      version: 1,
+      bytes: outsideBytes.byteLength,
+      sha256: sha256Of(outsideBytes),
+      createdAt: new Date().toISOString(),
+    });
+
+    service.enqueueOutbound(TG_KEY, '发一下', created.task.id, {
+      artifactId: 'art_link',
+      name: 'link.md',
+      version: 1,
+      sha256: sha256Of(outsideBytes),
+      bytes: outsideBytes.byteLength,
+    });
+    await service.drainOutbound();
+
+    const row = harness.store.listOutboundBySession(TG_KEY).at(-1)!;
+    const segments = (Array.isArray(row.segments) ? row.segments : []) as OutboundSegment[];
+    const fileSegment = segments.find((segment) => segment.kind === 'file')!;
+    assert.equal(fileSegment.status, 'failed', '软链指向工作目录之外必须拒绝');
+    assert.match(fileSegment.error ?? '', /不在工作目录内/);
+    assert.equal(adapter.sent.filter((item) => item.segment.kind === 'file').length, 0);
+  } finally {
+    await service.stop();
+    await harness.cleanup();
+  }
+});
+
+test('材料认领：建任务事务失败时，附件不能被不存在的任务占用', async () => {
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    // 建任务时创建负责人会撞上 Worker 上限，事务整体回滚。
+    limits: { maxWorkersPerGroup: 0 },
+  });
+  try {
+    const payload = Buffer.from('这份材料必须还能重试\n', 'utf8');
+    const stored = writeInboundAttachment({
+      workDir: harness.config.workDir,
+      channel: 'telegram',
+      accountId: 'bot_1',
+      eventId: 'update:31',
+      name: '重试.csv',
+      kind: 'file',
+      mime: 'text/csv',
+      bytes: payload,
+    });
+    harness.store.recordInboundBatch({
+      channel: 'telegram',
+      accountId: 'bot_1',
+      ownerIds: ['owner-1'],
+      events: [
+        {
+          id: 'in_31',
+          eventId: 'update:31',
+          peerId: 'owner-1',
+          senderId: 'owner-1',
+          platformMessageId: '31',
+          sessionKey: TG_KEY,
+          threadId: null,
+          body: '材料给你',
+          attachments: [stored],
+          unsupported: null,
+          receivedAt: new Date().toISOString(),
+        },
+      ],
+      cursor: '32',
+    });
+    harness.store.markInbound('in_31', 'handed');
+
+    assert.throws(() =>
+      harness.runtime.createTask({
+        title: 't',
+        goal: 'g',
+        ownerRole: 'r',
+        ownerBrief: 'b',
+        source: { channel: 'telegram', accountId: 'bot_1', peerId: 'owner-1', sessionKey: TG_KEY },
+      }),
+    );
+
+    assert.equal(harness.store.listTasks().length, 0, '事务回滚后不能留下任务');
+    assert.equal(
+      harness.store.listUnclaimedSessionAttachments(TG_KEY).length,
+      1,
+      '材料必须仍然可用，用户重试建任务时还能带上',
+    );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('材料补充：任务建好后用户再发文件，能补进已有任务且只能补一次', async () => {
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    router: () => mockReply({ text: '好的' }),
+  });
+  try {
+    const { task } = harness.runtime.createTask({
+      title: '已有任务',
+      goal: 'g',
+      ownerRole: 'r',
+      ownerBrief: 'b',
+      source: { channel: 'telegram', accountId: 'bot_1', peerId: 'owner-1', sessionKey: TG_KEY },
+    });
+    const payload = Buffer.from('后来补的材料\n', 'utf8');
+    const stored = writeInboundAttachment({
+      workDir: harness.config.workDir,
+      channel: 'telegram',
+      accountId: 'bot_1',
+      eventId: 'update:41',
+      name: '补充.csv',
+      kind: 'file',
+      mime: 'text/csv',
+      bytes: payload,
+    });
+    harness.store.recordInboundBatch({
+      channel: 'telegram',
+      accountId: 'bot_1',
+      ownerIds: ['owner-1'],
+      events: [
+        {
+          id: 'in_41',
+          eventId: 'update:41',
+          peerId: 'owner-1',
+          senderId: 'owner-1',
+          platformMessageId: '41',
+          sessionKey: TG_KEY,
+          threadId: null,
+          body: '再补一份',
+          attachments: [stored],
+          unsupported: null,
+          receivedAt: new Date().toISOString(),
+        },
+      ],
+      cursor: '42',
+    });
+    // 消息已被 Router 交接之后，材料才处于"可补充"状态
+    harness.store.markInbound('in_41', 'handed');
+
+    const attached = harness.runtime.attachSessionMaterials(task.id, TG_KEY);
+    assert.equal(attached.ok, true);
+    const files = attached.ok ? attached.files : [];
+    assert.equal(files.length, 1, '应有一份材料被补进去');
+    const target = join(harness.config.workDir, files[0]!.path);
+    assert.ok(existsSync(target), `材料应落在任务目录里（${target}）`);
+    assert.equal(readFileSync(target, 'utf8'), payload.toString('utf8'), '内容必须一致');
+    assert.match(harness.store.getTask(task.id)!.brief, /补充\.csv/, '任务说明里要记下这份材料');
+
+    // 再补一次：没有新材料了，必须明确说没有，而不是假装成功
+    const again = harness.runtime.attachSessionMaterials(task.id, TG_KEY);
+    assert.equal(again.ok, false);
+    assert.match(again.ok ? '' : again.message, /没有待补充的材料/);
+  } finally {
+    await harness.cleanup();
+  }
 });

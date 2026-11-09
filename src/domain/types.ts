@@ -59,6 +59,11 @@ export interface Task {
   sourcePeerId?: string | null;
   /** 来源会话键；同一聊天内的追问与续接都按它定位。 */
   sourceSessionKey?: string | null;
+  /**
+   * 来源话题：一个聊天窗口里可以有多个互相独立的话题。
+   * 老任务没有这一列（null），仍按"本聊天可见"处理。
+   */
+  sourceConversationId?: string | null;
   status: TaskStatus;
   closeReason: string | null;
   createdAt: string;
@@ -109,6 +114,20 @@ export interface Message {
   deliveredAt: string | null;
   consumedAt: string | null;
   error: string | null;
+}
+
+/**
+ * 排队交付时固定的产物身份。
+ *
+ * 用户说"把这个文件发我"的那一刻就决定了版本：之后 Worker 再存 v3，
+ * 不能悄悄替换掉已经排队的 v2。发送前按 id + 版本 + 指纹重新核验真实文件。
+ */
+export interface OutboundArtifact {
+  artifactId: string;
+  name: string;
+  version: number;
+  sha256: string;
+  bytes: number;
 }
 
 export interface Artifact {
@@ -212,8 +231,10 @@ export type RuntimeEvent =
       sessionKey: string;
       text: string;
       taskId: string | null;
-      /** 要作为真实文件发出的已登记产物名；为空表示纯文本。 */
-      artifact: string | null;
+      /** 排队时固定的产物版本；为空表示纯文本。 */
+      artifact: OutboundArtifact | null;
+      /** 这条回信属于哪个话题；为空表示老任务，没有话题归属。 */
+      conversationId?: string | null;
     }
   | { type: 'error'; text: string };
 

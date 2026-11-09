@@ -127,6 +127,49 @@ test('Telegram：429 返回可重试与建议等待时间', async () => {
   }
 });
 
+test('Telegram：文本按 HTML 发送，解析失败退回纯文本', async () => {
+  const { workDir, cleanup } = await tempWork();
+  const bodies: string[] = [];
+  let attempt = 0;
+  const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
+    attempt += 1;
+    const payload = JSON.parse(String(init?.body ?? '{}')) as { text?: string; parse_mode?: string };
+    bodies.push(`${payload.parse_mode ?? 'plain'}|${payload.text ?? ''}`);
+    if (attempt === 1) {
+      return jsonResponse({ ok: false, description: "Bad Request: can't parse entities", error_code: 400 }, 400);
+    }
+    return jsonResponse({ ok: true, result: { message_id: 77 } });
+  }) as unknown as typeof fetch;
+  const adapter = new TelegramAdapter({
+    token: '1:S',
+    ownerIds: ['1'],
+    apiBase: 'http://127.0.0.1:9',
+    workDir,
+    pollTimeoutMs: 1000,
+    maxInboundBytes: 1024,
+    fetchImpl,
+  });
+  try {
+    const outcome = await adapter.send({
+      target: { channel: 'telegram', accountId: adapter.accountId, peerId: '1', sessionKey: 'telegram|bot_1|1' },
+      segment: {
+        index: 0,
+        kind: 'text',
+        text: '**重点** 和 `code`',
+        status: 'pending',
+        platformMessageId: null,
+        error: null,
+      },
+      signal: new AbortController().signal,
+    });
+    assert.equal(outcome.status, 'sent', '解析失败也要把消息发出去');
+    assert.match(bodies[0]!, /^HTML\|<b>重点<\/b>/, '第一次带 HTML 渲染');
+    assert.equal(bodies[1]!, 'plain|重点 和 code', '第二次退回纯文本，不带标记');
+  } finally {
+    await cleanup();
+  }
+});
+
 test('Telegram：令牌失效是鉴权错误，不当作可重试的网络抖动', async () => {
   const { workDir, cleanup } = await tempWork();
   const fetchImpl = (async () =>
@@ -501,5 +544,145 @@ test('微信：经完整渠道服务跑一轮，回复带回该会话的 context
   } finally {
     await service.stop();
     await harness.cleanup();
+  }
+});
+
+test('微信：发送只看 ret 不够，errcode 非 0 也不能算已发送', async () => {
+  const { workDir, cleanup } = await tempWork();
+  const sessionKey = 'weixin|bot_abc|wxid_owner';
+  const fetchImpl = (async (url: string | URL) => {
+    if (String(url).includes('sendmessage')) return jsonResponse({ ret: 0, errcode: -14, errmsg: 'stale token' });
+    return jsonResponse({ ret: 0 });
+  }) as unknown as typeof fetch;
+  const adapter = weixinAdapter({ workDir, fetchImpl });
+  try {
+    const outcome = await adapter.send({
+      target: { channel: 'weixin', accountId: 'bot_abc', peerId: 'wxid_owner', sessionKey },
+      segment: { index: 0, kind: 'text', text: '你好', status: 'pending', platformMessageId: null, error: null },
+      signal: new AbortController().signal,
+    });
+    assert.equal(outcome.status, 'failed', 'ret=0 但 errcode=-14 必须判失败');
+    assert.equal(outcome.retryable, false, '登录失效不进入重试');
+    assert.match(outcome.error ?? '', /errcode -14/);
+  } finally {
+    await cleanup();
+  }
+});
+
+test('微信：外部取消要真的作用到请求上，而不是等内部超时', async () => {
+  const { workDir, cleanup } = await tempWork();
+  const controller = new AbortController();
+  let sawAborted = false;
+  const fetchImpl = (async (_url: string | URL, init?: RequestInit) => {
+    const signal = init?.signal;
+    assert.ok(signal, '请求必须带 signal');
+    // 立刻取消：真实实现应当在请求层就中止，而不是自己数秒。
+    controller.abort();
+    sawAborted = signal.aborted === true;
+    throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+  }) as unknown as typeof fetch;
+  const adapter = weixinAdapter({ workDir, fetchImpl });
+  try {
+    const outcome = await adapter.send({
+      target: { channel: 'weixin', accountId: 'bot_abc', peerId: 'wxid_owner', sessionKey: 'weixin|bot_abc|wxid_owner' },
+      segment: { index: 0, kind: 'text', text: '你好', status: 'pending', platformMessageId: null, error: null },
+      signal: controller.signal,
+    });
+    assert.equal(sawAborted, true, '外部取消必须传到 fetch 的 signal 上');
+    assert.equal(outcome.status, 'unknown', '请求中止时结果未知，不能当成功');
+  } finally {
+    await cleanup();
+  }
+});
+
+test('Telegram：停机时文件下载要跟着取消，不能把大文件下完', async () => {
+  const { workDir, cleanup } = await tempWork();
+  const controller = new AbortController();
+  const seen: { url: string; aborted: boolean }[] = [];
+  const fetchImpl = (async (url: string | URL, init?: RequestInit) => {
+    const text = String(url);
+    seen.push({ url: text, aborted: init?.signal?.aborted === true });
+    if (text.includes('/getUpdates')) {
+      return jsonResponse({
+        ok: true,
+        result: [
+        {
+          update_id: 9,
+          message: {
+            message_id: 9,
+            date: Math.floor(Date.now() / 1000),
+            chat: { id: 777001, type: 'private' },
+            from: { id: 777001 },
+            document: { file_id: 'f1', file_name: 'a.pdf', file_size: 10 },
+          },
+        },
+        ],
+      });
+    }
+    if (text.includes('/getFile')) {
+      // 取到下载地址之后、真正下载之前停机
+      controller.abort();
+      return jsonResponse({ ok: true, result: { file_path: 'documents/a.pdf' } });
+    }
+    // 二进制下载：请求必须带着已经取消的 signal，真实实现会立刻中止
+    return new Response(new Uint8Array([1, 2, 3]), { status: 200 });
+  }) as unknown as typeof fetch;
+
+  const adapter = new TelegramAdapter({
+    token: 't',
+    ownerIds: ['777001'],
+    apiBase: 'http://127.0.0.1:9',
+    workDir,
+    pollTimeoutMs: 1000,
+    maxInboundBytes: 1024,
+    fetchImpl,
+  });
+  try {
+    await adapter.poll({ cursor: null, signal: controller.signal });
+    const download = seen.find((item) => item.url.includes('/file/bot'));
+    assert.ok(download, '应当真的去下载文件');
+    assert.equal(download!.aborted, true, '下载请求必须带取消信号');
+  } finally {
+    await cleanup();
+  }
+});
+
+test('Telegram：草稿走 sendMessageDraft，纯文本、draft_id 非零、无 message_id', async () => {
+  const { workDir, cleanup } = await tempWork();
+  const calls: { url: string; body: string }[] = [];
+  const fetchImpl = (async (url: string | URL, init?: RequestInit) => {
+    calls.push({ url: String(url), body: String(init?.body ?? '') });
+    return jsonResponse({ ok: true, result: true });
+  }) as unknown as typeof fetch;
+  const adapter = new TelegramAdapter({
+    token: 't',
+    ownerIds: ['777001'],
+    apiBase: 'http://127.0.0.1:9',
+    workDir,
+    pollTimeoutMs: 1000,
+    maxInboundBytes: 1024,
+    fetchImpl,
+  });
+  try {
+    const outcome = await adapter.draft({
+      target: {
+        channel: 'telegram',
+        accountId: 'bot_1',
+        peerId: '777001',
+        sessionKey: 'telegram|bot_1|777001',
+      },
+      draftId: 42,
+      text: '**正在执行**：list_tasks',
+      signal: new AbortController().signal,
+    });
+    assert.equal(outcome.status, 'sent');
+    assert.equal(outcome.status === 'sent' ? outcome.platformMessageId : 'x', null, '草稿没有 message_id');
+    assert.match(calls[0]!.url, /\/sendMessageDraft$/);
+    const payload = JSON.parse(calls[0]!.body) as Record<string, unknown>;
+    assert.equal(payload['chat_id'], 777001, 'chat_id 必须是数字');
+    assert.equal(payload['draft_id'], 42);
+    assert.equal(payload['text'], '正在执行：list_tasks', '草稿用纯文本，避免半截 Markdown 解析失败');
+  } finally {
+    await cleanup();
   }
 });

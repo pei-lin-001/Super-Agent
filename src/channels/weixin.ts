@@ -28,6 +28,7 @@ import type {
 } from './types.ts';
 import { ChannelAuthError } from './types.ts';
 import { writeInboundAttachment, type StoredAttachment } from './storage.ts';
+import { toPlainText } from './render.ts';
 
 /** 微信消息项类型。 */
 const ITEM = { TEXT: 1, IMAGE: 2, VOICE: 3, FILE: 4, VIDEO: 5 } as const;
@@ -276,15 +277,22 @@ export class WeixinAdapter implements ChannelAdapter {
     return { channel_version: this.options.appVersion ?? '1.0.0', bot_agent: 'Super-Agent' };
   }
 
-  private async post<T>(endpoint: string, body: Record<string, unknown>, timeoutMs: number): Promise<T> {
+  private async post<T>(
+    endpoint: string,
+    body: Record<string, unknown>,
+    timeoutMs: number,
+    signal?: AbortSignal | null,
+  ): Promise<T> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+    // 外部取消和单次超时都要生效：只等内部超时的话，停机时请求还会继续跑。
+    const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
     try {
       const response = await this.fetchImpl(`${this.baseUrl}/${endpoint}`, {
         method: 'POST',
         headers: this.headers(true),
         body: JSON.stringify({ ...body, base_info: this.baseInfo() }),
-        signal: controller.signal,
+        signal: combined,
       });
       const raw = await response.text();
       if (!response.ok) {
@@ -300,7 +308,7 @@ export class WeixinAdapter implements ChannelAdapter {
     const body: Record<string, unknown> = { get_updates_buf: input.cursor ?? '' };
     let response: GetUpdatesResp;
     try {
-      response = await this.post<GetUpdatesResp>('ilink/bot/getupdates', body, this.longPollTimeoutMs);
+      response = await this.post<GetUpdatesResp>('ilink/bot/getupdates', body, this.longPollTimeoutMs, input.signal);
     } catch (error) {
       if (input.signal.aborted) return { events: [], cursor: null };
       const name = (error as Error).name;
@@ -444,47 +452,56 @@ export class WeixinAdapter implements ChannelAdapter {
     segment: OutboundSegment;
     signal: AbortSignal;
   }): Promise<SendOutcome> {
-    const { target, segment } = input;
+    const { target, segment, signal } = input;
     const contextToken = this.options.contextTokens.get(target.sessionKey);
     try {
       if (segment.kind === 'text') {
-        await this.sendMessage({
-          to: target.peerId,
-          clientId: `sa-${randomUUID()}`,
-          contextToken,
-          item: { type: ITEM.TEXT, text_item: { text: segment.text ?? '' } },
-        });
+        await this.sendMessage(
+          {
+            to: target.peerId,
+            clientId: `sa-${randomUUID()}`,
+            contextToken,
+            item: { type: ITEM.TEXT, text_item: { text: toPlainText(segment.text ?? '') } },
+          },
+          signal,
+        );
         return { status: 'sent', platformMessageId: null };
       }
       const path = segment.path;
       if (!path) return { status: 'failed', error: '文件段缺少本地路径', retryable: false };
-      const uploaded = await this.uploadFile(path, segment.name ?? 'file.bin', target.peerId);
+      const uploaded = await this.uploadFile(path, segment.name ?? 'file.bin', target.peerId, signal);
       // 说明文字与文件拆成两个请求：与平台客户端行为一致，各自有独立 client_id。
       if (segment.name) {
-        await this.sendMessage({
+        await this.sendMessage(
+          {
+            to: target.peerId,
+            clientId: `sa-${randomUUID()}`,
+            contextToken,
+            item: { type: ITEM.TEXT, text_item: { text: segment.name } },
+          },
+          signal,
+        );
+      }
+      await this.sendMessage(
+        {
           to: target.peerId,
           clientId: `sa-${randomUUID()}`,
           contextToken,
-          item: { type: ITEM.TEXT, text_item: { text: segment.name } },
-        });
-      }
-      await this.sendMessage({
-        to: target.peerId,
-        clientId: `sa-${randomUUID()}`,
-        contextToken,
-        item: {
-          type: ITEM.FILE,
-          file_item: {
-            media: {
-              encrypt_query_param: uploaded.downloadParam,
-              aes_key: Buffer.from(uploaded.aesKey).toString('base64'),
-              encrypt_type: 1,
+          item: {
+            type: ITEM.FILE,
+            file_item: {
+              media: {
+                encrypt_query_param: uploaded.downloadParam,
+                aes_key: Buffer.from(uploaded.aesKey).toString('base64'),
+                encrypt_type: 1,
+              },
+              file_name: segment.name ?? 'file.bin',
+              len: String(uploaded.plainSize),
             },
-            file_name: segment.name ?? 'file.bin',
-            len: String(uploaded.plainSize),
           },
         },
-      });
+        signal,
+      );
       return { status: 'sent', platformMessageId: null };
     } catch (error) {
       if (error instanceof ChannelAuthError) {
@@ -503,13 +520,16 @@ export class WeixinAdapter implements ChannelAdapter {
     }
   }
 
-  private async sendMessage(input: {
-    to: string;
-    clientId: string;
-    contextToken: string | null;
-    item: unknown;
-  }): Promise<void> {
-    const response = await this.post<{ ret?: number; errmsg?: string }>(
+  private async sendMessage(
+    input: {
+      to: string;
+      clientId: string;
+      contextToken: string | null;
+      item: unknown;
+    },
+    signal?: AbortSignal | null,
+  ): Promise<void> {
+    const response = await this.post<{ ret?: number; errcode?: number; errmsg?: string }>(
       'ilink/bot/sendmessage',
       {
         msg: {
@@ -523,9 +543,16 @@ export class WeixinAdapter implements ChannelAdapter {
         },
       },
       15_000,
+      signal,
     );
-    if (response.ret !== undefined && response.ret !== 0) {
-      throw new Error(`sendMessage ret=${response.ret} errmsg=${response.errmsg ?? '(none)'}`);
+    // 和 getUpdates 用同一套判定：errcode 优先，其次 ret，非零即业务拒绝。
+    // 只看 ret 会把 errcode=-14（登录失效）这类响应当成发送成功。
+    const code = response.errcode ?? response.ret ?? 0;
+    if (code !== 0) {
+      if (code === STALE_TOKEN_ERRCODE) {
+        throw new ChannelAuthError('weixin', `登录已失效（errcode ${code}）：需要重新扫码登录`);
+      }
+      throw new Error(`sendMessage ret=${response.ret} errcode=${response.errcode} errmsg=${response.errmsg ?? '(none)'}`);
     }
   }
 
@@ -534,6 +561,7 @@ export class WeixinAdapter implements ChannelAdapter {
     path: string,
     name: string,
     toUserId: string,
+    signal?: AbortSignal | null,
   ): Promise<{ downloadParam: string; aesKey: Buffer; plainSize: number }> {
     const plaintext = readFileSync(path);
     const rawSize = plaintext.byteLength;
@@ -560,6 +588,7 @@ export class WeixinAdapter implements ChannelAdapter {
         aeskey: aesKey.toString('hex'),
       },
       15_000,
+      signal,
     );
     if (uploadInfo.ret !== undefined && uploadInfo.ret !== 0) {
       throw new Error(`getUploadUrl ret=${uploadInfo.ret} errmsg=${uploadInfo.errmsg ?? '(none)'}`);
@@ -574,10 +603,12 @@ export class WeixinAdapter implements ChannelAdapter {
     }
 
     const ciphertext = encryptAesEcb(plaintext, aesKey);
+    // CDN 上传同样要能被停机取消：大文件上传不该在收尾阶段继续跑。
     const response = await this.fetchImpl(cdnUrl, {
       method: 'POST',
       headers: { 'content-type': 'application/octet-stream' },
       body: new Uint8Array(ciphertext),
+      ...(signal ? { signal } : {}),
     });
     if (!response.ok) {
       const detail = response.headers.get('x-error-message') ?? `HTTP ${response.status}`;

@@ -100,8 +100,19 @@ export interface OutboundSegment {
   /** 文件段的受控路径与展示名。 */
   path?: string;
   name?: string;
-  /** sent / failed / unknown / pending */
-  status: 'pending' | 'sent' | 'failed' | 'unknown';
+  /**
+   * 文件段固定的产物身份。排队时就写死，发送时按它重新核验，
+   * 不能到发送那一刻再去挑"这个名字的最新版本"。
+   */
+  artifactId?: string;
+  version?: number;
+  sha256?: string;
+  bytes?: number;
+  /**
+   * sending 是"已经交给平台、还没拿到回执"的中间态。
+   * 进程在这里中断，重启后只能记 unknown，不能当没发过。
+   */
+  status: 'pending' | 'sending' | 'sent' | 'failed' | 'unknown';
   platformMessageId: string | null;
   error: string | null;
 }
@@ -146,6 +157,13 @@ export interface ChannelCapabilities {
   typing: boolean;
   /** 能否原地修改已发消息（流式更新的载体）。 */
   edit: boolean;
+  /**
+   * 能否发"正在生成的草稿"（Telegram sendMessageDraft）。
+   *
+   * 草稿是临时预览：没有 message_id，不会留在聊天里，最终答案仍要正常发送。
+   * 有它就不需要先发一条占位消息再改写——那会多出一条真实气泡。
+   */
+  draft?: boolean;
 }
 
 export interface ChannelAdapter {
@@ -162,6 +180,16 @@ export interface ChannelAdapter {
   readonly capabilities?: ChannelCapabilities;
   /** 发送"正在输入"；到期由平台自动消失，上层按节奏补发。 */
   typing?(input: { target: OutboundTarget; signal: AbortSignal }): Promise<void>;
+  /**
+   * 更新"正在生成"的草稿预览。draftId 在同一次回答内保持不变，平台才会做动画。
+   * 没有 message_id，也不能编辑或删除；最终答案必须走 send。
+   */
+  draft?(input: {
+    target: OutboundTarget;
+    draftId: number;
+    text: string;
+    signal: AbortSignal;
+  }): Promise<SendOutcome>;
   /** 原地改写一条已发送消息（流式展示的载体）。 */
   edit?(input: {
     target: OutboundTarget;

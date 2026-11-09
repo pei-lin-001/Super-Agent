@@ -246,7 +246,7 @@ MAX_CONCURRENT_RUNS=3      全局同时执行的 Worker
 MAX_WORKERS_PER_GROUP=6    单组 Worker 上限
 MAX_TOTAL_WORKERS=12       全局 Worker 上限
 MAX_STEPS_PER_RUN=8        单次运行的模型调用上限
-MAX_STEPS_PER_WORKER=24
+MAX_STEPS_PER_WORKER=0      0 = 只写预算事件，不判死
 MAX_STEPS_PER_GROUP=160
 MAX_REQUEST_HOPS=4         request→reply 链最大跳数
 MESSAGE_TTL_MINUTES=30
@@ -379,7 +379,7 @@ Router：`create_task` `send_to_worker` `stop_task` `list_tasks` `read_task`。
 > 统计口径：返修轮次按**正式请求 / 检查批次**计数。上面两条 `approved` 对应两次检查请求，
 > 不是两条 `review` 记录——同一批检查里每份产物各有一行记录。
 
-**默认配置（`MAX_STEPS_PER_WORKER=24`）下两次都没跑完**：第一次负责人 23 步后卡在等待（系统通知没唤醒等待者，
+**当时的默认配置（`MAX_STEPS_PER_WORKER=24`，后来改成 0）下两次都没跑完**：第一次负责人 23 步后卡在等待（系统通知没唤醒等待者，
 已修）；第二次负责人 24 步耗尽。工具变多以后，这条链路本身就在 30–40 步量级。
 这次通过用的是 44 步的验收配置，**不是默认值**，提高上限这件事没有进默认配置。
 
@@ -905,13 +905,13 @@ pnpm accept:channel         # 进程级验收：本地假平台，真实启动 d
 
 ## 13. 已知限制
 
-- 长任务仍会触及 `MAX_STEPS_PER_WORKER` 或 `MAX_STEPS_PER_GROUP`；整理只能省输入，不能突破步数上限。
+- 长任务默认**不会**因为步数被中断（`MAX_STEPS_PER_WORKER` / `MAX_STEPS_PER_GROUP` 默认 0，只写 `budget.*` 事件）；显式设成 >0 才恢复"到点判死"。代价是跑飞的任务只能靠人停。
 - 单条工具结果超过 8000 字符会被截断并提示用 `offset` 续读；模型不一定照着做。
 - 外部副作用不保证精确一次。写文件类工具用 `dedupe_key` 与版本号降低重复风险，但这不等于事务回滚。
 - `requireReview` 需要 Router 在建任务时显式声明；程序不解析自然语言里的"要检查"。
 - 跨群组协作需要 Router 在两边分别下指令，尚未实现自动的跨组协商。
 - 真实模型容易反复保存新版本（最小冒烟里出现 11 个版本），版本号会快速膨胀；没有自动清理策略。
-- 真实模型也容易在检查环节来回多轮；`MAX_STEPS_PER_WORKER` 是当前唯一的兜底。
+- 真实模型也容易在检查环节来回多轮；默认配置不设步数上限，兜底要靠人观察与 `stop_task`。
 - Ollama Cloud 会返回 `finish_reason: "load"`，长任务明显变慢；程序会持久化等待并自动重试，但单次长任务仍可能耗时十分钟以上。
 - 没有长期记忆、权限系统、图形界面。
 - IM 渠道只覆盖单聊：群聊、频道、语音视频内容识别、模型视觉输入都不在本轮范围；图片只保存附件并如实说明读不了内容。

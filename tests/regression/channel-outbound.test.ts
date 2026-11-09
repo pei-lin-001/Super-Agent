@@ -349,39 +349,74 @@ test('正在输入：会话开始处理时发送，结束后停止；不支持�
   }
 });
 
-test('流式：支持编辑的平台只发一条占位消息，最终被改写成答案', async () => {
+test('流式：短回复不建占位消息，只发一条正常消息', async () => {
   const harness = await createHarness({
     worker: () => mockReply({ text: '收到' }),
-    router: () => mockReply({ text: '这是最终答案' }),
+    router: () => mockReply({ text: '这是快速答案' }),
   });
   const service = serviceOf({ runtime: harness.runtime, store: harness.store, config: harness.config });
   const adapter = new FakeAdapter('telegram', 'bot_1', ['owner-1']);
-  const edits: { messageId: string; text: string }[] = [];
-  const sends: string[] = [];
+  const edits: string[] = [];
   (adapter as unknown as { capabilities: { typing: boolean; edit: boolean } }).capabilities = {
-    typing: false,
+    typing: true,
     edit: true,
   };
-  (adapter as unknown as { edit: (input: { messageId: string; text: string }) => Promise<{ status: string; platformMessageId: string }> }).edit = async (input) => {
-    edits.push({ messageId: input.messageId, text: input.text });
-    return { status: 'sent', platformMessageId: input.messageId };
-  };
-  adapter.sendPolicy = () => {
-    sends.push('send');
-    return { status: 'sent', platformMessageId: 'm-placeholder' };
+  (adapter as unknown as { typing: () => Promise<void> }).typing = async () => undefined;
+  (adapter as unknown as { edit: (input: { text: string }) => Promise<{ status: string; platformMessageId: string }> }).edit = async (input) => {
+    edits.push(input.text);
+    return { status: 'sent', platformMessageId: 'm1' };
   };
   service.register(adapter);
   service.start();
   try {
     await harness.router.handleUserMessage('你好', { sessionKey: TG_KEY });
     await service.waitForIdle(3_000);
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    await service.drainOutbound();
 
-    assert.equal(sends.length, 1, `只该发一条占位消息（实际 ${sends.length} 条）`);
-    assert.equal(edits.at(-1)?.text, '这是最终答案', '占位消息应被改写成最终答案');
+    assert.equal(adapter.sent.length, 1, '短任务只该有一条普通消息');
+    assert.equal(adapter.sent[0]!.segment.text, '这是快速答案');
+    assert.equal(edits.length, 0, '短任务不该出现占位消息与其改写');
+  } finally {
+    await service.stop();
+    await harness.cleanup();
+  }
+});
+
+test('流式：任务确实慢时才建占位消息，最终被改写成答案', async () => {
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    router: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 3_000));
+      return mockReply({ text: '这是慢任务的最终答案' });
+    },
+  });
+  const service = serviceOf({ runtime: harness.runtime, store: harness.store, config: harness.config });
+  const adapter = new FakeAdapter('telegram', 'bot_1', ['owner-1']);
+  const edits: { messageId: string; text: string }[] = [];
+  (adapter as unknown as { capabilities: { typing: boolean; edit: boolean } }).capabilities = {
+    typing: true,
+    edit: true,
+  };
+  (adapter as unknown as { typing: () => Promise<void> }).typing = async () => undefined;
+  (adapter as unknown as { edit: (input: { messageId: string; text: string }) => Promise<{ status: string; platformMessageId: string }> }).edit = async (input) => {
+    edits.push({ messageId: input.messageId, text: input.text });
+    return { status: 'sent', platformMessageId: input.messageId };
+  };
+  adapter.sendPolicy = () => ({ status: 'sent', platformMessageId: 'm-placeholder' });
+  service.register(adapter);
+  service.start();
+  try {
+    const run = harness.router.handleUserMessage('帮我查一下', { sessionKey: TG_KEY });
+    await new Promise((resolve) => setTimeout(resolve, 3_500));
+    await run;
+    await service.waitForIdle(5_000);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    assert.equal(adapter.sent.length, 1, `慢任务只发一条占位消息（实际 ${adapter.sent.length}）`);
+    assert.equal(adapter.sent[0]!.segment.text, '正在处理…');
+    assert.equal(edits.at(-1)?.text, '这是慢任务的最终答案', '占位消息应被改写成最终答案');
     assert.equal(edits.at(-1)?.messageId, 'm-placeholder', '改写的是同一条消息');
-    const rows = harness.store.listOutboundBySession(TG_KEY);
-    assert.equal(rows.length, 0, '改写成功就不该再有独立发件记录');
+    assert.equal(harness.store.listOutboundBySession(TG_KEY).length, 0, '改写成功就不该再有独立发件记录');
   } finally {
     await service.stop();
     await harness.cleanup();
@@ -408,6 +443,194 @@ test('流式：不支持编辑的平台照常发新消息，不建占位', async
     await service.drainOutbound();
     assert.equal(adapter.sent.length, 1, '不支持编辑就只发一条最终消息');
     assert.equal(adapter.sent[0]!.segment.text, '微信里的回答');
+  } finally {
+    await service.stop();
+    await harness.cleanup();
+  }
+});
+
+test('出站：一段结果未知，不冻结后面确定没发的段', async () => {
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    // 9000 字符 → 三段（Telegram 单条上限 4000）
+    router: () => mockReply({ text: '甲'.repeat(9_000) }),
+  });
+  const service = serviceOf({ runtime: harness.runtime, store: harness.store, config: harness.config });
+  const adapter = new FakeAdapter('telegram', 'bot_1', ['owner-1']);
+  service.register(adapter);
+  service.start();
+  try {
+    let blocked = true;
+    adapter.sendPolicy = (input) => {
+      if (input.segment.index === 0) return { status: 'unknown', error: '请求超时' };
+      // 第一次推进时第二段被限速，第三段因此还没轮到
+      if (input.segment.index === 1 && blocked) return { status: 'failed', error: '限速', retryable: true };
+      return { status: 'sent', platformMessageId: `m${input.segment.index}` };
+    };
+    await harness.router.handleUserMessage('发吧', { sessionKey: TG_KEY });
+    await service.drainOutbound();
+
+    const first = harness.store.listOutboundBySession(TG_KEY)[0]!;
+    assert.notEqual(first.status, 'unknown', '还有段没发完时不能整条标成 unknown，否则再也调不动');
+
+    // 退避到期后继续推进：第二、三段必须还能发出去
+    blocked = false;
+    expireOutboundBackoff(harness.store, TG_KEY);
+    await service.drainOutbound();
+
+    const indexes = adapter.sent.map((item) => item.segment.index);
+    assert.deepEqual(indexes, [0, 1, 1, 2], '第一段只尝试一次，其余段继续发');
+    const final = harness.store.listOutboundBySession(TG_KEY)[0]!;
+    const segments = (Array.isArray(final.segments) ? final.segments : []) as OutboundSegment[];
+    assert.deepEqual(segments.map((segment) => segment.status), ['unknown', 'sent', 'sent']);
+    assert.equal(final.status, 'unknown', '全部都有结论后，整条如实记 unknown');
+  } finally {
+    await service.stop();
+    await harness.cleanup();
+  }
+});
+
+test('出站：每段拿到回执就立刻落库，不等整轮结束', async () => {
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    router: () => mockReply({ text: '乙'.repeat(5000) }),
+  });
+  const service = serviceOf({ runtime: harness.runtime, store: harness.store, config: harness.config });
+  const adapter = new FakeAdapter('telegram', 'bot_1', ['owner-1']);
+  service.register(adapter);
+  service.start();
+  try {
+    let calls = 0;
+    let firstStatusDuringSecondSend = '';
+    adapter.sendPolicy = () => {
+      calls += 1;
+      if (calls === 2) {
+        // 第二段开始发送的瞬间（第一段已确认、整轮还没结束）读数据库
+        const row = harness.store.listOutboundBySession(TG_KEY)[0]!;
+        const segments = (Array.isArray(row.segments) ? row.segments : []) as OutboundSegment[];
+        firstStatusDuringSecondSend = segments[0]!.status;
+      }
+      return { status: 'sent', platformMessageId: `m${calls}` };
+    };
+    await harness.router.handleUserMessage('发吧', { sessionKey: TG_KEY });
+    await service.drainOutbound();
+
+    assert.equal(firstStatusDuringSecondSend, 'sent', '第一段确认后必须立刻落库，否则崩溃会重发');
+  } finally {
+    await service.stop();
+    await harness.cleanup();
+  }
+});
+
+test('出站：发送途中进程中断（sending）按结果未知处理，不重发', async () => {
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    router: () => mockReply({ text: '只发一条' }),
+  });
+  const service = serviceOf({ runtime: harness.runtime, store: harness.store, config: harness.config });
+  const adapter = new FakeAdapter('telegram', 'bot_1', ['owner-1']);
+  service.register(adapter);
+  service.start();
+  try {
+    await harness.router.handleUserMessage('发吧', { sessionKey: TG_KEY });
+    // 模拟"已经交给平台、还没拿到回执"时进程死掉
+    const row = harness.store.listOutboundBySession(TG_KEY)[0]!;
+    const segments = (Array.isArray(row.segments) ? row.segments : []) as OutboundSegment[];
+    for (const segment of segments) segment.status = 'sending';
+    harness.store.updateOutbound({
+      id: row.id,
+      segments,
+      status: 'pending',
+      attempts: row.attempts,
+      lastError: null,
+      nextAttemptAt: null,
+    });
+
+    const before = adapter.sent.length;
+    await service.drainOutbound();
+
+    assert.equal(adapter.sent.length, before, '结果未知的段不能重发');
+    const after = harness.store.listOutboundBySession(TG_KEY).at(-1)!;
+    assert.equal(after.status, 'unknown', '中断在发送途中的记录只能记 unknown');
+  } finally {
+    await service.stop();
+    await harness.cleanup();
+  }
+});
+
+test('草稿：支持 sendMessageDraft 的平台不再发占位消息，进度走临时预览', async () => {
+  let round = 0;
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    router: () => {
+      round += 1;
+      if (round === 1) return mockReply({ toolCalls: [{ name: 'list_tasks', arguments: {} }] });
+      return mockReply({ text: '最终答案' });
+    },
+  });
+  const service = serviceOf({ runtime: harness.runtime, store: harness.store, config: harness.config });
+  const adapter = new FakeAdapter('telegram', 'bot_1', ['owner-1']);
+  const drafts: { draftId: number; text: string }[] = [];
+  const edits: string[] = [];
+  (adapter as unknown as { capabilities: object }).capabilities = { typing: true, edit: true, draft: true };
+  (adapter as unknown as { typing: () => Promise<void> }).typing = async () => undefined;
+  (adapter as unknown as {
+    draft: (input: { draftId: number; text: string }) => Promise<{ status: string; platformMessageId: null }>;
+  }).draft = async (input) => {
+    drafts.push({ draftId: input.draftId, text: input.text });
+    return { status: 'sent', platformMessageId: null };
+  };
+  (adapter as unknown as { edit: (input: { text: string }) => Promise<{ status: string; platformMessageId: string }> }).edit = async (input) => {
+    edits.push(input.text);
+    return { status: 'sent', platformMessageId: 'm1' };
+  };
+  service.register(adapter);
+  service.start();
+  try {
+    await harness.router.handleUserMessage('你好', { sessionKey: TG_KEY });
+    await service.waitForIdle(5_000);
+    await service.drainOutbound();
+
+    assert.ok(drafts.length >= 1, `进度应走草稿（实际 ${drafts.length} 次）`);
+    assert.match(drafts[0]!.text, /正在执行：/, '草稿内容是当前进展');
+    assert.ok(drafts.every((item) => item.draftId !== 0), 'draft_id 必须非零，平台才会做动画');
+    assert.ok(
+      adapter.sent.every((item) => item.segment.text !== '正在处理…'),
+      '不该再发"正在处理…"占位消息',
+    );
+    assert.equal(adapter.sent.length, 1, `最终答案只发一条普通消息（实际 ${adapter.sent.length}）`);
+    assert.equal(adapter.sent[0]!.segment.text, '最终答案');
+    assert.equal(edits.length, 0, '草稿路径不需要改写任何消息');
+  } finally {
+    await service.stop();
+    await harness.cleanup();
+  }
+});
+
+test('草稿：平台不认这个接口时安静退回，答案照常发送', async () => {
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    router: () => mockReply({ text: '答案' }),
+  });
+  const service = serviceOf({ runtime: harness.runtime, store: harness.store, config: harness.config });
+  const adapter = new FakeAdapter('telegram', 'bot_1', ['owner-1']);
+  let draftCalls = 0;
+  (adapter as unknown as { capabilities: object }).capabilities = { typing: true, edit: true, draft: true };
+  (adapter as unknown as { typing: () => Promise<void> }).typing = async () => undefined;
+  (adapter as unknown as { draft: () => Promise<{ status: string; error: string; retryable: boolean }> }).draft = async () => {
+    draftCalls += 1;
+    return { status: 'failed', error: 'unknown method', retryable: false };
+  };
+  service.register(adapter);
+  service.start();
+  try {
+    await harness.router.handleUserMessage('你好', { sessionKey: TG_KEY });
+    await service.waitForIdle(3_000);
+    await service.drainOutbound();
+
+    assert.equal(adapter.sent.length, 1, '答案必须照常发出去');
+    assert.equal(adapter.sent[0]!.segment.text, '答案');
+    assert.ok(draftCalls <= 1, `草稿失败后不该反复撞同一个接口（实际 ${draftCalls} 次）`);
   } finally {
     await service.stop();
     await harness.cleanup();

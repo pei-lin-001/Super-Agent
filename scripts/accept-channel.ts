@@ -361,6 +361,39 @@ try {
     `重启没有丢掉任务（重启前 ${tasksBefore}，重启后 ${tasksAfter}）`,
   );
 
+  // ---- 第三段：话题命令走代码，话题切换后历史/归属跟着走 ----
+  const repliesBeforeTopic = sentMessages.length;
+  const routerCallsBeforeTopic = routerCalls;
+  pushUpdate(5_000_003, '/new 第二个话题');
+  const gotTopic = await waitFor(
+    () =>
+      sentMessages
+        .slice(repliesBeforeTopic)
+        .some((item) => item.text.includes('已新建并切换到话题「第二个话题」')),
+    60_000,
+    '话题新建回信',
+  );
+  require_(gotTopic, '话题命令有确定性回信（不经过模型）');
+  // 不能用"调用次数没涨"来判定：后台自动汇报/续接随时可能插进来，那是正常的。
+  // 真正的不变量是命令文本根本没进 Router 历史。
+  const commandInHistory = readDb((db) =>
+    db.prepare("SELECT COUNT(*) AS n FROM router_turn WHERE content LIKE '/new%'").get() as { n: number },
+  );
+  require_(
+    (commandInHistory?.n ?? -1) === 0,
+    `话题命令没有进入 Router 历史（实际命中 ${commandInHistory?.n ?? '未知'} 条）`,
+  );
+  log(`话题命令期间 Router 另有 ${routerCalls - routerCallsBeforeTopic} 次后台调用（自动汇报/续接，允许）`);
+
+  const conversations = readDb((db) =>
+    db.prepare('SELECT title FROM conversation ORDER BY created_at').all() as { title: string }[],
+  );
+  require_((conversations?.length ?? 0) === 2, `库里有两条话题（实际 ${conversations?.length ?? 0}）`);
+  require_(
+    (conversations ?? []).some((row) => row.title === '第二个话题'),
+    `话题名已落库（实际 ${JSON.stringify(conversations?.map((row) => row.title))}）`,
+  );
+
   const artifact = readDb((db) => {
     const row = db.prepare('SELECT name, path, sha256, bytes FROM artifact ORDER BY rowid DESC LIMIT 1').get() as
       | { name: string; path: string; sha256: string; bytes: number }

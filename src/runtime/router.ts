@@ -1,9 +1,10 @@
 import type { Config } from '../config.ts';
 import { parseSessionKey } from '../channels/types.ts';
+import { ConversationService } from '../channels/conversations.ts';
 import { randomBytes } from 'node:crypto';
 import { nowIso } from '../domain/ids.ts';
 import { RecordingModel } from '../model/recorder.ts';
-import type { RuntimeEvent } from '../domain/types.ts';
+import type { OutboundArtifact, RuntimeEvent, Task } from '../domain/types.ts';
 import type { ChatMessage, ModelClient, ToolSchema } from '../model/types.ts';
 import type { Runtime } from './runtime.ts';
 import { Execution, ExecutionRevoked } from './execution.ts';
@@ -70,6 +71,19 @@ const ROUTER_TOOLS: ToolSchema[] = [
     },
   },
   {
+    name: 'attach_materials',
+    description:
+      '把用户在这条聊天里刚发来的文件补充给一个已有任务（不新建任务）。用户说"把这个文件也给它/补个材料"时用。',
+    parameters: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string', description: '要补充材料的任务 id' },
+        note: { type: 'string', description: '给负责人说明这份材料是什么，可为空' },
+      },
+      required: ['task_id'],
+    },
+  },
+  {
     name: 'list_tasks',
     description: '列出所有任务及其状态、负责人和最新结论。',
     parameters: { type: 'object', properties: {}, required: [] },
@@ -81,6 +95,29 @@ const ROUTER_TOOLS: ToolSchema[] = [
       type: 'object',
       properties: { task_id: { type: 'string' } },
       required: ['task_id'],
+    },
+  },
+  {
+    name: 'conversation_list',
+    description: '列出当前聊天里的所有话题（编号、名字、是否当前）。用户问"有哪些话题/之前聊了什么话题"时用。',
+    parameters: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'conversation_new',
+    description: '在当前聊天里新建一个话题并切换过去。之后的消息、任务都归属新话题。',
+    parameters: {
+      type: 'object',
+      properties: { title: { type: 'string', description: '话题名，可为空' } },
+      required: [],
+    },
+  },
+  {
+    name: 'conversation_switch',
+    description: '切换当前话题。用户说"回到刚才那个话题"时用它，引用 /list 里显示的编号或名字。',
+    parameters: {
+      type: 'object',
+      properties: { ref: { type: 'string', description: '话题编号或名字' } },
+      required: ['ref'],
     },
   },
 ];
@@ -107,6 +144,8 @@ export class Router {
   private readonly runtime: Runtime;
   private readonly model: ModelClient;
   private readonly config: Config;
+  /** 话题的确定性操作：新建/列出/切换都由代码做，模型只表达意图。 */
+  private readonly conversations: ConversationService;
 
   private readonly readOnly: boolean;
   /** 正在续接的会话：防止定时 tick 把同一个会话排成一串重复执行。 */
@@ -116,13 +155,14 @@ export class Router {
   /** 每条串行链当前会话的上下文：失败时据此把会话收回"待续接"。 */
   private readonly liveContexts = new Map<
     string,
-    { sessionId: string; sessionKey: string | null; messages: ChatMessage[] }
+    { sessionId: string; sessionKey: string | null; conversationId: string | null; messages: ChatMessage[] }
   >();
 
   constructor(runtime: Runtime, model: ModelClient, config: Config, options: { readOnly?: boolean } = {}) {
     this.runtime = runtime;
     this.model = model;
     this.config = config;
+    this.conversations = new ConversationService(runtime.store);
     this.readOnly = options.readOnly ?? false;
   }
 
@@ -133,6 +173,8 @@ export class Router {
       sessionId?: string;
       history?: ChatMessage[];
       sessionKey?: string | null;
+      /** 话题：历史、收件箱、任务卡、续接与回信归属都按它隔离。 */
+      conversationId?: string | null;
       onAccepted?: () => void;
       /** 所在的串行链标识（= 会话键，CLI 为空串）。 */
       chainKey?: string;
@@ -164,6 +206,7 @@ export class Router {
           this.runtime.store.saveRouterSession({
             id: context.sessionId,
             sessionKey: context.sessionKey,
+            conversationId: context.conversationId,
             taskId: null,
             messages: context.messages.filter((message) => message.role !== 'system'),
             reason: `执行失败，等待续接：${(error as Error).message}`,
@@ -183,10 +226,11 @@ export class Router {
    */
   handleUserMessage(
     content: string,
-    options: { sessionKey?: string | null; onAccepted?: () => void } = {},
+    options: { sessionKey?: string | null; conversationId?: string | null; onAccepted?: () => void } = {},
   ): Promise<void> {
     return this.enqueue(content, {
       sessionKey: options.sessionKey ?? null,
+      conversationId: options.conversationId ?? null,
       onAccepted: options.onAccepted,
     }).then(() => undefined);
   }
@@ -207,13 +251,15 @@ export class Router {
           resolve();
           return;
         }
-        // 按来源会话分组汇报：多条聊天交错时，不能把别人的材料混进一次总结。
-        const keys = this.runtime.store.routerInboxSessionKeys();
-        if (keys.length === 0) {
+        // 按来源会话+话题分组汇报：多条聊天交错时，不能把别人的材料混进一次总结。
+        const targets = this.runtime.store.routerInboxTargets();
+        if (targets.length === 0) {
           resolve();
           return;
         }
-        const runs = keys.map((sessionKey) => this.enqueue(null, { sessionKey }));
+        const runs = targets.map((target) =>
+          this.enqueue(null, { sessionKey: target.sessionKey, conversationId: target.conversationId }),
+        );
         void Promise.all(runs).then(
           (outcome) => {
             if (outcome.some((item) => item === 'failed')) {
@@ -238,10 +284,11 @@ export class Router {
     sessionKey: string | null,
     text: string,
     taskId: string | null,
-    artifact: string | null,
+    artifact: OutboundArtifact | null,
+    conversationId: string | null = null,
   ): void {
     if (sessionKey === null || text.trim() === '') return;
-    this.publish({ type: 'channel.outbound', sessionKey, text, taskId, artifact });
+    this.publish({ type: 'channel.outbound', sessionKey, text, taskId, artifact, conversationId });
   }
 
   /** 返回这次协调的结果：完成 / 额度用完待续接 / 失败。只有完成才关闭会话。 */
@@ -257,6 +304,7 @@ export class Router {
       sessionId?: string;
       history?: ChatMessage[];
       sessionKey?: string | null;
+      conversationId?: string | null;
       onAccepted?: () => void;
       chainKey?: string;
     } = {},
@@ -282,13 +330,15 @@ export class Router {
       sessionId?: string;
       history?: ChatMessage[];
       sessionKey?: string | null;
+      conversationId?: string | null;
       onAccepted?: () => void;
       chainKey?: string;
     } = {},
   ): Promise<'done' | 'suspended'> {
     if (this.runtime.isStopped) return 'done';
     const sessionKey = context.sessionKey ?? null;
-    const inbox = this.runtime.store.listRouterInbox(sessionKey);
+    const conversationId = context.conversationId ?? null;
+    const inbox = this.runtime.store.listRouterInbox(sessionKey, conversationId);
     if (userText === null && inbox.length === 0) return 'done';
 
     const pending = inbox
@@ -302,12 +352,15 @@ export class Router {
     const history =
       context.history ??
       this.runtime.store
-        .listRouterTurns(20, sessionKey)
+        .listRouterTurns(20, sessionKey, conversationId)
         .map((turn): ChatMessage => ({ role: turn.role, content: turn.content }));
     const messages: ChatMessage[] = [
       {
         role: 'system',
-        content: routerSystemPrompt({ taskCards: this.renderTaskCards(), pendingMessages: pending }),
+        content: routerSystemPrompt({
+          taskCards: this.renderTaskCards(sessionKey, conversationId),
+          pendingMessages: pending,
+        }),
       },
       ...history,
     ];
@@ -319,6 +372,7 @@ export class Router {
         role: 'user',
         content: userText,
         sessionKey,
+        conversationId,
         createdAt: nowIso(),
       });
     } else {
@@ -332,11 +386,12 @@ export class Router {
     // 供上层在任意退出路径上清理"正在跑"标记。
     context.sessionId = sessionId;
     // 登记本次运行的会话上下文：失败时用它把会话收回"待续接"。
-    this.liveContexts.set(context.chainKey ?? '', { sessionId, sessionKey, messages });
+    this.liveContexts.set(context.chainKey ?? '', { sessionId, sessionKey, conversationId, messages });
     // 会话在第一次模型请求前就落库：额度耗尽或失败时，续接入口始终存在。
     this.runtime.store.saveRouterSession({
       id: sessionId,
       sessionKey,
+      conversationId,
       taskId: null,
       messages: messages.filter((message) => message.role !== 'system'),
       reason: '进行中',
@@ -380,7 +435,7 @@ export class Router {
             messages.push({ role: 'tool', content: cached.result, toolCallId: call.id });
             continue;
           }
-          const content = await this.executeTool(call.name, call.arguments, { sessionId, actionKey, sessionKey });
+          const content = await this.executeTool(call.name, call.arguments, { sessionId, actionKey, sessionKey, conversationId });
           // create_task 已经在事务里写过回执，这里用 INSERT OR IGNORE 保证不会重复。
           this.runtime.store.saveRouterAction({
             id: `ra_${randomBytes(4).toString('hex')}`,
@@ -391,7 +446,7 @@ export class Router {
           });
           messages.push({ role: 'tool', content, toolCallId: call.id });
         }
-        this.runtime.store.finishRouterDecision(pending.id);
+        this.commitDecision(pending.id, sessionId, messages);
         continue;
       }
 
@@ -414,7 +469,7 @@ export class Router {
         const answer = result.text?.trim() ?? '';
         if (answer === '') {
           this.publish({ type: 'router.notice', text: 'Router 没有输出内容，已忽略本轮。', sessionKey });
-          this.finishSession(sessionId, 'done', messages, sessionKey);
+          this.finishSession(sessionId, 'done', messages, sessionKey, conversationId);
           return 'done';
         }
         messages.push({ role: 'assistant', content: answer });
@@ -427,10 +482,10 @@ export class Router {
         });
         // 回信目标由程序按会话决定，不接受模型给出的 chatId。
         this.publish({ type: 'router.reply', text: answer, sessionKey });
-        this.publishOutbound(sessionKey, answer, inbox[0]?.taskId ?? null, null);
+        this.publishOutbound(sessionKey, answer, inbox[0]?.taskId ?? null, null, conversationId);
         for (const message of inbox) this.consume(message.id);
         // 完成即收尾：会话不能停在"进行中"，否则 tick 会再续接一次并重复建任务。
-        this.finishSession(sessionId, 'done', messages, sessionKey);
+        this.finishSession(sessionId, 'done', messages, sessionKey, conversationId);
         return 'done';
       }
 
@@ -458,7 +513,7 @@ export class Router {
           messages.push({ role: 'tool', content: cached.result, toolCallId: call.id });
           continue;
         }
-        const content = await this.executeTool(call.name, call.arguments, { sessionId, actionKey, sessionKey });
+        const content = await this.executeTool(call.name, call.arguments, { sessionId, actionKey, sessionKey, conversationId });
         this.runtime.store.saveRouterAction({
           id: `ra_${randomBytes(4).toString('hex')}`,
           sessionId,
@@ -468,13 +523,14 @@ export class Router {
         });
         messages.push({ role: 'tool', content, toolCallId: call.id });
       }
-      this.runtime.store.finishRouterDecision(decisionId);
+      this.commitDecision(decisionId, sessionId, messages);
     }
 
     // 挂起：保存最新进度，下一轮续接。这是唯一保留待续接状态的路径。
     this.runtime.store.saveRouterSession({
       id: sessionId,
       sessionKey,
+      conversationId,
       taskId: null,
       messages: messages.filter((message) => message.role !== 'system'),
       reason: `达到单轮调度额度 ${maxRounds}`,
@@ -490,6 +546,20 @@ export class Router {
   }
 
   /**
+   * 一批工具调用结束后记录"这一步真的做完了"。
+   *
+   * 决策状态和会话检查点在同一个事务里提交：崩溃后要么整步重来（从决策记录里拿到
+   * 同样的工具结果），要么整步已被记住，绝不会出现"决策说完成、检查点还停在动手之前"。
+   */
+  private commitDecision(decisionId: string, sessionId: string, messages: ChatMessage[]): void {
+    this.runtime.store.finishRouterDecision({
+      id: decisionId,
+      sessionId,
+      messages: messages.filter((message) => message.role !== 'system'),
+    });
+  }
+
+  /**
    * 会话的唯一收尾入口。
    *
    * 完成与失败都由这里决定会话的去留：完成关闭，可恢复失败保留。
@@ -501,6 +571,7 @@ export class Router {
     outcome: 'done' | 'failed',
     messages: ChatMessage[],
     sessionKey: string | null = null,
+    conversationId: string | null = null,
   ): void {
     this.activeSessions.delete(sessionId);
     if (outcome === 'done') {
@@ -510,6 +581,7 @@ export class Router {
     this.runtime.store.saveRouterSession({
       id: sessionId,
       sessionKey,
+      conversationId,
       taskId: null,
       messages: messages.filter((message) => message.role !== 'system'),
       reason: '执行失败，等待续接',
@@ -523,14 +595,14 @@ export class Router {
   }
 
   async resume(): Promise<void> {
-    // 逐会话恢复：只挑全库最后一条会让别的聊天永远停在待续接。
-    for (const key of this.runtime.store.pendingRouterSessionKeys()) {
-      await this.resumeOne(key);
+    // 逐会话、逐话题恢复：只挑全库最后一条会让别的聊天永远停在待续接。
+    for (const entry of this.runtime.store.pendingRouterSessions()) {
+      await this.resumeOne(entry.sessionKey, entry.conversationId);
     }
   }
 
-  private async resumeOne(sessionKey: string | null): Promise<void> {
-    const session = this.runtime.store.pendingRouterSession(sessionKey);
+  private async resumeOne(sessionKey: string | null, conversationId: string | null = null): Promise<void> {
+    const session = this.runtime.store.pendingRouterSession(sessionKey, conversationId);
     if (!session) return;
     // 内存里也挡一道：同一会话正在跑时，任何唤醒都只是合并，不新开一轮。
     if (this.activeSessions.has(session.id)) return;
@@ -545,6 +617,7 @@ export class Router {
           sessionId: session.id,
           history: this.parseHistory(session.messages),
           sessionKey: session.sessionKey,
+          conversationId: session.conversationId,
         },
       );
       // 会话的关闭与保留已经由 runBody 统一处理，这里不再重复决定。
@@ -577,7 +650,12 @@ export class Router {
   private async executeTool(
     name: string,
     rawArguments: string,
-    receipt?: { sessionId: string; actionKey: string; sessionKey?: string | null },
+    receipt?: {
+      sessionId: string;
+      actionKey: string;
+      sessionKey?: string | null;
+      conversationId?: string | null;
+    },
   ): Promise<string> {
     if (this.readOnly && (name === 'create_task' || name === 'send_to_worker')) {
       return '只读模式：本次只做汇报，不能建立任务、修改要求或向 Worker 发消息。请基于现有事实回答用户。';
@@ -609,7 +687,7 @@ export class Router {
               ownerRole: text(args['owner_role'], 'owner_role'),
               ownerBrief: text(args['owner_brief'], 'owner_brief'),
               // 来源与建任务同事务写入：崩溃后回信目标不会丢。
-              source: this.sourceOfSession(receipt?.sessionKey ?? null),
+              source: this.sourceOfSession(receipt?.sessionKey ?? null, receipt?.conversationId ?? null),
             },
             {
               onRecorded: (task, owner) => {
@@ -632,8 +710,14 @@ export class Router {
           return recorded ?? `已创建任务 ${created.task.id}，负责人 ${created.owner.id}。`;
         }
         case 'send_to_worker': {
+          const allowed = this.taskForAction(
+              text(args['task_id'], 'task_id'),
+              receipt?.sessionKey ?? null,
+              receipt?.conversationId ?? null,
+            );
+          if (!allowed.ok) return allowed.message;
           const result = this.runtime.sendRouterMessage({
-            taskId: text(args['task_id'], 'task_id'),
+            taskId: allowed.task.id,
             workerId: text(args['worker_id'], 'worker_id'),
             kind: text(args['kind'], 'kind') as 'update' | 'stop',
             body: text(args['body'], 'body'),
@@ -641,18 +725,26 @@ export class Router {
           return result.ok ? `已投递消息 ${result.messageId}` : `投递失败：${result.reason}`;
         }
         case 'stop_task': {
-          const ok = await this.runtime.stopTask(text(args['task_id'], 'task_id'), text(args['reason'], 'reason'));
+          const allowed = this.taskForAction(
+              text(args['task_id'], 'task_id'),
+              receipt?.sessionKey ?? null,
+              receipt?.conversationId ?? null,
+            );
+          if (!allowed.ok) return allowed.message;
+          const ok = await this.runtime.stopTask(allowed.task.id, text(args['reason'], 'reason'));
           return ok ? '任务已取消' : '任务不存在或已结束';
         }
         case 'send_file': {
-          const taskId = text(args['task_id'], 'task_id');
+          const allowed = this.taskForAction(
+              text(args['task_id'], 'task_id'),
+              receipt?.sessionKey ?? null,
+              receipt?.conversationId ?? null,
+            );
+          if (!allowed.ok) return allowed.message;
+          const task = allowed.task;
+          const taskId = task.id;
           const name = text(args['name'], 'name');
           const note = optional(args['note']) ?? '';
-          const task = this.runtime.store.getTask(taskId);
-          if (!task) return `任务不存在：${taskId}`;
-          if (!this.visibleTo(task, receipt?.sessionKey ?? null)) {
-            return `任务 ${taskId} 属于另一个会话，不能从这里取文件。`;
-          }
           const artifact = this.runtime.store
             .listArtifacts(taskId)
             .filter((item) => item.name === name)
@@ -669,19 +761,74 @@ export class Router {
             sessionKey,
             text: note,
             taskId,
-            artifact: name,
+            // 版本在这句话里就固定下来：排队时是 v1，之后再有 v2 也不会被调包。
+            artifact: {
+              artifactId: artifact.id,
+              name: artifact.name,
+              version: artifact.version,
+              sha256: artifact.sha256,
+              bytes: artifact.bytes,
+            },
+            conversationId: receipt?.conversationId ?? null,
           });
-          return `已把 ${name}（v${artifact.version}）发给当前聊天`;
+          return `已把 ${artifact.name}（v${artifact.version}）加入发送队列`;
+        }
+        case 'conversation_list': {
+          const sessionKey = receipt?.sessionKey ?? null;
+          if (sessionKey === null) return 'CLI 会话没有话题，所有对话都在同一条历史里。';
+          const list = this.conversations.list(sessionKey);
+          if (list.length === 0) return '这个聊天还没有话题。';
+          const currentId = this.conversations.ensureCurrent(sessionKey).id;
+          return list
+            .map((item, index) => `${item.id === currentId ? '●' : '○'} ${index + 1}. ${item.title}`)
+            .join('\n');
+        }
+        case 'conversation_new': {
+          const sessionKey = receipt?.sessionKey ?? null;
+          if (sessionKey === null) return 'CLI 会话没有话题。';
+          const title = optional(args['title']) ?? '新话题';
+          const created = this.conversations.create(sessionKey, title);
+          return `已新建并切换到话题「${created.title}」（${created.id}）。`;
+        }
+        case 'conversation_switch': {
+          const sessionKey = receipt?.sessionKey ?? null;
+          if (sessionKey === null) return 'CLI 会话没有话题。';
+          const target = this.conversations.switchTo(sessionKey, text(args['ref'], 'ref'));
+          if (!target) return `没找到话题「${String(args['ref'])}」。先用 conversation_list 看看有哪些。`;
+          return `已切换到话题「${target.title}」（${target.id}）。`;
+        }
+        case 'attach_materials': {
+          const taskId = text(args['task_id'], 'task_id');
+          const allowed = this.taskForAction(
+            taskId,
+            receipt?.sessionKey ?? null,
+            receipt?.conversationId ?? null,
+          );
+          if (!allowed.ok) return allowed.message;
+          const sessionKey = receipt?.sessionKey ?? null;
+          if (sessionKey === null) return 'CLI 会话没有聊天材料可补充。';
+          const attached = this.runtime.attachSessionMaterials(taskId, sessionKey);
+          if (!attached.ok) return attached.message;
+          // 有说明就一并交给负责人：只说"补了材料"它不知道该拿这份材料做什么。
+          const note = optional(args['note']);
+          const ownerId = allowed.task.ownerWorkerId;
+          if (note && ownerId) {
+            this.runtime.sendRouterMessage({ taskId, workerId: ownerId, kind: 'update', body: note });
+          }
+          return `已把 ${attached.files.length} 份材料补充给任务 ${taskId}：\n${attached.files
+            .map((item) => `- ${item.path}`)
+            .join('\n')}`;
         }
         case 'list_tasks':
-          return this.renderTaskCards(receipt?.sessionKey ?? null);
+          return this.renderTaskCards(receipt?.sessionKey ?? null, receipt?.conversationId ?? null);
         case 'read_task': {
-          const taskId = text(args['task_id'], 'task_id');
-          const task = this.runtime.store.getTask(taskId);
-          if (!task) return `任务不存在：${taskId}`;
-          if (!this.visibleTo(task, receipt?.sessionKey ?? null)) {
-            return `任务 ${taskId} 属于另一个会话，本轮不跨渠道读取。要了解它，请在发起它的那个聊天里询问。`;
-          }
+          const allowed = this.taskForAction(
+              text(args['task_id'], 'task_id'),
+              receipt?.sessionKey ?? null,
+              receipt?.conversationId ?? null,
+            );
+          if (!allowed.ok) return allowed.message;
+          const task = allowed.task;
           const workers = this.runtime.listGroupWorkers(task.groupId);
           const recent = this.runtime.store.listGroupMessages(task.groupId, 20).slice(-10);
           const lines = [
@@ -707,30 +854,73 @@ export class Router {
   /**
    * 任务是否对当前会话可见。
    *
-   * 当前会话发起的任务、以及没有来源的 CLI 老任务可见；其余聊天的一律不可见，
-   * 避免凭任务编号猜到别人的任务。
+   * 归属必须精确相等：CLI 会话只看到 CLI 建的任务，某个聊天只看到自己建的任务。
+   * 以前把「没有来源的任务」对所有会话一律放行，结果是微信用户问一句话，
+   * Router 拿到的任务卡是 CLI 留下的旧任务，而本聊天刚建的任务反而不在上下文里。
    */
-  private visibleTo(task: { sourceSessionKey?: string | null }, sessionKey: string | null): boolean {
-    const source = task.sourceSessionKey ?? null;
-    if (source === null) return true;
-    return source === sessionKey;
+  /**
+   * 任务是否属于当前会话（会话键 + 话题）。
+   *
+   * 老任务没有话题归属（source_conversation_id 为 NULL），仍按"本聊天可见"处理，
+   * 否则升级后旧任务会突然全部消失。
+   */
+  private visibleTo(
+    task: { sourceSessionKey?: string | null; sourceConversationId?: string | null },
+    sessionKey: string | null,
+    conversationId: string | null = null,
+  ): boolean {
+    if ((task.sourceSessionKey ?? null) !== sessionKey) return false;
+    if (conversationId === null) return true;
+    const owner = task.sourceConversationId ?? null;
+    return owner === null || owner === conversationId;
+  }
+
+  /**
+   * 任务类动作的唯一授权入口。
+   *
+   * 读取、改要求、停止、发文件必须走同一套判断：任务存在、且属于当前会话。
+   * 之前只有读取做了校验，改要求的入口能凭任务编号操作别的聊天的任务。
+   */
+  private taskForAction(
+    taskId: string,
+    sessionKey: string | null,
+    conversationId: string | null = null,
+  ): { ok: true; task: Task } | { ok: false; message: string } {
+    const task = this.runtime.store.getTask(taskId);
+    if (!task) return { ok: false, message: `任务不存在：${taskId}` };
+    if (!this.visibleTo(task, sessionKey, conversationId)) {
+      return { ok: false, message: `任务 ${taskId} 属于另一个会话，这里不能读取也不能修改它。` };
+    }
+    return { ok: true, task };
   }
 
   /** 会话键还原成来源三元组，用于任务归属。 */
-  private sourceOfSession(sessionKey: string | null): {
+  private sourceOfSession(
+    sessionKey: string | null,
+    conversationId: string | null = null,
+  ): {
     channel: string;
     accountId: string;
     peerId: string;
     sessionKey: string;
+    conversationId: string | null;
   } | null {
     if (sessionKey === null) return null;
     const parts = parseSessionKey(sessionKey);
     if (!parts) return null;
-    return { channel: parts.channel, accountId: parts.accountId, peerId: parts.peerId, sessionKey };
+    return {
+      channel: parts.channel,
+      accountId: parts.accountId,
+      peerId: parts.peerId,
+      sessionKey,
+      conversationId,
+    };
   }
 
-  private renderTaskCards(sessionKey: string | null = null): string {
-    const tasks = this.runtime.store.listTasks().filter((task) => this.visibleTo(task, sessionKey));
+  private renderTaskCards(sessionKey: string | null = null, conversationId: string | null = null): string {
+    const tasks = this.runtime.store
+      .listTasks()
+      .filter((task) => this.visibleTo(task, sessionKey, conversationId));
     if (tasks.length === 0) return '（暂无任务）';
     return tasks
       .map((task) => {

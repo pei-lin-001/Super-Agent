@@ -224,6 +224,19 @@ CREATE TABLE IF NOT EXISTS channel_session (
   updated_at        TEXT NOT NULL
 );
 
+-- ---- 对话话题：一个聊天窗口里可以有多个互相独立的话题 ----
+-- 聊天窗口（session_key）是地址，话题是内容边界：历史、任务、待续接执行按话题隔离。
+CREATE TABLE IF NOT EXISTS conversation (
+  id                 TEXT PRIMARY KEY,
+  session_key        TEXT NOT NULL,
+  title              TEXT NOT NULL,
+  status             TEXT NOT NULL DEFAULT 'active',
+  last_message_at    TEXT,
+  created_at         TEXT NOT NULL,
+  updated_at         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_conversation_session ON conversation(session_key, status, last_message_at);
+
 CREATE TABLE IF NOT EXISTS router_decision (
   id         TEXT PRIMARY KEY,
   session_id TEXT NOT NULL,

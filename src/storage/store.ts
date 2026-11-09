@@ -39,6 +39,16 @@ function num(value: unknown): number {
   return typeof value === 'number' ? value : Number(value);
 }
 
+/** router_turn 行 → 结构体；只暴露给模型需要的字段。 */
+function toRouterTurn(row: Record<string, unknown>): RouterTurn {
+  return {
+    id: str(row['id']),
+    role: str(row['role']) as RouterTurn['role'],
+    content: str(row['content']),
+    createdAt: str(row['created_at']),
+  };
+}
+
 function str(value: unknown): string {
   return typeof value === 'string' ? value : String(value ?? '');
 }
@@ -63,6 +73,7 @@ function mapTask(row: Row): Task {
     sourceAccountId: strOrNull(row['source_account_id'] ?? null),
     sourcePeerId: strOrNull(row['source_peer_id'] ?? null),
     sourceSessionKey: strOrNull(row['source_session_key'] ?? null),
+    sourceConversationId: strOrNull(row['source_conversation_id'] ?? null),
     status: str(row['status']) as TaskStatus,
     closeReason: strOrNull(row['close_reason']),
     createdAt: str(row['created_at']),
@@ -254,9 +265,16 @@ export class Store {
     ensureColumn('channel_outbound', 'next_attempt_at', 'next_attempt_at TEXT');
     ensureColumn('router_turn', 'session_key', 'session_key TEXT');
     ensureColumn('router_session', 'session_key', 'session_key TEXT');
+    // 话题归属：老记录为 NULL，按"本聊天任何话题都可见"处理（见 router 的 visibleTo）。
+    ensureColumn('channel_session', 'current_conversation_id', 'current_conversation_id TEXT');
+    ensureColumn('router_turn', 'conversation_id', 'conversation_id TEXT');
+    ensureColumn('router_session', 'conversation_id', 'conversation_id TEXT');
+    ensureColumn('task', 'source_conversation_id', 'source_conversation_id TEXT');
     // 索引必须建在补列之后：老库里这两列还不存在，先建索引会直接报 no such column。
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_router_turn_session ON router_turn(session_key, created_at)');
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_router_session_key ON router_session(session_key, status)');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_router_turn_conversation ON router_turn(conversation_id, created_at)');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_router_session_conversation ON router_session(conversation_id, status)');
     ensureColumn('wd_action', 'command_id', 'command_id TEXT');
     ensureColumn('model_call', 'instance_id', 'instance_id TEXT');
     ensureColumn('model_call', 'model_alias', 'model_alias TEXT');
@@ -327,12 +345,13 @@ export class Store {
     this.run(
       `INSERT INTO task (id, group_id, title, goal, brief, done_criteria, require_review,
                          owner_worker_id, source_channel, source_account_id, source_peer_id,
-                         source_session_key, status, close_reason, created_at, updated_at, closed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                         source_session_key, source_conversation_id, status, close_reason,
+                         created_at, updated_at, closed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       task.id, task.groupId, task.title, task.goal, task.brief, task.doneCriteria,
       task.requireReview ? 1 : 0,
       task.ownerWorkerId, task.sourceChannel ?? null, task.sourceAccountId ?? null,
-      task.sourcePeerId ?? null, task.sourceSessionKey ?? null,
+      task.sourcePeerId ?? null, task.sourceSessionKey ?? null, task.sourceConversationId ?? null,
       task.status, task.closeReason, task.createdAt, task.updatedAt, task.closedAt,
     );
     return task;
@@ -521,7 +540,13 @@ export class Store {
    * 传 sessionKey 时只返回来源是该会话的任务消息：多条聊天交错时，
    * 一次汇报不能把别的聊天的材料混进来。传 null 返回 CLI 与无来源任务的消息。
    */
-  listRouterInbox(sessionKey: string | null = null): Message[] {
+  /**
+   * 待交给 Router 的 Worker 消息。
+   *
+   * 传了话题就按话题过滤：别的任务的话题不该出现在这个会话的收件箱里。
+   * 老任务没有话题归属（source_conversation_id 为 NULL），仍在本聊天各话题可见。
+   */
+  listRouterInbox(sessionKey: string | null = null, conversationId: string | null = null): Message[] {
     if (sessionKey === null) {
       return this.all(
         `SELECT m.* FROM message m
@@ -529,6 +554,17 @@ export class Store {
          WHERE m.to_kind = 'router' AND m.status IN ('queued','delivered')
            AND (m.task_id IS NULL OR t.source_session_key IS NULL)
          ORDER BY m.created_at ASC`,
+      ).map(mapMessage);
+    }
+    if (conversationId !== null) {
+      return this.all(
+        `SELECT m.* FROM message m
+         JOIN task t ON t.id = m.task_id
+         WHERE m.to_kind = 'router' AND m.status IN ('queued','delivered')
+           AND t.source_session_key = ?
+           AND (t.source_conversation_id = ? OR t.source_conversation_id IS NULL)
+         ORDER BY m.created_at ASC`,
+        sessionKey, conversationId,
       ).map(mapMessage);
     }
     return this.all(
@@ -541,14 +577,22 @@ export class Store {
     ).map(mapMessage);
   }
 
-  /** 收件箱里涉及的会话键（含 null 表示 CLI），按会话分组汇报。 */
-  routerInboxSessionKeys(): (string | null)[] {
+  /**
+   * 收件箱里涉及的（会话键, 话题）组合，按它分组汇报。
+   *
+   * 只按会话键分组会把两个话题的材料混进同一次汇报；只按话题分组又会丢
+   * CLI 会话（话题为 null）的消息。
+   */
+  routerInboxTargets(): { sessionKey: string | null; conversationId: string | null }[] {
     const rows = this.all(
-      `SELECT DISTINCT t.source_session_key AS k FROM message m
+      `SELECT DISTINCT t.source_session_key AS k, t.source_conversation_id AS c FROM message m
        LEFT JOIN task t ON t.id = m.task_id
        WHERE m.to_kind = 'router' AND m.status IN ('queued','delivered')`,
     );
-    return rows.map((row) => strOrNull(row['k']));
+    return rows.map((row) => ({
+      sessionKey: strOrNull(row['k']),
+      conversationId: strOrNull(row['c']),
+    }));
   }
 
   listGroupMessages(groupId: string, limit = 200): Message[] {
@@ -818,6 +862,8 @@ export class Store {
     reason: string | null;
     /** 来源会话；为空表示 CLI。同一会话的多条待续接互不覆盖。 */
     sessionKey?: string | null;
+    /** 话题归属：同一聊天里的不同话题各自续接，互不覆盖。 */
+    conversationId?: string | null;
     /**
      * running = 正在跑（不可续接）；pending = 中断待续接。
      *
@@ -829,12 +875,13 @@ export class Store {
     const now = nowIso();
     const status = session.status ?? 'pending';
     this.run(
-      `INSERT INTO router_session (id, session_key, task_id, messages, reason, status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO router_session (id, session_key, conversation_id, task_id, messages, reason, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET messages = excluded.messages, reason = excluded.reason,
-         session_key = excluded.session_key, status = excluded.status, updated_at = excluded.updated_at`,
-      session.id, session.sessionKey ?? null, session.taskId, JSON.stringify(session.messages),
-      session.reason, status, now, now,
+         session_key = excluded.session_key, conversation_id = excluded.conversation_id,
+         status = excluded.status, updated_at = excluded.updated_at`,
+      session.id, session.sessionKey ?? null, session.conversationId ?? null, session.taskId,
+      JSON.stringify(session.messages), session.reason, status, now, now,
     );
   }
 
@@ -844,15 +891,21 @@ export class Store {
    * 传 null 表示 CLI 会话。不能只挑全库最后一条：多个聊天各自用完额度后，
    * 每条会话都要能恢复。
    */
-  pendingRouterSession(sessionKey: string | null = null): {
+  pendingRouterSession(sessionKey: string | null = null, conversationId: string | null = null): {
     id: string;
     taskId: string | null;
     messages: unknown;
     reason: string | null;
     sessionKey: string | null;
+    conversationId: string | null;
   } | null {
     const row =
-      sessionKey === null
+      conversationId !== null
+        ? this.get(
+            "SELECT * FROM router_session WHERE status = 'pending' AND conversation_id = ? ORDER BY updated_at DESC LIMIT 1",
+            conversationId,
+          )
+        : sessionKey === null
         ? this.get(
             "SELECT * FROM router_session WHERE status = 'pending' AND session_key IS NULL ORDER BY updated_at DESC LIMIT 1",
           )
@@ -867,15 +920,24 @@ export class Store {
       messages: JSON.parse(str(row['messages'])),
       reason: strOrNull(row['reason']),
       sessionKey: strOrNull(row['session_key']),
+      conversationId: strOrNull(row['conversation_id']),
     };
   }
 
-  /** 仍待续接的会话键（去重），用于重启后逐会话恢复。 */
+  /** 仍待续接的会话键（去重）。话题内的续接请用 pendingRouterSessions。 */
   pendingRouterSessionKeys(): (string | null)[] {
+    return [...new Set(this.pendingRouterSessions().map((item) => item.sessionKey))];
+  }
+
+  /** 仍待续接的会话（去重），用于重启后逐会话、逐话题恢复。 */
+  pendingRouterSessions(): { sessionKey: string | null; conversationId: string | null }[] {
     const rows = this.all(
-      "SELECT DISTINCT session_key FROM router_session WHERE status = 'pending'",
+      "SELECT DISTINCT session_key, conversation_id FROM router_session WHERE status = 'pending'",
     );
-    return rows.map((row) => strOrNull(row['session_key']));
+    return rows.map((row) => ({
+      sessionKey: strOrNull(row['session_key']),
+      conversationId: strOrNull(row['conversation_id']),
+    }));
   }
 
   /**
@@ -1055,8 +1117,22 @@ export class Store {
     };
   }
 
-  finishRouterDecision(id: string): void {
-    this.run(`UPDATE router_decision SET status = 'done' WHERE id = ?`, id);
+  /**
+   * 决策完成与检查点一起提交。
+   *
+   * 只把决策标 done、不推进 router_session 的 messages，崩溃后恢复会拿回
+   * "工具还没执行"的旧快照，于是同一批动作被再做一次（重复建任务）。
+   * 两者必须原子：要么都在，要么都不在。
+   */
+  finishRouterDecision(input: { id: string; sessionId: string; messages: unknown }): void {
+    const now = nowIso();
+    this.tx(() => {
+      this.run(`UPDATE router_decision SET status = 'done' WHERE id = ?`, input.id);
+      this.run(
+        `UPDATE router_session SET messages = ?, updated_at = ? WHERE id = ?`,
+        JSON.stringify(input.messages), now, input.sessionId,
+      );
+    });
   }
 
   getRouterAction(sessionId: string, actionKey: string): { tool: string; result: string } | null {
@@ -1399,15 +1475,27 @@ export class Store {
     ).map(mapTurn);
   }
 
-  appendRouterTurn(turn: RouterTurn & { sessionKey?: string | null }): void {
+  appendRouterTurn(turn: RouterTurn & { sessionKey?: string | null; conversationId?: string | null }): void {
     this.run(
-      'INSERT INTO router_turn (id, role, content, session_key, created_at) VALUES (?, ?, ?, ?, ?)',
-      turn.id, turn.role, turn.content, turn.sessionKey ?? null, turn.createdAt,
+      'INSERT INTO router_turn (id, role, content, session_key, conversation_id, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      turn.id, turn.role, turn.content, turn.sessionKey ?? null, turn.conversationId ?? null, turn.createdAt,
     );
   }
 
-  /** 只读指定会话的对话历史；sessionKey 为 null 表示 CLI。 */
-  listRouterTurns(limit = 30, sessionKey: string | null = null): RouterTurn[] {
+  /**
+   * 只读指定会话的对话历史。
+   *
+   * 传了 conversationId 就按话题过滤——同一个聊天里不同话题的历史互不可见；
+   * 没传则沿用按聊天地址（sessionKey）过滤，CLI 为 null。
+   */
+  listRouterTurns(limit = 30, sessionKey: string | null = null, conversationId: string | null = null): RouterTurn[] {
+    if (conversationId !== null) {
+      const rows = this.all(
+        'SELECT * FROM router_turn WHERE conversation_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?',
+        conversationId, limit,
+      );
+      return rows.reverse().map(toRouterTurn);
+    }
     const rows =
       sessionKey === null
         ? this.all(
@@ -1418,14 +1506,7 @@ export class Store {
             'SELECT * FROM router_turn WHERE session_key = ? ORDER BY created_at DESC, rowid DESC LIMIT ?',
             sessionKey, limit,
           );
-    return rows
-      .map((row) => ({
-        id: str(row['id']),
-        role: str(row['role']) as RouterTurn['role'],
-        content: str(row['content']),
-        createdAt: str(row['created_at']),
-      }))
-      .reverse();
+    return rows.map(toRouterTurn).reverse();
   }
 
   // ---------------- events ----------------
@@ -1760,6 +1841,81 @@ export class Store {
       `UPDATE channel_session SET context_token = ?, context_updated_at = ?, updated_at = ?
        WHERE session_key = ?`,
       token, now, now, sessionKey,
+    );
+  }
+
+  // ---------------- 对话话题 ----------------
+
+  createConversation(input: { id: string; sessionKey: string; title: string; now: string }): void {
+    this.run(
+      `INSERT INTO conversation (id, session_key, title, status, last_message_at, created_at, updated_at)
+       VALUES (?, ?, ?, 'active', ?, ?, ?)`,
+      input.id, input.sessionKey, input.title, input.now, input.now, input.now,
+    );
+  }
+
+  getConversation(id: string): {
+    id: string;
+    sessionKey: string;
+    title: string;
+    status: string;
+    lastMessageAt: string | null;
+  } | null {
+    const row = this.get('SELECT * FROM conversation WHERE id = ?', id);
+    if (!row) return null;
+    return {
+      id: str(row['id']),
+      sessionKey: str(row['session_key']),
+      title: str(row['title']),
+      status: str(row['status']),
+      lastMessageAt: strOrNull(row['last_message_at']),
+    };
+  }
+
+  listConversations(sessionKey: string, status: 'active' | 'archived' | 'all' = 'active'): {
+    id: string;
+    sessionKey: string;
+    title: string;
+    status: string;
+    lastMessageAt: string | null;
+  }[] {
+    const rows = this.all(
+      `SELECT * FROM conversation WHERE session_key = ? ${status === 'all' ? '' : 'AND status = ?'}
+       ORDER BY created_at ASC, rowid ASC`,
+      ...(status === 'all' ? [sessionKey] : [sessionKey, status]),
+    );
+    return rows.map((row) => ({
+      id: str(row['id']),
+      sessionKey: str(row['session_key']),
+      title: str(row['title']),
+      status: str(row['status']),
+      lastMessageAt: strOrNull(row['last_message_at']),
+    }));
+  }
+
+  renameConversation(id: string, title: string): void {
+    this.run('UPDATE conversation SET title = ?, updated_at = ? WHERE id = ?', title, nowIso(), id);
+  }
+
+  setConversationStatus(id: string, status: 'active' | 'archived'): void {
+    this.run('UPDATE conversation SET status = ?, updated_at = ? WHERE id = ?', status, nowIso(), id);
+  }
+
+  touchConversation(id: string): void {
+    const now = nowIso();
+    this.run('UPDATE conversation SET last_message_at = ?, updated_at = ? WHERE id = ?', now, now, id);
+  }
+
+  /** 当前话题：聊天会话行上的指针。没有行或指针指空都返回 null。 */
+  currentConversationId(sessionKey: string): string | null {
+    const row = this.get('SELECT current_conversation_id FROM channel_session WHERE session_key = ?', sessionKey);
+    return row ? strOrNull(row['current_conversation_id']) : null;
+  }
+
+  setCurrentConversation(sessionKey: string, conversationId: string): void {
+    this.run(
+      'UPDATE channel_session SET current_conversation_id = ?, updated_at = ? WHERE session_key = ?',
+      conversationId, nowIso(), sessionKey,
     );
   }
 

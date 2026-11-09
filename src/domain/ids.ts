@@ -4,6 +4,10 @@ function short(): string {
   return randomBytes(4).toString('hex');
 }
 
+export function newConversationId(): string {
+  return `cv_${short()}`;
+}
+
 export function newTaskId(): string {
   return `task_${short()}`;
 }

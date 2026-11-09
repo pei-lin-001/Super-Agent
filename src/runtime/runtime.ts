@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { assertInsideRoot, normalizeRelativePath, resolveInside } from '../tools/paths.ts';
 
 import type { Config } from '../config.ts';
@@ -86,6 +86,8 @@ export interface CreateTaskInput {
     accountId: string;
     peerId: string;
     sessionKey: string;
+    /** 话题：任务归属到这个话题，历史与可见性都按它算。 */
+    conversationId?: string | null;
   } | null;
 }
 
@@ -110,7 +112,7 @@ export interface RouterBridge {
   notify(): void;
   handleUserMessage(
     text: string,
-    options?: { sessionKey?: string | null; onAccepted?: () => void },
+    options?: { sessionKey?: string | null; conversationId?: string | null; onAccepted?: () => void },
   ): Promise<void>;
   /** 有达到单轮额度后保存的协调进度。 */
   hasPendingSession?(): boolean;
@@ -297,6 +299,7 @@ export class Runtime implements ToolHost {
       sourceAccountId: input.source?.accountId ?? null,
       sourcePeerId: input.source?.peerId ?? null,
       sourceSessionKey: input.source?.sessionKey ?? null,
+      sourceConversationId: input.source?.conversationId ?? null,
       status: 'active',
       closeReason: null,
       createdAt: now,
@@ -306,30 +309,39 @@ export class Runtime implements ToolHost {
     // 聊天里发来的材料必须在建任务时就落到任务目录：Worker 的文件权限范围是
     // workDir/<taskId>，只给一个它读不到的缓存路径等于没给。
     const staged = input.source
-      ? this.stageSessionMaterials(taskId, input.source.sessionKey)
-      : [];
-    if (staged.length > 0) {
+      ? this.prepareSessionMaterials(taskId, input.source.sessionKey)
+      : { files: [], inboundIds: [], cleanup: (): void => {} };
+    if (staged.files.length > 0) {
       task.brief = [
         task.brief,
         `随任务附带的材料（已放入 materials/）：`,
-        ...staged.map((item) => `- ${item.path}（${item.bytes} 字节，sha256 ${item.sha256.slice(0, 16)}）`),
+        ...staged.files.map((item) => `- ${item.path}（${item.bytes} 字节，sha256 ${item.sha256.slice(0, 16)}）`),
       ]
         .filter((line) => line !== '')
         .join('\n');
     }
     let owner!: Worker;
-    this.store.tx(() => {
-      this.store.createTask(task);
-      owner = this.createWorkerRecord({
-        groupId,
-        parentId: null,
-        role: input.ownerRole,
-        brief: input.ownerBrief,
-        modelAlias: input.model ?? this.config.defaultModelAlias,
+    try {
+      this.store.tx(() => {
+        this.store.createTask(task);
+        owner = this.createWorkerRecord({
+          groupId,
+          parentId: null,
+          role: input.ownerRole,
+          brief: input.ownerBrief,
+          modelAlias: input.model ?? this.config.defaultModelAlias,
+        });
+        this.store.setTaskOwner(taskId, owner.id);
+        // 认领和建任务同一个事务：任务回滚了，附件不能被一个不存在的任务占着，
+        // 否则用户重试建任务时材料已经"被用掉"，再也带不上。
+        if (staged.inboundIds.length > 0) this.store.claimInboundAttachments(staged.inboundIds, taskId);
+        options.onRecorded?.(task, owner);
       });
-      this.store.setTaskOwner(taskId, owner.id);
-      options.onRecorded?.(task, owner);
-    });
+    } catch (error) {
+      // 事务失败则清掉本次复制出来的孤立副本，任务目录里不留半份材料。
+      staged.cleanup();
+      throw error;
+    }
     const created = this.store.getTask(taskId)!;
     this.store.appendEvent(taskId, owner.id, 'task.created', input.title);
     this.emit({ type: 'task.created', taskId, title: input.title });
@@ -338,19 +350,69 @@ export class Runtime implements ToolHost {
     return { task: created, owner };
   }
 
-  /** 把该会话尚未归属任务的附件复制进任务目录，并记下归属。 */
-  private stageSessionMaterials(
+  /**
+   * 把聊天里后来上传的材料补充给一个已有任务。
+   *
+   * 建任务之后用户又发来附件时必须有这个入口：否则材料一直挂在"未认领"，
+   * Worker 永远看不到，用户也不知道自己的文件去哪了。
+   */
+  attachSessionMaterials(
     taskId: string,
     sessionKey: string,
-  ): { path: string; bytes: number; sha256: string }[] {
+  ): { ok: true; files: { path: string; bytes: number; sha256: string }[] } | { ok: false; message: string } {
+    const task = this.store.getTask(taskId);
+    if (!task) return { ok: false, message: `任务不存在：${taskId}` };
+    const staged = this.prepareSessionMaterials(taskId, sessionKey);
+    if (staged.inboundIds.length === 0) {
+      return { ok: false, message: '这个会话没有待补充的材料：请先把文件发到聊天里。' };
+    }
+    if (staged.files.length === 0) {
+      // 记录在、文件没了：不能假装补进去了。
+      staged.cleanup();
+      return { ok: false, message: '这些附件的文件已经不在了，没法补进任务；请重新发一次。' };
+    }
+    const added = staged.files
+      .map((item) => `- ${item.path}（${item.bytes} 字节，sha256 ${item.sha256.slice(0, 16)}）`)
+      .join('\n');
+    try {
+      this.store.tx(() => {
+        this.store.claimInboundAttachments(staged.inboundIds, taskId);
+        this.store.updateTaskRequirements(taskId, {
+          brief: [task.brief, '随后补充的材料（已放入 materials/）：', added].filter((line) => line !== '').join('\n'),
+        });
+      });
+    } catch (error) {
+      staged.cleanup();
+      throw error;
+    }
+    this.store.appendEvent(taskId, null, 'task.materials', `补充 ${staged.files.length} 份材料`);
+    return { ok: true, files: staged.files };
+  }
+
+  /**
+   * 把该会话尚未归属任务的附件复制进任务目录。
+   *
+   * 这里只复制文件，不写数据库：认领必须和建任务在同一个事务里提交，
+   * 否则事务回滚会留下"任务不存在，材料却已被占用"的孤儿归属。
+   */
+  private prepareSessionMaterials(
+    taskId: string,
+    sessionKey: string,
+  ): { files: { path: string; bytes: number; sha256: string }[]; inboundIds: string[]; cleanup: () => void } {
     const pending = this.store.listUnclaimedSessionAttachments(sessionKey);
-    if (pending.length === 0) return [];
+    const cleanup = (): void => {
+      try {
+        rmSync(join(this.config.workDir, taskId), { recursive: true, force: true });
+      } catch {
+        // 清理失败不掩盖原始错误。
+      }
+    };
+    if (pending.length === 0) return { files: [], inboundIds: [], cleanup };
     const attachments = pending.flatMap(
       (item) => (Array.isArray(item.attachments) ? item.attachments : []) as StoredAttachment[],
     );
-    const staged = stageMaterials({ workDir: this.config.workDir, taskId, attachments });
-    if (staged.length > 0) this.store.claimInboundAttachments(pending.map((item) => item.id), taskId);
-    return staged;
+    const files = stageMaterials({ workDir: this.config.workDir, taskId, attachments });
+    return { files, inboundIds: pending.map((item) => item.id), cleanup };
   }
 
   private createWorkerRecord(input: {
@@ -360,6 +422,13 @@ export class Runtime implements ToolHost {
     brief: string;
     /** 模型别名；必须是目录里已配置的别名。 */
     modelAlias: string;
+    /**
+     * 初始化状态。
+     *
+     * 协作者建出来时还没有任何消息，用 idle 表示"在等第一份活"；
+     * 直接写成 queued 会让人以为它已经排进队列，实际上没有任何东西在推进它。
+     */
+    status?: 'queued' | 'idle';
   }): Worker {
     // 组内按「累计创建」计预算，防止一个任务无限拉人；全局按「当前活跃」计资源。
     const createdInGroup = this.store.countWorkersInGroup(input.groupId);
@@ -378,7 +447,7 @@ export class Runtime implements ToolHost {
       parentId: input.parentId,
       role: input.role,
       brief: input.brief,
-      status: 'queued',
+      status: input.status ?? 'queued',
       model: input.modelAlias,
       stepCount: 0,
       createdAt: now,
@@ -410,8 +479,11 @@ export class Runtime implements ToolHost {
         role,
         brief,
         modelAlias: alias,
+        // 建出来就入队的话，协作者会在负责人把请求投出去之前就开始第一轮：
+        // 它读到的收件箱是空的，只能凭"请开始你的工作"自己猜要做什么。
+        // 交给消息投递来唤醒（onMessageDelivered 对 idle 的 Worker 会入队）。
+        status: 'idle',
       });
-      this.enqueue(worker.id);
       return { ok: true, workerId: worker.id };
     } catch (error) {
       return { ok: false, reason: (error as Error).message };

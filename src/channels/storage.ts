@@ -7,6 +7,7 @@
 import { createHash } from 'node:crypto';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { basename, join, relative, resolve, sep } from 'node:path';
+import { assertInsideRoot } from '../tools/paths.ts';
 
 /** 把平台文件名清洗成安全的单段文件名。 */
 export function safeFileName(raw: string, fallback = 'file.bin'): string {
@@ -115,10 +116,22 @@ export function stageMaterials(input: {
   return staged;
 }
 
-/** 产物路径必须落在 workDir 内，且真实存在。 */
+/**
+ * 产物路径必须落在 workDir 内，且真实存在。
+ *
+ * 只比字符串不够：workDir 里一个指向外部的符号链接同样会通过 resolve/relative，
+ * 于是"任务目录内的文件"能读到别的路径。这里复用工具层已有的 realpath 校验，
+ * 并要求最终是一个普通文件。
+ */
 export function resolveArtifactPath(workDir: string, artifactPath: string): string | null {
   const abs = resolve(workDir, artifactPath);
   const rel = relative(workDir, abs);
   if (rel.startsWith('..') || rel === '' || rel.split(sep).includes('..')) return null;
-  return existsSync(abs) ? abs : null;
+  if (!existsSync(abs)) return null;
+  try {
+    assertInsideRoot(workDir, abs);
+  } catch {
+    return null;
+  }
+  return statSync(abs).isFile() ? abs : null;
 }
