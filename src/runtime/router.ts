@@ -224,7 +224,8 @@ export class Router {
             messages.push({ role: 'tool', content: cached.result, toolCallId: call.id });
             continue;
           }
-          const content = await this.executeTool(call.name, call.arguments);
+          const content = await this.executeTool(call.name, call.arguments, { sessionId, actionKey });
+          // create_task 已经在事务里写过回执，这里用 INSERT OR IGNORE 保证不会重复。
           this.runtime.store.saveRouterAction({
             id: `ra_${randomBytes(4).toString('hex')}`,
             sessionId,
@@ -289,7 +290,7 @@ export class Router {
           messages.push({ role: 'tool', content: cached.result, toolCallId: call.id });
           continue;
         }
-        const content = await this.executeTool(call.name, call.arguments);
+        const content = await this.executeTool(call.name, call.arguments, { sessionId, actionKey });
         this.runtime.store.saveRouterAction({
           id: `ra_${randomBytes(4).toString('hex')}`,
           sessionId,
@@ -364,7 +365,11 @@ export class Router {
     }
   }
 
-  private async executeTool(name: string, rawArguments: string): Promise<string> {
+  private async executeTool(
+    name: string,
+    rawArguments: string,
+    receipt?: { sessionId: string; actionKey: string },
+  ): Promise<string> {
     if (this.readOnly && (name === 'create_task' || name === 'send_to_worker')) {
       return '只读模式：本次只做汇报，不能建立任务、修改要求或向 Worker 发消息。请基于现有事实回答用户。';
     }
@@ -382,16 +387,38 @@ export class Router {
     try {
       switch (name) {
         case 'create_task': {
-          const created = this.runtime.createTask({
-            title: text(args['title'], 'title'),
-            goal: text(args['goal'], 'goal'),
-            brief: optional(args['brief']) ?? '',
-            doneCriteria: optional(args['done_criteria']) ?? '',
-            requireReview: args['require_review'] === true,
-            ownerRole: text(args['owner_role'], 'owner_role'),
-            ownerBrief: text(args['owner_brief'], 'owner_brief'),
-          });
-          return `已创建任务 ${created.task.id}，负责人 ${created.owner.id}。任务在后台执行，你可以继续与用户交互。`;
+          // 业务变更与操作回执同一个事务：要么都生效，要么都不生效。
+          // 这样"任务建好了、回执还没写"的崩溃点就不存在了。
+          let recorded: string | null = null;
+          const created = this.runtime.createTask(
+            {
+              title: text(args['title'], 'title'),
+              goal: text(args['goal'], 'goal'),
+              brief: optional(args['brief']) ?? '',
+              doneCriteria: optional(args['done_criteria']) ?? '',
+              requireReview: args['require_review'] === true,
+              ownerRole: text(args['owner_role'], 'owner_role'),
+              ownerBrief: text(args['owner_brief'], 'owner_brief'),
+            },
+            {
+              onRecorded: (task, owner) => {
+                const text = `已创建任务 ${task.id}，负责人 ${owner.id}。任务在后台执行，你可以继续与用户交互。`;
+                recorded = text;
+                // 回执与业务变更同事务落库：崩溃后不会出现"任务在、回执不在"。
+                if (receipt) {
+                  this.runtime.store.saveRouterAction({
+                    id: `ra_${randomBytes(4).toString('hex')}`,
+                    sessionId: receipt.sessionId,
+                    actionKey: receipt.actionKey,
+                    tool: name,
+                    result: text,
+                  });
+                }
+              },
+            },
+          );
+          void created;
+          return recorded ?? `已创建任务 ${created.task.id}，负责人 ${created.owner.id}。`;
         }
         case 'send_to_worker': {
           const result = this.runtime.sendRouterMessage({

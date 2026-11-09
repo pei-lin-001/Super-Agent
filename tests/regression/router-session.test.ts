@@ -181,3 +181,66 @@ test('操作与回执：业务变更后回执保存失败，恢复时不会重�
     await h.cleanup();
   }
 });
+
+test('事务边界：事务内写回执失败时，任务不会被建出来', async () => {
+  const h = await makeHarness(1);
+  try {
+    // 让回执写入在事务内直接抛错，模拟"业务变更成功、回执保存失败"的崩溃点
+    const original = h.store.saveRouterAction.bind(h.store);
+    let shouldFail = true;
+    h.store.saveRouterAction = ((input: Parameters<Store['saveRouterAction']>[0]) => {
+      if (shouldFail) throw new Error('注入：回执写入失败');
+      return original(input);
+    }) as Store['saveRouterAction'];
+
+    const router = new Router(
+      h.runtime,
+      new MockModel(() => ({
+        text: null,
+        reasoning: null,
+        toolCalls: [createTaskCall('事务任务', 't1')],
+        finishReason: 'tool_calls',
+        model: 'm',
+        usage: null,
+      })),
+      h.config,
+    );
+
+    await router.handleUserMessage('建一个任务').catch(() => undefined);
+    assert.equal(h.store.listTasks().length, 0, '回执失败时任务不应残留');
+
+    // 恢复执行：不应该出现"半成品"重复
+    shouldFail = false;
+    await router.resume().catch(() => undefined);
+    const titles = h.store.listTasks().map((t) => t.title);
+    assert.equal(titles.filter((t) => t === '事务任务').length, 1, `恢复后只应有一个任务（实际 ${titles.join(',')}）`);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('新决策同名同参数：仍然产生第二次合法操作', async () => {
+  const h = await makeHarness(6);
+  try {
+    let call = 0;
+    const router = new Router(
+      h.runtime,
+      new MockModel(() => {
+        call += 1;
+        if (call === 1) {
+          return { text: null, reasoning: null, toolCalls: [createTaskCall('同名任务', 's1')], finishReason: 'tool_calls', model: 'm', usage: null };
+        }
+        if (call === 2) {
+          return { text: null, reasoning: null, toolCalls: [createTaskCall('同名任务', 's2')], finishReason: 'tool_calls', model: 'm', usage: null };
+        }
+        return { text: '两个都建好了', reasoning: null, toolCalls: [], finishReason: 'stop', model: 'm', usage: null };
+      }),
+      h.config,
+    );
+    await router.handleUserMessage('建两个同名任务').catch(() => undefined);
+    const same = h.store.listTasks().filter((t) => t.title === '同名任务');
+    assert.equal(same.length, 2, `参数相同的两次合法操作都应生效（实际 ${same.length}）`);
+  } finally {
+    await h.cleanup();
+  }
+});

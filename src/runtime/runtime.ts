@@ -216,7 +216,17 @@ export class Runtime implements ToolHost {
 
   // ---------------- 任务与 Worker ----------------
 
-  createTask(input: CreateTaskInput): { task: Task; owner: Worker } {
+  /**
+   * 建立任务与负责人。
+   *
+   * `options.onRecorded` 在同一个事务里执行：调用方（例如 Router）需要把
+   * "这次操作已经完成"的回执和业务变更一起提交，避免业务生效但回执丢失。
+   * 唤醒调度放在事务提交之后——事务里不应该启动后台执行。
+   */
+  createTask(
+    input: CreateTaskInput,
+    options: { onRecorded?: (task: Task, owner: Worker) => void } = {},
+  ): { task: Task; owner: Worker } {
     const taskId = newTaskId();
     const groupId = `grp_${taskId.slice(5)}`;
     const now = nowIso();
@@ -247,6 +257,7 @@ export class Runtime implements ToolHost {
         model: input.model ?? null,
       });
       this.store.setTaskOwner(taskId, owner.id);
+      options.onRecorded?.(task, owner);
     });
     const created = this.store.getTask(taskId)!;
     this.store.appendEvent(taskId, owner.id, 'task.created', input.title);
