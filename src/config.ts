@@ -128,7 +128,10 @@ function loadModelProfiles(fallback: {
   try {
     parsed = JSON.parse(raw);
   } catch {
-    throw new ConfigError('MODEL_CATALOG 不是合法 JSON，请写成 [{"alias":"...","model":"..."}]');
+    throw new ConfigError(
+      'MODEL_CATALOG 不是合法 JSON，请写成 [{"alias":"...","model":"..."}]；' +
+        '注意用它时请通过 node --env-file-if-exists=.env.local 加载，shell 的 source 会吃掉 JSON 里的引号',
+    );
   }
   if (!Array.isArray(parsed) || parsed.length === 0) {
     throw new ConfigError('MODEL_CATALOG 必须是非空数组');
