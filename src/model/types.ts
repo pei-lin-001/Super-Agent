@@ -106,3 +106,10 @@ export function withAttempts(error: ModelError, attempts: number): ModelError {
   error.httpAttempts = attempts;
   return error;
 }
+
+/** 等待被取消时抛出的中性错误：只表示"等待结束了"，归类由调用方完成。 */
+export function abortError(): Error {
+  const error = new Error('等待已被取消');
+  error.name = 'AbortError';
+  return error;
+}

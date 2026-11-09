@@ -318,3 +318,160 @@ test('记账层：错误文字含 cancel 但不是本地取消，仍记成 faile
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---- 网络/超时退避期间取消：取消的归类与计数都必须落到记账层 ----
+
+/** 让底层抛指定错误，用来复现"第一次请求就失败、随后进入退避"的路径。 */
+function failingFetch(error: Error): typeof fetch {
+  return (async () => {
+    throw error;
+  }) as unknown as typeof fetch;
+}
+
+function networkModel(url: string, retry: number, error: Error): OpenAICompatibleModel {
+  return new OpenAICompatibleModel({
+    baseUrl: url,
+    apiKey: 'k',
+    timeoutMs: 30_000,
+    retry,
+    reasoningEffort: 'low',
+    maxTokens: 32,
+    fetchImpl: failingFetch(error),
+  });
+}
+
+test('记账层：网络失败进入退避后取消，落库为 1 次 cancelled', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sa-rec-'));
+  try {
+    const controller = new AbortController();
+    const store = new Store(join(dir, 'db.sqlite'), { instanceId: 'inst_rec' });
+    let outcome: unknown = null;
+    try {
+      let calls = 0;
+      const model = new OpenAICompatibleModel({
+        baseUrl: 'http://127.0.0.1:9/v1',
+        apiKey: 'k',
+        timeoutMs: 30_000,
+        retry: 3,
+        reasoningEffort: 'low',
+        maxTokens: 32,
+        fetchImpl: (async () => {
+          calls += 1;
+          throw new TypeError('network down');
+        }) as unknown as typeof fetch,
+      });
+      const recorder = new RecordingModel(model, store, 'worker');
+      const pending = recorder.chat(req(controller.signal)).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      // 等到第一次请求真的发出（gate 可能被其它测试占用），再取消
+      for (let i = 0; i < 300 && calls === 0; i += 1) await new Promise((r) => setTimeout(r, 10));
+      assert.equal(calls, 1, '第一次请求应已发出');
+      controller.abort();
+      outcome = await pending;
+    } finally {
+      store.close();
+    }
+    const row = lastCall(dir);
+    assert.ok(outcome instanceof ModelError, '应抛结构化错误');
+    assert.equal(outcome.kind, 'cancelled', '退避中取消必须归为 cancelled');
+    assert.equal(row.status, 'cancelled', `入库状态应为 cancelled（实际 ${row.status}）`);
+    assert.equal(row.http_attempts, 1, `已经发出 1 次请求，入库必须是 1（实际 ${row.http_attempts}）`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('记账层：超时失败进入退避后取消，落库为 1 次 cancelled', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sa-rec-'));
+  try {
+    const controller = new AbortController();
+    const store = new Store(join(dir, 'db.sqlite'), { instanceId: 'inst_rec' });
+    let outcome: unknown = null;
+    try {
+      const timeoutError = new Error('The operation was aborted due to timeout');
+      timeoutError.name = 'TimeoutError';
+      let calls = 0;
+      const model = new OpenAICompatibleModel({
+        baseUrl: 'http://127.0.0.1:9/v1',
+        apiKey: 'k',
+        timeoutMs: 30_000,
+        retry: 3,
+        reasoningEffort: 'low',
+        maxTokens: 32,
+        fetchImpl: (async () => {
+          calls += 1;
+          throw timeoutError;
+        }) as unknown as typeof fetch,
+      });
+      const recorder = new RecordingModel(model, store, 'worker');
+      const pending = recorder.chat(req(controller.signal)).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      for (let i = 0; i < 300 && calls === 0; i += 1) await new Promise((r) => setTimeout(r, 10));
+      assert.equal(calls, 1, '第一次请求应已发出');
+      controller.abort();
+      outcome = await pending;
+    } finally {
+      store.close();
+    }
+    const row = lastCall(dir);
+    assert.ok(outcome instanceof ModelError);
+    assert.equal(outcome.kind, 'cancelled', `退避中取消必须归为 cancelled（实际 ${outcome.kind}）`);
+    assert.equal(row.status, 'cancelled', `入库状态（实际 ${row.status}）`);
+    assert.equal(
+      row.http_attempts,
+      1,
+      `已经发出 1 次请求，入库必须是 1（实际 ${row.http_attempts}，错误 attempts=${outcome.httpAttempts}）`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('记账层：退避中取消后不再继续重试', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sa-rec-'));
+  try {
+    let calls = 0;
+    const controller = new AbortController();
+    const store = new Store(join(dir, 'db.sqlite'), { instanceId: 'inst_rec' });
+    try {
+      const model = new OpenAICompatibleModel({
+        baseUrl: 'http://127.0.0.1:9/v1',
+        apiKey: 'k',
+        timeoutMs: 30_000,
+        retry: 4,
+        reasoningEffort: 'low',
+        maxTokens: 32,
+        fetchImpl: (async () => {
+          calls += 1;
+          throw new TypeError('network down');
+        }) as unknown as typeof fetch,
+      });
+      const recorder = new RecordingModel(model, store, 'worker');
+      const pending = recorder.chat(req(controller.signal)).catch(() => undefined);
+      for (let i = 0; i < 300 && calls === 0; i += 1) await new Promise((r) => setTimeout(r, 10));
+      assert.equal(calls, 1, '第一次请求应已发出');
+      controller.abort();
+      await pending;
+      const afterCancel = calls;
+      // 退避是 400ms 起指数增长，等足够久确认没有后续请求
+      await new Promise((r) => setTimeout(r, 1_500));
+      assert.equal(calls, afterCancel, `取消后不应再发请求（取消时 ${afterCancel}，之后 ${calls}）`);
+      assert.equal(calls, 1, '取消时只应发出过 1 次');
+    } finally {
+      store.close();
+    }
+    const all = (() => {
+      const db = new DatabaseSync(join(dir, 'db.sqlite'), { readOnly: true });
+      const rows = db.prepare('SELECT status, http_attempts FROM model_call').all();
+      db.close();
+      return JSON.stringify(rows);
+    })();
+    assert.equal(lastCall(dir).http_attempts, 1, `全部记录：${all}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
