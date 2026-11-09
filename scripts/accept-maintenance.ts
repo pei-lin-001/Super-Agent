@@ -72,7 +72,9 @@ const server = createServer((req, res) => {
     if (isWatchdog) {
       wdCalls += 1;
       // 严格围绕同一个 issue 推进；只有读到真实变化才关闭它。
-      const seenDeliverable = toolOutputs.includes('deliverable.md');
+      // 只看结构化证据行："产物：deliverable.md v1" 才是登记过，
+      // 任务目标、期望描述里提到同名文件都不算。
+      const seenDeliverable = /产物[：:]\s*deliverable\.md/.test(toolOutputs);
       const issuedCommand = toolOutputs.includes('已提交维护命令');
       if (!issuedCommand) {
         payload = reply(
@@ -162,6 +164,7 @@ try {
          store.setTaskOwner('task_main', 'w1_main');
          store.appendEvent('task_main', 'w1_main', 'task.created', '维护闭环验收');
          // 先记录一个具体的未解决问题：后面要检查的是这同一个问题被关闭。
+         // 任务目标里提到产物名，用来验证"目标里出现文件名"不会被当成产物存在
          store.upsertWdIssue({
            id: 'wdi_spin',
            taskId: 'task_main',

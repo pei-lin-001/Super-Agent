@@ -87,7 +87,7 @@ const server = createServer((req, res) => {
             status: 'open',
             title: '负责人在重复同一个无效动作',
             note: '复查：命令已执行，但 spins.txt 仍只有同一行，没有产出 deliverable.md，问题未改善',
-            check_after_minutes: 5,
+            check_after_minutes: 0,
           },
           `w${wdCalls}`,
         );

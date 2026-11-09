@@ -230,6 +230,18 @@ export class WatchdogSession {
         lines.push(`  turn#${turn.seq} ${turn.role}${calls} ${body}`);
       }
     }
+    // 产物与检查是判断"有没有真的交付"的直接证据，必须出现在观察结果里。
+    const artifacts = store.listArtifacts(task.id);
+    lines.push(
+      `产物：${artifacts.length === 0 ? '无' : artifacts.map((item) => `${item.name} v${item.version}`).join('、')}`,
+    );
+    const reviews = store.listReviews(task.id);
+    if (reviews.length > 0) {
+      lines.push('## 检查');
+      for (const review of reviews.slice(-5)) {
+        lines.push(`  ${review.artifactId ?? '-'} ${review.outcome} 版本 ${review.epoch}`);
+      }
+    }
     const jobs = store.listJobs(task.id).slice(-8);
     if (jobs.length > 0) {
       lines.push('\n## 作业');
