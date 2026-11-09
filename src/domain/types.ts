@@ -53,6 +53,12 @@ export interface Task {
   /** 维护挂起：不调度该任务，直到显式恢复。 */
   maintenance?: number;
   ownerWorkerId: string | null;
+  /** 任务来源：由 IM 聊天发起时记录，用于把后台结果送回原聊天。CLI 旧任务为 null。 */
+  sourceChannel?: string | null;
+  sourceAccountId?: string | null;
+  sourcePeerId?: string | null;
+  /** 来源会话键；同一聊天内的追问与续接都按它定位。 */
+  sourceSessionKey?: string | null;
   status: TaskStatus;
   closeReason: string | null;
   createdAt: string;
@@ -187,8 +193,21 @@ export type RuntimeEvent =
   | { type: 'worker.status'; workerId: string; status: WorkerStatus }
   | { type: 'message.sent'; messageId: string; from: string; to: string; kind: MessageKind }
   | { type: 'router.start' }
-  | { type: 'router.reply'; text: string }
-  | { type: 'router.notice'; text: string }
+  /** sessionKey 决定这条回复回哪个聊天；为空表示 CLI。 */
+  | { type: 'router.reply'; text: string; sessionKey?: string | null }
+  | { type: 'router.notice'; text: string; sessionKey?: string | null }
+  /**
+   * 面向某个聊天的可投递内容。渠道层据此写发件记录；
+   * CLI 只看 router.reply / router.notice，不会重复发送。
+   */
+  | {
+      type: 'channel.outbound';
+      sessionKey: string;
+      text: string;
+      taskId: string | null;
+      /** 要作为真实文件发出的已登记产物名；为空表示纯文本。 */
+      artifact: string | null;
+    }
   | { type: 'error'; text: string };
 
 /**

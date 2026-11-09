@@ -14,6 +14,10 @@ CREATE TABLE IF NOT EXISTS task (
   review_epoch     INTEGER NOT NULL DEFAULT 0,
   maintenance      INTEGER NOT NULL DEFAULT 0,
   owner_worker_id  TEXT,
+  source_channel     TEXT,
+  source_account_id  TEXT,
+  source_peer_id     TEXT,
+  source_session_key TEXT,
   status           TEXT NOT NULL,
   close_reason     TEXT,
   created_at       TEXT NOT NULL,
@@ -122,8 +126,10 @@ CREATE TABLE IF NOT EXISTS router_turn (
   id         TEXT PRIMARY KEY,
   role       TEXT NOT NULL,
   content    TEXT NOT NULL,
+  session_key TEXT,
   created_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_router_turn_session ON router_turn(session_key, created_at);
 
 CREATE TABLE IF NOT EXISTS worker_note (
   id           TEXT PRIMARY KEY,
@@ -144,6 +150,7 @@ CREATE INDEX IF NOT EXISTS idx_note_worker ON worker_note(worker_id, created_at)
 
 CREATE TABLE IF NOT EXISTS router_session (
   id           TEXT PRIMARY KEY,
+  session_key  TEXT,
   task_id      TEXT,
   messages     TEXT NOT NULL,
   reason       TEXT,
@@ -152,6 +159,71 @@ CREATE TABLE IF NOT EXISTS router_session (
   updated_at   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_router_session_status ON router_session(status);
+CREATE INDEX IF NOT EXISTS idx_router_session_key ON router_session(session_key, status);
+
+-- ---- 渠道层：入站、游标、发件与渠道会话 ----
+CREATE TABLE IF NOT EXISTS channel_inbound (
+  id                  TEXT PRIMARY KEY,
+  channel             TEXT NOT NULL,
+  account_id          TEXT NOT NULL,
+  event_id            TEXT NOT NULL,
+  peer_id             TEXT NOT NULL,
+  sender_id           TEXT NOT NULL,
+  platform_message_id TEXT NOT NULL,
+  session_key         TEXT NOT NULL,
+  thread_id           TEXT,
+  body                TEXT NOT NULL DEFAULT '',
+  attachments         TEXT,
+  unsupported         TEXT,
+  status              TEXT NOT NULL,
+  reason              TEXT,
+  received_at         TEXT NOT NULL,
+  created_at          TEXT NOT NULL,
+  handled_at          TEXT,
+  claimed_task_id     TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_inbound_dedupe ON channel_inbound(channel, account_id, event_id);
+CREATE INDEX IF NOT EXISTS idx_inbound_status ON channel_inbound(status, created_at);
+
+CREATE TABLE IF NOT EXISTS channel_cursor (
+  channel    TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  cursor     TEXT,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (channel, account_id)
+);
+
+CREATE TABLE IF NOT EXISTS channel_outbound (
+  id          TEXT PRIMARY KEY,
+  channel     TEXT NOT NULL,
+  account_id  TEXT NOT NULL,
+  peer_id     TEXT NOT NULL,
+  session_key TEXT NOT NULL,
+  task_id     TEXT,
+  body        TEXT NOT NULL,
+  segments    TEXT NOT NULL,
+  status      TEXT NOT NULL,
+  attempts    INTEGER NOT NULL DEFAULT 0,
+  last_error  TEXT,
+  created_at  TEXT NOT NULL,
+  updated_at  TEXT NOT NULL,
+  sent_at     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_outbound_status ON channel_outbound(status, created_at);
+
+CREATE TABLE IF NOT EXISTS channel_session (
+  session_key       TEXT PRIMARY KEY,
+  channel           TEXT NOT NULL,
+  account_id        TEXT NOT NULL,
+  peer_id           TEXT NOT NULL,
+  router_session_id TEXT,
+  context_token     TEXT,
+  context_updated_at TEXT,
+  last_inbound_at   TEXT,
+  last_outbound_at  TEXT,
+  created_at        TEXT NOT NULL,
+  updated_at        TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS router_decision (
   id         TEXT PRIMARY KEY,

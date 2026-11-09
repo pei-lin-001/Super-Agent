@@ -17,7 +17,10 @@
     "smoke:mini": "node --env-file-if-exists=.env.local scripts/smoke-mini.ts",
     "smoke:real": "node --env-file-if-exists=.env.local scripts/smoke-real.ts",
     "smoke:toolkit": "node --env-file-if-exists=.env.local scripts/smoke-toolkit.ts",
-    "format": "prettier --write ."
+    "format": "prettier --write .",
+    "channel:weixin-login": "node --env-file-if-exists=.env.local scripts/weixin-login.ts",
+    "channel:status": "node --env-file-if-exists=.env.local scripts/channel-status.ts",
+    "accept:channel": "node scripts/accept-channel.ts"
   },
   "devDependencies": {
     "@types/node": "^24.10.1",

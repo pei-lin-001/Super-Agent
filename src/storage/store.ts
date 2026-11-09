@@ -59,6 +59,10 @@ function mapTask(row: Row): Task {
     reviewEpoch: num(row['review_epoch'] ?? 0),
     maintenance: num(row['maintenance'] ?? 0),
     ownerWorkerId: strOrNull(row['owner_worker_id']),
+    sourceChannel: strOrNull(row['source_channel'] ?? null),
+    sourceAccountId: strOrNull(row['source_account_id'] ?? null),
+    sourcePeerId: strOrNull(row['source_peer_id'] ?? null),
+    sourceSessionKey: strOrNull(row['source_session_key'] ?? null),
     status: str(row['status']) as TaskStatus,
     closeReason: strOrNull(row['close_reason']),
     createdAt: str(row['created_at']),
@@ -242,6 +246,12 @@ export class Store {
     };
     ensureColumn('task', 'review_epoch', 'review_epoch INTEGER NOT NULL DEFAULT 0');
     ensureColumn('task', 'maintenance', 'maintenance INTEGER NOT NULL DEFAULT 0');
+    ensureColumn('task', 'source_channel', 'source_channel TEXT');
+    ensureColumn('task', 'source_account_id', 'source_account_id TEXT');
+    ensureColumn('task', 'source_peer_id', 'source_peer_id TEXT');
+    ensureColumn('task', 'source_session_key', 'source_session_key TEXT');
+    ensureColumn('router_turn', 'session_key', 'session_key TEXT');
+    ensureColumn('router_session', 'session_key', 'session_key TEXT');
     ensureColumn('wd_action', 'command_id', 'command_id TEXT');
     ensureColumn('model_call', 'instance_id', 'instance_id TEXT');
     ensureColumn('model_call', 'model_alias', 'model_alias TEXT');
@@ -311,11 +321,14 @@ export class Store {
   createTask(task: Task): Task {
     this.run(
       `INSERT INTO task (id, group_id, title, goal, brief, done_criteria, require_review,
-                         owner_worker_id, status, close_reason, created_at, updated_at, closed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                         owner_worker_id, source_channel, source_account_id, source_peer_id,
+                         source_session_key, status, close_reason, created_at, updated_at, closed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       task.id, task.groupId, task.title, task.goal, task.brief, task.doneCriteria,
       task.requireReview ? 1 : 0,
-      task.ownerWorkerId, task.status, task.closeReason, task.createdAt, task.updatedAt, task.closedAt,
+      task.ownerWorkerId, task.sourceChannel ?? null, task.sourceAccountId ?? null,
+      task.sourcePeerId ?? null, task.sourceSessionKey ?? null,
+      task.status, task.closeReason, task.createdAt, task.updatedAt, task.closedAt,
     );
     return task;
   }
@@ -497,10 +510,40 @@ export class Store {
   }
 
   /** Router 未消费的消息。 */
-  listRouterInbox(): Message[] {
+  /**
+   * Router 收件箱。
+   *
+   * 传 sessionKey 时只返回来源是该会话的任务消息：多条聊天交错时，
+   * 一次汇报不能把别的聊天的材料混进来。传 null 返回 CLI 与无来源任务的消息。
+   */
+  listRouterInbox(sessionKey: string | null = null): Message[] {
+    if (sessionKey === null) {
+      return this.all(
+        `SELECT m.* FROM message m
+         LEFT JOIN task t ON t.id = m.task_id
+         WHERE m.to_kind = 'router' AND m.status IN ('queued','delivered')
+           AND (m.task_id IS NULL OR t.source_session_key IS NULL)
+         ORDER BY m.created_at ASC`,
+      ).map(mapMessage);
+    }
     return this.all(
-      "SELECT * FROM message WHERE to_kind = 'router' AND status IN ('queued','delivered') ORDER BY created_at ASC",
+      `SELECT m.* FROM message m
+       JOIN task t ON t.id = m.task_id
+       WHERE m.to_kind = 'router' AND m.status IN ('queued','delivered')
+         AND t.source_session_key = ?
+       ORDER BY m.created_at ASC`,
+      sessionKey,
     ).map(mapMessage);
+  }
+
+  /** 收件箱里涉及的会话键（含 null 表示 CLI），按会话分组汇报。 */
+  routerInboxSessionKeys(): (string | null)[] {
+    const rows = this.all(
+      `SELECT DISTINCT t.source_session_key AS k FROM message m
+       LEFT JOIN task t ON t.id = m.task_id
+       WHERE m.to_kind = 'router' AND m.status IN ('queued','delivered')`,
+    );
+    return rows.map((row) => strOrNull(row['k']));
   }
 
   listGroupMessages(groupId: string, limit = 200): Message[] {
@@ -763,26 +806,63 @@ export class Store {
 
   // ---------------- Router 会话续接 / 行为覆盖 / 控制命令 ----------------
 
-  saveRouterSession(session: { id: string; taskId: string | null; messages: unknown; reason: string | null }): void {
+  saveRouterSession(session: {
+    id: string;
+    taskId: string | null;
+    messages: unknown;
+    reason: string | null;
+    /** 来源会话；为空表示 CLI。同一会话的多条待续接互不覆盖。 */
+    sessionKey?: string | null;
+  }): void {
     const now = nowIso();
     this.run(
-      `INSERT INTO router_session (id, task_id, messages, reason, status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, 'pending', ?, ?)
+      `INSERT INTO router_session (id, session_key, task_id, messages, reason, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
        ON CONFLICT(id) DO UPDATE SET messages = excluded.messages, reason = excluded.reason,
-         status = 'pending', updated_at = excluded.updated_at`,
-      session.id, session.taskId, JSON.stringify(session.messages), session.reason, now, now,
+         session_key = excluded.session_key, status = 'pending', updated_at = excluded.updated_at`,
+      session.id, session.sessionKey ?? null, session.taskId, JSON.stringify(session.messages),
+      session.reason, now, now,
     );
   }
 
-  pendingRouterSession(): { id: string; taskId: string | null; messages: unknown; reason: string | null } | null {
-    const row = this.get("SELECT * FROM router_session WHERE status = 'pending' ORDER BY updated_at DESC LIMIT 1");
+  /**
+   * 取指定会话的待续接过程。
+   *
+   * 传 null 表示 CLI 会话。不能只挑全库最后一条：多个聊天各自用完额度后，
+   * 每条会话都要能恢复。
+   */
+  pendingRouterSession(sessionKey: string | null = null): {
+    id: string;
+    taskId: string | null;
+    messages: unknown;
+    reason: string | null;
+    sessionKey: string | null;
+  } | null {
+    const row =
+      sessionKey === null
+        ? this.get(
+            "SELECT * FROM router_session WHERE status = 'pending' AND session_key IS NULL ORDER BY updated_at DESC LIMIT 1",
+          )
+        : this.get(
+            "SELECT * FROM router_session WHERE status = 'pending' AND session_key = ? ORDER BY updated_at DESC LIMIT 1",
+            sessionKey,
+          );
     if (!row) return null;
     return {
       id: str(row['id']),
       taskId: strOrNull(row['task_id']),
       messages: JSON.parse(str(row['messages'])),
       reason: strOrNull(row['reason']),
+      sessionKey: strOrNull(row['session_key']),
     };
+  }
+
+  /** 仍待续接的会话键（去重），用于重启后逐会话恢复。 */
+  pendingRouterSessionKeys(): (string | null)[] {
+    const rows = this.all(
+      "SELECT DISTINCT session_key FROM router_session WHERE status = 'pending'",
+    );
+    return rows.map((row) => strOrNull(row['session_key']));
   }
 
   closeRouterSession(id: string, status: 'done' | 'abandoned'): void {
@@ -1293,15 +1373,25 @@ export class Store {
     ).map(mapTurn);
   }
 
-  appendRouterTurn(turn: RouterTurn): void {
+  appendRouterTurn(turn: RouterTurn & { sessionKey?: string | null }): void {
     this.run(
-      'INSERT INTO router_turn (id, role, content, created_at) VALUES (?, ?, ?, ?)',
-      turn.id, turn.role, turn.content, turn.createdAt,
+      'INSERT INTO router_turn (id, role, content, session_key, created_at) VALUES (?, ?, ?, ?, ?)',
+      turn.id, turn.role, turn.content, turn.sessionKey ?? null, turn.createdAt,
     );
   }
 
-  listRouterTurns(limit = 30): RouterTurn[] {
-    const rows = this.all('SELECT * FROM router_turn ORDER BY created_at DESC LIMIT ?', limit);
+  /** 只读指定会话的对话历史；sessionKey 为 null 表示 CLI。 */
+  listRouterTurns(limit = 30, sessionKey: string | null = null): RouterTurn[] {
+    const rows =
+      sessionKey === null
+        ? this.all(
+            'SELECT * FROM router_turn WHERE session_key IS NULL ORDER BY created_at DESC, rowid DESC LIMIT ?',
+            limit,
+          )
+        : this.all(
+            'SELECT * FROM router_turn WHERE session_key = ? ORDER BY created_at DESC, rowid DESC LIMIT ?',
+            sessionKey, limit,
+          );
     return rows
       .map((row) => ({
         id: str(row['id']),
@@ -1332,6 +1422,325 @@ export class Store {
       type: str(row['type']),
       detail: strOrNull(row['detail']),
       createdAt: str(row['created_at']),
+    }));
+  }
+
+  // ---------------- 渠道层：入站 / 游标 / 发件 / 渠道会话 ----------------
+
+  /**
+   * 把一批入站消息与新的游标放进同一个事务。
+   *
+   * 顺序是「先落库、再前移游标」：写库失败时游标不动，重启还能重新拉到这批消息；
+   * 反过来会丢掉已经确认、但没来得及处理的那些。
+   */
+  recordInboundBatch(input: {
+    channel: string;
+    accountId: string;
+    /** 只接受这些发送者的消息；为空表示尚未绑定主人。 */
+    ownerIds: string[];
+    events: {
+      id: string;
+      eventId: string;
+      peerId: string;
+      senderId: string;
+      platformMessageId: string;
+      sessionKey: string;
+      threadId: string | null;
+      body: string;
+      attachments: unknown;
+      unsupported: string | null;
+      receivedAt: string;
+    }[];
+    cursor: string | null;
+  }): { accepted: string[]; duplicates: string[]; rejected: string[] } {
+    return this.tx(() => {
+      const now = nowIso();
+      const accepted: string[] = [];
+      const duplicates: string[] = [];
+      const rejected: string[] = [];
+      for (const event of input.events) {
+        const existing = this.get(
+          'SELECT id FROM channel_inbound WHERE channel = ? AND account_id = ? AND event_id = ?',
+          input.channel, input.accountId, event.eventId,
+        );
+        if (existing) {
+          duplicates.push(event.id);
+          continue;
+        }
+        // 陌生发送者与未绑定主人：记录事实但不交给 Router，避免任何模型调用。
+        const allowed = input.ownerIds.length > 0 && input.ownerIds.includes(event.senderId);
+        const status = allowed ? 'pending' : 'rejected';
+        const reason = allowed
+          ? null
+          : input.ownerIds.length === 0
+            ? '尚未绑定主人身份'
+            : '发送者不在授权列表';
+        this.run(
+          `INSERT INTO channel_inbound (id, channel, account_id, event_id, peer_id, sender_id,
+             platform_message_id, session_key, thread_id, body, attachments, unsupported,
+             status, reason, received_at, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          event.id, input.channel, input.accountId, event.eventId, event.peerId, event.senderId,
+          event.platformMessageId, event.sessionKey, event.threadId, event.body,
+          JSON.stringify(event.attachments), event.unsupported, status, reason, event.receivedAt, now,
+        );
+        if (allowed) accepted.push(event.id);
+        else rejected.push(event.id);
+      }
+      if (input.cursor !== null) {
+        this.run(
+          `INSERT INTO channel_cursor (channel, account_id, cursor, updated_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(channel, account_id) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at`,
+          input.channel, input.accountId, input.cursor, now,
+        );
+      }
+      return { accepted, duplicates, rejected };
+    });
+  }
+
+  getChannelCursor(channel: string, accountId: string): string | null {
+    const row = this.get(
+      'SELECT cursor FROM channel_cursor WHERE channel = ? AND account_id = ?',
+      channel, accountId,
+    );
+    return row ? strOrNull(row['cursor']) : null;
+  }
+
+  listPendingInbound(limit = 20): {
+    id: string;
+    channel: string;
+    accountId: string;
+    peerId: string;
+    senderId: string;
+    platformMessageId: string;
+    sessionKey: string;
+    body: string;
+    attachments: unknown;
+    unsupported: string | null;
+    receivedAt: string;
+  }[] {
+    return this.all(
+      "SELECT * FROM channel_inbound WHERE status = 'pending' ORDER BY created_at ASC, rowid ASC LIMIT ?",
+      limit,
+    ).map((row) => ({
+      id: str(row['id']),
+      channel: str(row['channel']),
+      accountId: str(row['account_id']),
+      peerId: str(row['peer_id']),
+      senderId: str(row['sender_id']),
+      platformMessageId: str(row['platform_message_id']),
+      sessionKey: str(row['session_key']),
+      body: str(row['body']),
+      attachments: JSON.parse(str(row['attachments'] ?? '[]')),
+      unsupported: strOrNull(row['unsupported']),
+      receivedAt: str(row['received_at']),
+    }));
+  }
+
+  /**
+   * 取某个会话里带附件、尚未归属任务、且已成功交接的入站记录。
+   *
+   * 用于把用户发来的材料真正落到任务目录：交接失败的记录不算。
+   */
+  listUnclaimedSessionAttachments(sessionKey: string, limit = 50): {
+    id: string;
+    attachments: unknown;
+    receivedAt: string;
+  }[] {
+    return this.all(
+      `SELECT * FROM channel_inbound
+       WHERE session_key = ? AND status = 'handed' AND claimed_task_id IS NULL
+         AND attachments IS NOT NULL AND attachments != '[]'
+       ORDER BY created_at ASC, rowid ASC LIMIT ?`,
+      sessionKey, limit,
+    ).map((row) => ({
+      id: str(row['id']),
+      attachments: JSON.parse(str(row['attachments'] ?? '[]')),
+      receivedAt: str(row['received_at']),
+    }));
+  }
+
+  claimInboundAttachments(ids: string[], taskId: string): void {
+    for (const id of ids) {
+      this.run('UPDATE channel_inbound SET claimed_task_id = ? WHERE id = ?', taskId, id);
+    }
+  }
+
+  markInbound(id: string, status: 'handed' | 'rejected' | 'failed', reason?: string | null): void {
+    this.run(
+      'UPDATE channel_inbound SET status = ?, reason = ?, handled_at = ? WHERE id = ?',
+      status, reason ?? null, nowIso(), id,
+    );
+  }
+
+  enqueueOutbound(input: {
+    id: string;
+    channel: string;
+    accountId: string;
+    peerId: string;
+    sessionKey: string;
+    taskId: string | null;
+    body: string;
+    segments: unknown;
+  }): void {
+    const now = nowIso();
+    this.run(
+      `INSERT INTO channel_outbound (id, channel, account_id, peer_id, session_key, task_id,
+         body, segments, status, attempts, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+       ON CONFLICT(id) DO NOTHING`,
+      input.id, input.channel, input.accountId, input.peerId, input.sessionKey, input.taskId,
+      input.body, JSON.stringify(input.segments), now, now,
+    );
+  }
+
+  listPendingOutbound(limit = 10): {
+    id: string;
+    channel: string;
+    accountId: string;
+    peerId: string;
+    sessionKey: string;
+    taskId: string | null;
+    body: string;
+    segments: unknown;
+    attempts: number;
+  }[] {
+    return this.all(
+      "SELECT * FROM channel_outbound WHERE status IN ('pending','partial') ORDER BY created_at ASC, rowid ASC LIMIT ?",
+      limit,
+    ).map((row) => ({
+      id: str(row['id']),
+      channel: str(row['channel']),
+      accountId: str(row['account_id']),
+      peerId: str(row['peer_id']),
+      sessionKey: str(row['session_key']),
+      taskId: strOrNull(row['task_id']),
+      body: str(row['body']),
+      segments: JSON.parse(str(row['segments'] ?? '[]')),
+      attempts: num(row['attempts']),
+    }));
+  }
+
+  /** 某会话的发件记录，供测试与排查；按创建顺序。 */
+  listOutboundBySession(sessionKey: string, limit = 50): {
+    id: string;
+    channel: string;
+    accountId: string;
+    peerId: string;
+    taskId: string | null;
+    status: string;
+    segments: unknown;
+    attempts: number;
+    lastError: string | null;
+  }[] {
+    return this.all(
+      'SELECT * FROM channel_outbound WHERE session_key = ? ORDER BY created_at ASC, rowid ASC LIMIT ?',
+      sessionKey,
+      limit,
+    ).map((row) => ({
+      id: str(row['id']),
+      channel: str(row['channel']),
+      accountId: str(row['account_id']),
+      peerId: str(row['peer_id']),
+      taskId: strOrNull(row['task_id']),
+      status: str(row['status']),
+      segments: JSON.parse(str(row['segments'] ?? '[]')),
+      attempts: num(row['attempts']),
+      lastError: strOrNull(row['last_error']),
+    }));
+  }
+
+  updateOutbound(input: {
+    id: string;
+    segments: unknown;
+    status: 'pending' | 'partial' | 'sent' | 'failed' | 'unknown';
+    attempts: number;
+    lastError?: string | null;
+  }): void {
+    const now = nowIso();
+    this.run(
+      `UPDATE channel_outbound SET segments = ?, status = ?, attempts = ?, last_error = ?,
+         updated_at = ?, sent_at = CASE WHEN ? = 'sent' THEN ? ELSE sent_at END
+       WHERE id = ?`,
+      JSON.stringify(input.segments), input.status, input.attempts, input.lastError ?? null,
+      now, input.status, now, input.id,
+    );
+  }
+
+  getChannelSession(sessionKey: string): {
+    sessionKey: string;
+    channel: string;
+    accountId: string;
+    peerId: string;
+    routerSessionId: string | null;
+    contextToken: string | null;
+  } | null {
+    const row = this.get('SELECT * FROM channel_session WHERE session_key = ?', sessionKey);
+    if (!row) return null;
+    return {
+      sessionKey: str(row['session_key']),
+      channel: str(row['channel']),
+      accountId: str(row['account_id']),
+      peerId: str(row['peer_id']),
+      routerSessionId: strOrNull(row['router_session_id']),
+      contextToken: strOrNull(row['context_token']),
+    };
+  }
+
+  upsertChannelSession(input: {
+    sessionKey: string;
+    channel: string;
+    accountId: string;
+    peerId: string;
+    touch?: 'inbound' | 'outbound';
+  }): void {
+    const now = nowIso();
+    this.run(
+      `INSERT INTO channel_session (session_key, channel, account_id, peer_id, last_inbound_at,
+         last_outbound_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(session_key) DO UPDATE SET
+         last_inbound_at = CASE WHEN ? = 'inbound' THEN excluded.updated_at ELSE channel_session.last_inbound_at END,
+         last_outbound_at = CASE WHEN ? = 'outbound' THEN excluded.updated_at ELSE channel_session.last_outbound_at END,
+         updated_at = excluded.updated_at`,
+      input.sessionKey, input.channel, input.accountId, input.peerId,
+      input.touch === 'inbound' ? now : null, input.touch === 'outbound' ? now : null, now, now,
+      input.touch ?? null, input.touch ?? null,
+    );
+  }
+
+  /**
+   * 保存微信对端回复上下文。
+   *
+   * 这是渠道私有状态：只在适配器发送时使用，不进入模型提示词、也不写进调用转储。
+   */
+  setChannelContextToken(sessionKey: string, token: string | null): void {
+    const now = nowIso();
+    this.run(
+      `UPDATE channel_session SET context_token = ?, context_updated_at = ?, updated_at = ?
+       WHERE session_key = ?`,
+      token, now, now, sessionKey,
+    );
+  }
+
+  listChannelSessions(): {
+    sessionKey: string;
+    channel: string;
+    accountId: string;
+    peerId: string;
+    hasContextToken: boolean;
+    lastInboundAt: string | null;
+    lastOutboundAt: string | null;
+  }[] {
+    return this.all('SELECT * FROM channel_session ORDER BY updated_at DESC').map((row) => ({
+      sessionKey: str(row['session_key']),
+      channel: str(row['channel']),
+      accountId: str(row['account_id']),
+      peerId: str(row['peer_id']),
+      hasContextToken: strOrNull(row['context_token']) !== null,
+      lastInboundAt: strOrNull(row['last_inbound_at']),
+      lastOutboundAt: strOrNull(row['last_outbound_at']),
     }));
   }
 

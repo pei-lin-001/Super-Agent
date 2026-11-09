@@ -19,6 +19,7 @@ import {
 import { isTerminalTask, isTerminalWorker } from '../domain/state.ts';
 import { Execution, ExecutionRevoked } from './execution.ts';
 import { ModelRegistry } from '../model/registry.ts';
+import { stageMaterials, type StoredAttachment } from '../channels/storage.ts';
 import { identifyProcess } from '../watchdog/observer.ts';
 import type {
   Artifact,
@@ -79,6 +80,13 @@ export interface CreateTaskInput {
   ownerRole: string;
   ownerBrief: string;
   model?: string | null;
+  /** 任务来源：由哪个聊天发起。后台结果按它送回原聊天。 */
+  source?: {
+    channel: string;
+    accountId: string;
+    peerId: string;
+    sessionKey: string;
+  } | null;
 }
 
 /** 允许在线调整的覆盖项白名单。只接受已知 key，不做"任意 key 都报告已激活"。 */
@@ -100,7 +108,10 @@ export function validateOverride(key: string, content: string): { ok: boolean; m
 
 export interface RouterBridge {
   notify(): void;
-  handleUserMessage(text: string): Promise<void>;
+  handleUserMessage(
+    text: string,
+    options?: { sessionKey?: string | null; onAccepted?: () => void },
+  ): Promise<void>;
   /** 有达到单轮额度后保存的协调进度。 */
   hasPendingSession?(): boolean;
   /** 继续上次保存的协调进度。 */
@@ -143,6 +154,11 @@ export class Runtime implements ToolHost {
   private stopped = false;
   private timer: NodeJS.Timeout | null = null;
   private router: RouterBridge | null = null;
+
+  /** 渠道层用它把聊天输入交给 Router；没有 Router 时视为未接入。 */
+  get routerBridge(): RouterBridge | null {
+    return this.router;
+  }
 
   constructor(options: {
     store: Store;
@@ -277,12 +293,30 @@ export class Runtime implements ToolHost {
       requireReview: input.requireReview ?? false,
       reviewEpoch: 0,
       ownerWorkerId: null,
+      sourceChannel: input.source?.channel ?? null,
+      sourceAccountId: input.source?.accountId ?? null,
+      sourcePeerId: input.source?.peerId ?? null,
+      sourceSessionKey: input.source?.sessionKey ?? null,
       status: 'active',
       closeReason: null,
       createdAt: now,
       updatedAt: now,
       closedAt: null,
     };
+    // 聊天里发来的材料必须在建任务时就落到任务目录：Worker 的文件权限范围是
+    // workDir/<taskId>，只给一个它读不到的缓存路径等于没给。
+    const staged = input.source
+      ? this.stageSessionMaterials(taskId, input.source.sessionKey)
+      : [];
+    if (staged.length > 0) {
+      task.brief = [
+        task.brief,
+        `随任务附带的材料（已放入 materials/）：`,
+        ...staged.map((item) => `- ${item.path}（${item.bytes} 字节，sha256 ${item.sha256.slice(0, 16)}）`),
+      ]
+        .filter((line) => line !== '')
+        .join('\n');
+    }
     let owner!: Worker;
     this.store.tx(() => {
       this.store.createTask(task);
@@ -302,6 +336,21 @@ export class Runtime implements ToolHost {
     this.emit({ type: 'worker.created', workerId: owner.id, role: owner.role, parentId: null });
     this.enqueue(owner.id);
     return { task: created, owner };
+  }
+
+  /** 把该会话尚未归属任务的附件复制进任务目录，并记下归属。 */
+  private stageSessionMaterials(
+    taskId: string,
+    sessionKey: string,
+  ): { path: string; bytes: number; sha256: string }[] {
+    const pending = this.store.listUnclaimedSessionAttachments(sessionKey);
+    if (pending.length === 0) return [];
+    const attachments = pending.flatMap(
+      (item) => (Array.isArray(item.attachments) ? item.attachments : []) as StoredAttachment[],
+    );
+    const staged = stageMaterials({ workDir: this.config.workDir, taskId, attachments });
+    if (staged.length > 0) this.store.claimInboundAttachments(pending.map((item) => item.id), taskId);
+    return staged;
   }
 
   private createWorkerRecord(input: {

@@ -61,6 +61,30 @@ export interface ModelProfile {
   costHint: string | null;
 }
 
+/** 一个 IM 渠道的运行配置。凭据只从环境读取，不写进任何业务表或日志。 */
+export interface ChannelAccountConfig {
+  enabled: boolean;
+  /** 授权的稳定用户 ID；空数组表示尚未绑定主人，此时不接收任何执行请求。 */
+  ownerIds: string[];
+  /** Telegram Bot token / 微信登录状态文件路径由适配器自行解析。 */
+  botToken: string;
+  /** 平台 API 基地址，便于自建网关或本地联调。 */
+  apiBase: string;
+  /** 微信媒体 CDN 基地址。 */
+  cdnBase: string;
+}
+
+export interface ChannelsConfig {
+  telegram: ChannelAccountConfig;
+  weixin: ChannelAccountConfig;
+  /** 渠道状态与凭据目录（文件权限 0600）。 */
+  stateDir: string;
+  /** 单次长轮询的等待上限。 */
+  pollTimeoutMs: number;
+  /** 允许接收的单个文件上限（字节）。 */
+  maxInboundBytes: number;
+}
+
 export interface Config {
   provider: string;
   baseUrl: string;
@@ -72,6 +96,7 @@ export interface Config {
   models: ModelProfile[];
   /** Worker 未指定模型时使用的别名。 */
   defaultModelAlias: string;
+  channels: ChannelsConfig;
   reasoningEffort: string;
   timeoutMs: number;
   maxTokens: number;
@@ -91,6 +116,20 @@ function intEnv(name: string, fallback: number, options: { allowZero?: boolean }
     throw new ConfigError(`环境变量 ${name} 必须是${expectation}，当前为 "${raw}"`);
   }
   return value;
+}
+
+/** 逗号分隔的 ID 列表；允许空格，忽略空项。 */
+function listEnv(name: string): string[] {
+  return strEnv(name, '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter((item) => item !== '');
+}
+
+function boolEnv(name: string, fallback: boolean): boolean {
+  const raw = strEnv(name, '').toLowerCase();
+  if (raw === '') return fallback;
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
 }
 
 function strEnv(name: string, fallback: string): string {
@@ -179,6 +218,25 @@ export function loadConfig(options: { requireModel?: boolean } = {}): Config {
   const materialsDir = resolve(workDir, 'materials');
 
   const models = loadModelProfiles({ provider, baseUrl, apiKey, modelName });
+  const channels: ChannelsConfig = {
+    stateDir: resolve(root, strEnv('CHANNEL_STATE_DIR', '.data/channels')),
+    pollTimeoutMs: intEnv('CHANNEL_POLL_TIMEOUT_MS', 25_000),
+    maxInboundBytes: intEnv('CHANNEL_MAX_INBOUND_BYTES', 25 * 1024 * 1024),
+    telegram: {
+      enabled: boolEnv('TELEGRAM_ENABLED', strEnv('TELEGRAM_BOT_TOKEN', '') !== ''),
+      ownerIds: listEnv('TELEGRAM_OWNER_IDS'),
+      botToken: strEnv('TELEGRAM_BOT_TOKEN', ''),
+      apiBase: strEnv('TELEGRAM_API_BASE', 'https://api.telegram.org'),
+      cdnBase: '',
+    },
+    weixin: {
+      enabled: boolEnv('WEIXIN_ENABLED', false),
+      ownerIds: listEnv('WEIXIN_OWNER_IDS'),
+      botToken: '',
+      apiBase: strEnv('WEIXIN_API_BASE', 'https://ilinkai.weixin.qq.com'),
+      cdnBase: strEnv('WEIXIN_CDN_BASE', 'https://novac2c.cdn.weixin.qq.com/c2c'),
+    },
+  };
   const defaultModelAlias = strEnv('DEFAULT_MODEL_ALIAS', models[0]?.alias ?? 'default');
   if (requireModel && !models.some((item) => item.alias === defaultModelAlias)) {
     throw new ConfigError(
@@ -195,6 +253,7 @@ export function loadConfig(options: { requireModel?: boolean } = {}): Config {
     workerModel: strEnv('WORKER_MODEL', modelName),
     models,
     defaultModelAlias,
+    channels,
     reasoningEffort: strEnv('MODEL_REASONING_EFFORT', 'max'),
     timeoutMs: intEnv('MODEL_TIMEOUT_MS', 180_000),
     maxTokens: intEnv('MODEL_MAX_TOKENS', 16384),

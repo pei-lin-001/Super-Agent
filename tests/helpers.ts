@@ -63,6 +63,13 @@ export function testConfig(dir: string, overrides: Partial<Limits> = {}): Config
       },
     ],
     defaultModelAlias: 'default',
+    channels: {
+      stateDir: join(dir, 'channels'),
+      pollTimeoutMs: 1000,
+      maxInboundBytes: 25 * 1024 * 1024,
+      telegram: { enabled: false, ownerIds: [], botToken: '', apiBase: 'http://127.0.0.1:0', cdnBase: '' },
+      weixin: { enabled: false, ownerIds: [], botToken: '', apiBase: 'http://127.0.0.1:0', cdnBase: '' },
+    },
     reasoningEffort: 'max',
     timeoutMs: 5000,
     maxTokens: 2048,
@@ -106,6 +113,13 @@ export async function createHarness(options: {
       },
     ],
     defaultModelAlias: 'default',
+    channels: {
+      stateDir: join(dir, 'channels'),
+      pollTimeoutMs: 1000,
+      maxInboundBytes: 25 * 1024 * 1024,
+      telegram: { enabled: false, ownerIds: [], botToken: '', apiBase: 'http://127.0.0.1:0', cdnBase: '' },
+      weixin: { enabled: false, ownerIds: [], botToken: '', apiBase: 'http://127.0.0.1:0', cdnBase: '' },
+    },
     reasoningEffort: 'max',
     timeoutMs: 5000,
     maxTokens: 2048,
@@ -116,9 +130,17 @@ export async function createHarness(options: {
   };
 
   const store = new Store(config.dbPath);
-  const workerModel = new MockModel(options.worker);
-  const routerModel = new MockModel(
-    options.router ??
+  // 假模型必须真的让出一次事件循环：同步返回会让整条执行链在微任务里跑完，
+  // 定时器永远排不上，进程看起来像卡死。
+  const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+  const workerModel = new MockModel(async (context) => {
+    await tick();
+    return options.worker(context);
+  });
+  const routerModel = new MockModel(async (context) => {
+    await tick();
+    const handler =
+      options.router ??
       (() => ({
         text: '已记录。',
         reasoning: null,
@@ -126,8 +148,9 @@ export async function createHarness(options: {
         finishReason: 'stop',
         model: 'mock-router',
         usage: null,
-      })),
-  );
+      }));
+    return handler(context);
+  });
   const runtime = new Runtime({ store, config, workerModel });
   const router = new Router(runtime, routerModel, config);
   runtime.attachRouter(router);
