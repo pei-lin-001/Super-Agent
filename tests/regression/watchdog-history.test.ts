@@ -195,3 +195,91 @@ test('重启维护进程后继续使用历史：仍然合法', async () => {
     cleanup();
   }
 });
+
+test('历史选择：超过十组问答后，最新的几轮进入请求', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    // 写 14 组问答
+    for (let i = 1; i <= 14; i += 1) {
+      store.appendWdTurn({
+        id: `wdt_u${i}`,
+        role: 'user',
+        content: `问题-${i}`,
+        createdAt: `2026-02-01T00:${String(i).padStart(2, '0')}:00.000Z`,
+      });
+      store.appendWdTurn({
+        id: `wdt_a${i}`,
+        role: 'assistant',
+        content: `回答-${i}`,
+        createdAt: `2026-02-01T00:${String(i).padStart(2, '0')}:30.000Z`,
+      });
+    }
+
+    const captured: Captured[] = [];
+    const model = new MockModel((context) => {
+      captured.push({ messages: context.request.messages as Captured['messages'] });
+      return { text: '结论', reasoning: null, toolCalls: [], finishReason: 'stop', model: 'm', usage: null };
+    });
+    const session = new WatchdogSession({
+      store,
+      config: loadConfig(),
+      model,
+      modelName: 'm',
+      restartMain: async () => ({ ok: true, message: 'ok' }),
+      health: () => ({ state: 'alive' as const, pid: 1, detail: 'test', heartbeatAgeMs: 10 }),
+    });
+    await session.ask('最新问题');
+
+    const text = captured[0]!.messages.map((m) => m.content ?? '').join('\n');
+    assert.match(text, /问题-14/, '最近的一组问答必须进入请求');
+    assert.match(text, /回答-14/, '最近的一组回答必须进入请求');
+    assert.doesNotMatch(text, /问题-1\b/, '最早的内容应被裁掉，不能挤占最近的历史');
+    assertWellFormed(captured[0]!.messages, '最近历史请求');
+
+    // 顺序必须是正序：问题在前、回答在后
+    const body = captured[0]!.messages;
+    const q14 = body.findIndex((m) => (m.content ?? '').includes('问题-14'));
+    const a14 = body.findIndex((m) => (m.content ?? '').includes('回答-14'));
+    assert.ok(q14 >= 0 && a14 >= 0 && q14 < a14, '同一组问答要按时间正序出现');
+  } finally {
+    cleanup();
+  }
+});
+
+test('历史选择：重启维护进程后仍然选最近的记录', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    for (let i = 1; i <= 12; i += 1) {
+      store.appendWdTurn({
+        id: `wdt2_u${i}`,
+        role: 'user',
+        content: `重启问题-${i}`,
+        createdAt: `2026-03-01T00:${String(i).padStart(2, '0')}:00.000Z`,
+      });
+      store.appendWdTurn({
+        id: `wdt2_a${i}`,
+        role: 'assistant',
+        content: `重启回答-${i}`,
+        createdAt: `2026-03-01T00:${String(i).padStart(2, '0')}:30.000Z`,
+      });
+    }
+    const captured: Captured[] = [];
+    const session = new WatchdogSession({
+      store,
+      config: loadConfig(),
+      model: new MockModel((context) => {
+        captured.push({ messages: context.request.messages as Captured['messages'] });
+        return { text: '结论', reasoning: null, toolCalls: [], finishReason: 'stop', model: 'm', usage: null };
+      }),
+      modelName: 'm',
+      restartMain: async () => ({ ok: true, message: 'ok' }),
+      health: () => ({ state: 'alive' as const, pid: 1, detail: 'test', heartbeatAgeMs: 10 }),
+    });
+    await session.ask('重启后提问');
+    const text = captured[0]!.messages.map((m) => m.content ?? '').join('\n');
+    assert.match(text, /重启问题-12/, '重启后仍要读到最近的问答');
+    assert.doesNotMatch(text, /重启问题-1\b/, '重启后不应回退到最早的历史');
+  } finally {
+    cleanup();
+  }
+});

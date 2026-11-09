@@ -588,8 +588,20 @@ export class Store {
 
   // ---------------- Watchdog 会话 / 问题 / 动作 ----------------
 
-  appendWdTurn(turn: { id: string; role: 'user' | 'assistant' | 'tool'; content: string }): void {
-    this.run('INSERT INTO wd_turn (id, role, content, created_at) VALUES (?, ?, ?, ?)', turn.id, turn.role, turn.content, nowIso());
+  appendWdTurn(turn: {
+    id: string;
+    role: 'user' | 'assistant' | 'tool';
+    content: string;
+    /** 测试与导入场景可以指定时间；正常调用用当前时间。 */
+    createdAt?: string;
+  }): void {
+    this.run(
+      'INSERT INTO wd_turn (id, role, content, created_at) VALUES (?, ?, ?, ?)',
+      turn.id,
+      turn.role,
+      turn.content,
+      turn.createdAt ?? nowIso(),
+    );
   }
 
   /**
@@ -597,10 +609,18 @@ export class Store {
    * 调查日志里的工具记录不在这里：它们没有调用标识，不能当正式 tool 消息重发。
    */
   listWdDialogue(limit = 10): { id: string; role: 'user' | 'assistant'; content: string }[] {
-    return this.all(
-      "SELECT id, role, content FROM wd_turn WHERE role IN ('user','assistant') ORDER BY created_at ASC, rowid ASC LIMIT ?",
+    // 先取最近的若干条，再按时间正序返回：直接正序 + LIMIT 拿到的是最早的历史，
+    // 问答超过十组之后，新内容永远进不了下一次请求。
+    // 同时间的记录用 rowid 保证稳定次序。
+    const rows = this.all(
+      `SELECT id, role, content FROM (
+         SELECT id, role, content, created_at, rowid AS rid
+         FROM wd_turn WHERE role IN ('user','assistant')
+         ORDER BY created_at DESC, rowid DESC LIMIT ?
+       ) ORDER BY created_at ASC, rid ASC`,
       limit,
-    ).map((row) => ({
+    );
+    return rows.map((row) => ({
       id: str(row['id']),
       role: str(row['role']) as 'user' | 'assistant',
       content: str(row['content']),
