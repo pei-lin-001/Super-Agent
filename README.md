@@ -270,9 +270,12 @@ Worker：`fs_list` `fs_read`（支持 `offset`/`limit` 分段续读）`fs_search
 `artifact_save` `artifact_read` `artifact_list`、`create_worker`、`message_send`、`wait_for`、
 `submit_result`（仅负责人）、`report_to_router`。
 
-Router：`create_task` `send_to_worker` `stop_task` `list_tasks` `read_task`。
+Router：`create_task` `send_to_worker` `stop_task` `list_tasks` `read_task` `send_file`
+`attach_materials` `conversation_list` `conversation_new` `conversation_switch`。
 
-**没有开放 shell 工具**：本模块用读写与搜索已能完成真实任务，开放 shell 会让取消与幂等语义变复杂。
+**没有开放 shell**：`proc_run` 只接受「程序名 + 参数数组」，不经过 shell，不做管道/通配/变量展开，
+因此取消与幂等语义可控。但它确实能执行真实命令（python3 / node / git …），
+权限就是你自己的用户权限——只限制了工作目录与环境变量，**没有沙箱**。
 
 ## 7.5 Worker 工具
 

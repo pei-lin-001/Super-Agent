@@ -101,8 +101,12 @@ const platform = createServer((req, res) => {
 // ---------- 假模型：按工具集区分 Router / Worker ----------
 let routerCalls = 0;
 let workerWrites = 0;
-/** 记住第一次看到的任务号：汇报那一轮的上下文里不一定带 id。 */
-let knownTaskId = '';
+/**
+ * 假模型只认本次请求里真实可见的任务号（任务卡在 system 里）。
+ *
+ * 之前用一个跨请求记忆的全局变量，会在任务卡缺失时依然"恰好"拿到 id，
+ * 把"Router 上下文里看不到任务"这种真实缺陷盖住。
+ */
 const model = createServer((req, res) => {
   let raw = '';
   req.on('data', (chunk) => {
@@ -119,8 +123,12 @@ const model = createServer((req, res) => {
       .filter((message) => message.role === 'tool')
       .map((message) => message.content ?? '')
       .join('\n');
-    const taskId = raw.match(/task_[a-z0-9]{6,}/)?.[0] ?? '';
-    if (taskId !== '') knownTaskId = taskId;
+    const taskIdInContext =
+      (parsed.messages ?? [])
+        .filter((message) => message.role === 'system')
+        .map((message) => message.content ?? '')
+        .join('\n')
+        .match(/task_[a-z0-9]{6,}/)?.[0] ?? '';
 
     const reply = (name: string, args: Record<string, unknown>): unknown => ({
       choices: [
@@ -151,10 +159,13 @@ const model = createServer((req, res) => {
         });
       } else if (routerCalls === 2) {
         payload = text('收到，已经安排执行，完成后我把文件发你。');
-      } else if (routerCalls === 3 && knownTaskId !== '') {
-        payload = reply('send_file', { task_id: knownTaskId, name: 'deliverable.md', note: '交付文件' });
+      } else if (routerCalls === 3 && taskIdInContext !== '') {
+        payload = reply('send_file', { task_id: taskIdInContext, name: 'deliverable.md', note: '交付文件' });
       } else if (routerCalls === 4) {
         payload = text('文件已经发出，请查收。');
+      } else if (routerCalls === 3) {
+        // 上下文里看不到任务号：如实说出来，让验收自己失败，而不是猜一个 id。
+        payload = text('上下文里没有任务号，发不了文件。');
       } else {
         payload = text('收到，继续。');
       }
