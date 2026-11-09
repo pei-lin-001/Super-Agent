@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import type { Store } from '../storage/store.ts';
+import { outsideRevocation } from '../runtime/execution.ts';
 import type { ChatRequest, ModelClient, StepResult } from './types.ts';
 
 export type CallPurpose = 'router' | 'worker' | 'note' | 'watchdog' | 'context';
@@ -38,7 +39,9 @@ export class RecordingModel implements ModelClient {
     }
     const id = `mc_${randomBytes(6).toString('hex')}`;
     try {
-      this.store.startModelCall({ id, purpose: this.purpose, model: request.model, ...this.scope });
+      outsideRevocation(() => {
+        this.store.startModelCall({ id, purpose: this.purpose, model: request.model, ...this.scope });
+      });
     } catch {
       // 记账失败不能影响业务调用。
       return this.inner.chat(request);
@@ -68,12 +71,16 @@ export class RecordingModel implements ModelClient {
   }
 
   private safeFinish(input: Parameters<Store['finishModelCall']>[0]): void {
+    // 记账是停机收尾的一部分：业务已经撤销，但"这次调用被取消/失败"必须留下来。
+    // 这里退出撤销上下文，只为了让这一条记录落盘，不会让业务逻辑重新活过来。
     try {
-      if (this.store.isClosed) {
-        console.warn(`[记账] 存储已关闭，调用 ${input.id} 的状态未能写入`);
-        return;
-      }
-      this.store.finishModelCall(input);
+      outsideRevocation(() => {
+        if (this.store.isClosed) {
+          console.warn(`[记账] 存储已关闭，调用 ${input.id} 的状态未能写入`);
+          return;
+        }
+        this.store.finishModelCall(input);
+      });
     } catch (error) {
       // 记账失败要有可见诊断，不能静默吞掉。
       console.warn(`[记账] 写入调用 ${input.id} 失败：${(error as Error).message}`);

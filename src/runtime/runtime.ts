@@ -17,6 +17,7 @@ import {
   nowIso,
 } from '../domain/ids.ts';
 import { isTerminalTask, isTerminalWorker } from '../domain/state.ts';
+import { Execution, ExecutionRevoked } from './execution.ts';
 import type {
   Artifact,
   ProcessJob,
@@ -118,9 +119,21 @@ export class Runtime implements ToolHost {
   private readonly rerunRequested = new Set<string>();
   private readonly jobs: ProcessService;
   /** 每个 Worker 当前的取消信号；停止任务或 Worker 失败时触发。 */
-  private readonly aborts = new Map<string, AbortController>();
+  /** 每个正在执行的 Worker 对应一个执行过程；撤销后它彻底失去写库资格。 */
+  private readonly runs = new Map<string, Execution>();
   /** 进程级取消：覆盖不挂在单个 Worker 上的执行（Router、工作记录整理）。 */
   private readonly lifecycle = new AbortController();
+  /** 所有登记过的执行过程（含 Router 与工作记录整理），停机时统一撤销。 */
+  private readonly executions = new Set<Execution>();
+
+  /** 登记一次执行过程：停机时会被统一撤销，之后不会再写库。 */
+  track(execution: Execution): void {
+    this.executions.add(execution);
+  }
+
+  untrack(execution: Execution): void {
+    this.executions.delete(execution);
+  }
   private readonly budgetNoted = new Set<string>();
   private runningCount = 0;
   private workerSequence = 0;
@@ -195,14 +208,13 @@ export class Runtime implements ToolHost {
     this.rerunRequested.clear();
     // 2) 取消在途模型请求：不取消的话，等 15 秒也只是等到数据库被关掉
     this.lifecycle.abort();
-    for (const controller of this.aborts.values()) {
-      try {
-        controller.abort();
-      } catch {
-        // 已取消或已结束
-      }
+    for (const run of this.runs.values()) {
+      run.revoke('系统停机');
     }
-    // 3) 等在途执行收尾（取消后通常很快返回）
+    for (const execution of this.executions) {
+      execution.revoke('系统停机');
+    }
+    // 3) 等在途执行收尾：撤销之后执行过程不会再写库，迟到结果只被观察
     await this.waitForIdle(15_000);
     // 4) 兜底：仍然没退出说明提供方忽略了取消。再等一小段，
     //    之后迟到的回调会因为 stopped 标记和 isClosed 检查而不再写库。
@@ -1115,7 +1127,7 @@ export class Runtime implements ToolHost {
     for (const worker of this.store.listGroupWorkers(groupId)) {
       if (isTerminalWorker(worker.status)) continue;
       this.store.clearWaitsForWorker(worker.id);
-      this.aborts.get(worker.id)?.abort();
+      this.runs.get(worker.id)?.revoke('任务已结束');
       this.store.setWorkerStatus(worker.id, 'cancelled', reason);
       this.emit({ type: 'worker.status', workerId: worker.id, status: 'cancelled' });
     }
@@ -1166,10 +1178,10 @@ export class Runtime implements ToolHost {
       this.running.add(workerId);
       this.runningCount += 1;
       void this.runWorker(workerId)
-        .catch((error: unknown) => this.handleRunError(workerId, error))
+        .catch(() => undefined)
         .finally(() => {
           this.running.delete(workerId);
-          this.aborts.delete(workerId);
+          this.runs.delete(workerId);
           this.runningCount -= 1;
           if (this.rerunRequested.delete(workerId)) {
             const current = this.store.getWorker(workerId);
@@ -1183,12 +1195,27 @@ export class Runtime implements ToolHost {
   }
 
   private async runWorker(workerId: string): Promise<void> {
+    const execution = new Execution(`worker:${workerId}`);
+    this.runs.set(workerId, execution);
+    try {
+      await execution.run(() => this.runWorkerBody(workerId, execution));
+    } catch (error) {
+      if (error instanceof ExecutionRevoked || !execution.active) {
+        // 执行已经被撤销（停机 / 任务终结 / 代次失效）：
+        // 这条路径上不能再写库，也不能把业务判死。
+        return;
+      }
+      await this.handleRunError(workerId, error);
+    } finally {
+      this.runs.delete(workerId);
+    }
+  }
+
+  private async runWorkerBody(workerId: string, execution: Execution): Promise<void> {
     const dbg = (m: string): void => {
       if (process.env['DEBUG_RUN']) console.error(`[run:${workerId}] ${m}`);
     };
     dbg('enter');
-    const controller = new AbortController();
-    this.aborts.set(workerId, controller);
     let worker = this.store.getWorker(workerId);
     if (!worker || isTerminalWorker(worker.status)) return;
     let task = this.store.getTaskByGroup(worker.groupId);
@@ -1208,7 +1235,7 @@ export class Runtime implements ToolHost {
 
     // 本轮执行的代次：暂停、取消、恢复都会推进它，旧响应因此失去资格。
     const epoch = this.store.getWorker(workerId)?.runEpoch ?? 0;
-    const runController = this.aborts.get(workerId);
+    const runController = this.runs.get(workerId);
     const stale = (): boolean => {
       const current = this.store.getWorker(workerId);
       if (!current) return true;
@@ -1249,16 +1276,18 @@ export class Runtime implements ToolHost {
         return;
       }
       dbg(`request model closed=${this.store.isClosed}`);
-      const result = await new RecordingModel(this.workerModel, this.store, 'worker', {
-        taskId: task.id,
-        workerId,
-      }).chat({
-        model: worker.model ?? this.config.workerModel,
-        messages,
-        tools: this.tools.schemas(),
-        reasoningEffort: this.config.reasoningEffort,
-        signal: runController?.signal ?? null,
-      });
+      const result = await execution.attach(
+        new RecordingModel(this.workerModel, this.store, 'worker', {
+          taskId: task.id,
+          workerId,
+        }).chat({
+          model: worker.model ?? this.config.workerModel,
+          messages,
+          tools: this.tools.schemas(),
+          reasoningEffort: this.config.reasoningEffort,
+          signal: runController?.signal ?? null,
+        }),
+      );
 
       dbg('model returned');
       const afterModel = this.canRun(workerId, epoch);
@@ -1780,7 +1809,7 @@ export class Runtime implements ToolHost {
       task,
       workDir: this.config.workDir,
       materialsDir: this.config.materialsDir,
-      signal: this.aborts.get(workerId)?.signal ?? null,
+      signal: this.runs.get(workerId)?.signal ?? null,
     };
   }
 
@@ -1931,7 +1960,7 @@ export class Runtime implements ToolHost {
   private async failWorker(workerId: string, reason: string): Promise<void> {
     const worker = this.store.getWorker(workerId);
     if (!worker || isTerminalWorker(worker.status)) return;
-    this.aborts.get(workerId)?.abort();
+    this.runs.get(workerId)?.revoke('Worker 失败');
     this.store.setWorkerStatus(workerId, 'failed', reason);
     this.store.appendEvent(this.store.getTaskByGroup(worker.groupId)?.id ?? null, workerId, 'worker.failed', reason);
     this.emit({ type: 'worker.status', workerId, status: 'failed' });

@@ -5,6 +5,7 @@ import { RecordingModel } from '../model/recorder.ts';
 import type { RuntimeEvent } from '../domain/types.ts';
 import type { ChatMessage, ModelClient, ToolSchema } from '../model/types.ts';
 import type { Runtime } from './runtime.ts';
+import { Execution, ExecutionRevoked } from './execution.ts';
 import { routerSystemPrompt, taskCardLine } from './prompts.ts';
 
 const ROUTER_TOOLS: ToolSchema[] = [
@@ -145,7 +146,26 @@ export class Router {
   }
 
   /** 返回这次协调的结果：完成 / 额度用完待续接 / 失败。只有完成才关闭会话。 */
+  /**
+   * 一次协调执行。
+   *
+   * 整段流程在 Execution 里跑：停机撤销之后，任何一次存储访问都会被挡住，
+   * 包括异常分支和 finally。底层模型即使忽略取消，迟到结果也只被观察。
+   */
   private async run(userText: string | null): Promise<'done' | 'suspended'> {
+    const execution = new Execution('router');
+    this.runtime.track(execution);
+    try {
+      return await execution.run(() => this.runBody(userText, execution));
+    } catch (error) {
+      if (error instanceof ExecutionRevoked) return 'done';
+      throw error;
+    } finally {
+      this.runtime.untrack(execution);
+    }
+  }
+
+  private async runBody(userText: string | null, execution: Execution): Promise<'done' | 'suspended'> {
     if (this.runtime.isStopped) return 'done';
     const inbox = this.runtime.store.listRouterInbox();
     if (userText === null && inbox.length === 0) return 'done';
@@ -239,16 +259,18 @@ export class Router {
         continue;
       }
 
-      const result = await new RecordingModel(this.model, this.runtime.store, 'router', {
-        sessionId,
-      }).chat({
+      const result = await execution.attach(
+        new RecordingModel(this.model, this.runtime.store, 'router', {
+          sessionId,
+        }).chat({
         model: this.config.routerModel,
         messages,
         tools: this.readOnly ? [] : ROUTER_TOOLS,
-        reasoningEffort: this.config.reasoningEffort,
-        // 进程级取消：停机时 Router 的请求同样要停下，不能只在库里留下脏写。
-        signal: this.runtime.lifecycleSignal,
-      });
+          reasoningEffort: this.config.reasoningEffort,
+          // 进程级取消：停机时 Router 的请求同样要停下，不能只在库里留下脏写。
+          signal: this.runtime.lifecycleSignal,
+        }),
+      );
 
       if (result.toolCalls.length === 0) {
         const answer = result.text?.trim() ?? '';

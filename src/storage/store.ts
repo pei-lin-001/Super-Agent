@@ -1,6 +1,7 @@
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { ExecutionRevoked, isRevoked, revocationReason } from '../runtime/execution.ts';
 import { newEventId, newReviewId, newWaitId, nowIso } from '../domain/ids.ts';
 import { assertMessageTransition, assertTaskTransition, assertWorkerTransition } from '../domain/state.ts';
 import type {
@@ -261,7 +262,20 @@ export class Store {
     this.db.close();
   }
 
+  /**
+   * 统一的存储可用性检查。
+   *
+   * 这里同时挡住两件事：数据库已经关闭；当前执行过程已经被撤销。
+   * 放在最底层的 SQL 入口，是为了让异常分支、finally、迟到回调也走同一条边界，
+   * 而不是靠每个调用点各自记得检查。
+   */
+  private assertUsable(): void {
+    if (this.closed) throw new ExecutionRevoked('存储已关闭，拒绝访问');
+    if (isRevoked()) throw new ExecutionRevoked(revocationReason() ?? undefined);
+  }
+
   tx<T>(fn: () => T): T {
+    this.assertUsable();
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const value = fn();
@@ -274,14 +288,17 @@ export class Store {
   }
 
   private all(sql: string, ...params: unknown[]): Row[] {
+    this.assertUsable();
     return this.db.prepare(sql).all(...(params.map(bind) as never[])) as Row[];
   }
 
   private get(sql: string, ...params: unknown[]): Row | undefined {
+    this.assertUsable();
     return this.db.prepare(sql).get(...(params.map(bind) as never[])) as Row | undefined;
   }
 
   private run(sql: string, ...params: unknown[]): void {
+    this.assertUsable();
     this.db.prepare(sql).run(...(params.map(bind) as never[]));
   }
 
