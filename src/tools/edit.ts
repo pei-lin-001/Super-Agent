@@ -4,6 +4,7 @@ import { existsSync, statSync } from 'node:fs';
 import { extname, resolve } from 'node:path';
 import { readdirSync } from 'node:fs';
 import { assertInsideRoot, normalizeRelativePath, resolveInside, ToolError } from './paths.ts';
+import { resolveReadPath } from './files.ts';
 import {
   argNumber,
   argOptionalNumber,
@@ -96,8 +97,8 @@ export const editTools: ToolDefinition[] = [
   {
     name: 'fs_glob',
     description:
-      '按文件名或 glob 模式查找文件（例如 `**/*.py`、`src/**/*.ts`）。返回相对任务目录的路径与大小。' +
-      '只在任务目录内查找，自动跳过 node_modules/.git 等目录。找内容请用 fs_search。',
+      '按文件名或 glob 模式查找文件（例如 `**/*.py`、`src/**/*.ts`）。返回仓库相对路径与大小。' +
+      '在只读根（仓库）内查找，自动跳过 node_modules/.git 等目录。找内容请用 fs_search。',
     parameters: {
       type: 'object',
       properties: {
@@ -109,8 +110,9 @@ export const editTools: ToolDefinition[] = [
     },
     run(args, context) {
       const pattern = argString(args, 'pattern');
-      const root = taskDir(context);
-      const start = argOptionalString(args, 'path') ? writablePath(context, argOptionalString(args, 'path')!) : root;
+      // 只在读文件时放开到仓库；写入仍然限制在任务目录（fs_write/fs_edit 没变）。
+      const root = context.readRoot;
+      const start = resolveReadPath(context, argOptionalString(args, 'path') ?? '.');
       const limit = Math.max(1, Math.min(MAX_GLOB_RESULTS, argOptionalNumber(args, 'limit') ?? 100));
       const files: string[] = [];
       walk(root, start, files);
@@ -138,8 +140,7 @@ export const editTools: ToolDefinition[] = [
     },
     async run(args, context) {
       const logical = argString(args, 'path');
-      const root = taskDir(context);
-      const absolute = writablePath(context, logical);
+      const absolute = resolveReadPath(context, logical);
       if (!existsSync(absolute)) throw new ToolError(`路径不存在：${logical}`);
       const info = await stat(absolute);
       const lines = [

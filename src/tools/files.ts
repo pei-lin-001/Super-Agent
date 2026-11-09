@@ -32,7 +32,7 @@ export function taskDir(context: ToolContext): string {
  * 相对路径先看任务目录，没有就按仓库根解释——这样 Worker 像用 pi 一样
  * 直接读代码库，而不是被迫走 shell（shell 输出无界，会撑爆上下文窗口）。
  */
-function resolveReadPath(context: ToolContext, logicalPath: string): string {
+export function resolveReadPath(context: ToolContext, logicalPath: string): string {
   if (logicalPath === 'materials' || logicalPath.startsWith('materials/')) {
     const rest = logicalPath.slice('materials'.length).replace(/^\/+/, '');
     return resolveInside(context.materialsDir, rest);
