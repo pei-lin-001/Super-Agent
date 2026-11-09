@@ -240,7 +240,7 @@ export class Store {
     };
     ensureColumn('task', 'review_epoch', 'review_epoch INTEGER NOT NULL DEFAULT 0');
     ensureColumn('task', 'maintenance', 'maintenance INTEGER NOT NULL DEFAULT 0');
-    ensureColumn('wd_action', 'command_id', 'wd_action.command_id TEXT');
+    ensureColumn('wd_action', 'command_id', 'command_id TEXT');
     ensureColumn('worker', 'run_epoch', 'run_epoch INTEGER NOT NULL DEFAULT 0');
     ensureColumn('message', 'dedupe_key', 'dedupe_key TEXT');
     ensureColumn('message', 'broadcast_id', 'broadcast_id TEXT');
@@ -698,8 +698,19 @@ export class Store {
     };
   }
 
-  listWdActions(limit = 20): { action: string; reason: string; result: string; createdAt: string }[] {
+  listWdActions(limit = 20): {
+    id: string;
+    issueId: string | null;
+    commandId: string | null;
+    action: string;
+    reason: string;
+    result: string;
+    createdAt: string;
+  }[] {
     return this.all('SELECT * FROM wd_action ORDER BY created_at DESC LIMIT ?', limit).map((row) => ({
+      id: str(row['id']),
+      issueId: strOrNull(row['issue_id']),
+      commandId: strOrNull(row['command_id']),
       action: str(row['action']),
       reason: str(row['reason']),
       result: str(row['result']),
