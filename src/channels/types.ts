@@ -135,6 +135,19 @@ export interface ContextTokenStore {
 }
 
 /** 渠道适配器：平台收发 + 登录状态，不含业务判断。 */
+/**
+ * 渠道可选能力。
+ *
+ * 平台支持就实现，不支持就不实现——上层据此决定用哪种展示方式，
+ * 不假装微信也能编辑消息。
+ */
+export interface ChannelCapabilities {
+  /** 正在输入提示。 */
+  typing: boolean;
+  /** 能否原地修改已发消息（流式更新的载体）。 */
+  edit: boolean;
+}
+
 export interface ChannelAdapter {
   readonly name: ChannelName;
   readonly accountId: string;
@@ -145,4 +158,15 @@ export interface ChannelAdapter {
   send(input: { target: OutboundTarget; segment: OutboundSegment; signal: AbortSignal }): Promise<SendOutcome>;
   /** 停止时释放连接；不抛错。 */
   close(): Promise<void>;
+  /** 这个平台支持哪些展示能力；缺省表示都不支持。 */
+  readonly capabilities?: ChannelCapabilities;
+  /** 发送"正在输入"；到期由平台自动消失，上层按节奏补发。 */
+  typing?(input: { target: OutboundTarget; signal: AbortSignal }): Promise<void>;
+  /** 原地改写一条已发送消息（流式展示的载体）。 */
+  edit?(input: {
+    target: OutboundTarget;
+    messageId: string;
+    text: string;
+    signal: AbortSignal;
+  }): Promise<SendOutcome>;
 }

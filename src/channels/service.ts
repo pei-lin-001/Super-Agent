@@ -8,8 +8,14 @@ import { readFileSync, statSync } from 'node:fs';
 import type { Config } from '../config.ts';
 import type { Runtime } from '../runtime/runtime.ts';
 import type { Store } from '../storage/store.ts';
-import type { InboundAttachment, ChannelAdapter, OutboundSegment, SendOutcome } from './types.ts';
-import { ChannelAuthError } from './types.ts';
+import type {
+  InboundAttachment,
+  ChannelAdapter,
+  OutboundSegment,
+  OutboundTarget,
+  SendOutcome,
+} from './types.ts';
+import { ChannelAuthError, parseSessionKey } from './types.ts';
 import { resolveArtifactPath, sha256Of } from './storage.ts';
 import { randomBytes } from 'node:crypto';
 import { nowIso } from '../domain/ids.ts';
@@ -74,6 +80,23 @@ export class ChannelService {
   private readonly sending = new Set<string>();
   private outboundBusy = false;
   private started = false;
+  /**
+   * 正在进行的会话展示：占位消息 + 正在输入心跳。
+   *
+   * 只有支持编辑的平台才建占位消息；不支持的就只发"正在输入"，
+   * 最终回复照常作为一条新消息发出。
+   */
+  private readonly live = new Map<
+    string,
+    {
+      adapter: ChannelAdapter;
+      messageId: string | null;
+      lastText: string;
+      lastEditAt: number;
+      editing: boolean;
+    }
+  >();
+  private readonly typingTimers = new Map<string, NodeJS.Timeout>();
   private unsubscribe: (() => void) | null = null;
   private readonly sleeps = new Set<NodeJS.Timeout>();
 
@@ -119,8 +142,23 @@ export class ChannelService {
     this.started = true;
     // Router 面向聊天的可投递内容 → 发件记录。
     this.unsubscribe = this.runtime.on((event) => {
+      if (event.type === 'router.start') {
+        void this.beginLive(event.sessionKey ?? null);
+        return;
+      }
+      if (event.type === 'router.progress') {
+        this.updateLive(event.sessionKey ?? null, event.text);
+        return;
+      }
       if (event.type !== 'channel.outbound') return;
-      this.enqueueOutbound(event.sessionKey, event.text, event.taskId, event.artifact);
+      // 已经有占位消息的平台：把占位消息改成最终答案，不再多发一条。
+      void this.finishLive(event.sessionKey, event.text).then((handled) => {
+        if (!handled) {
+          this.enqueueOutbound(event.sessionKey, event.text, event.taskId, event.artifact);
+          return;
+        }
+        if (event.artifact) this.enqueueOutbound(event.sessionKey, '', event.taskId, event.artifact);
+      });
     });
     for (const [key, entry] of this.runtimes) {
       entry.loop = this.pollLoop(key, entry);
@@ -151,6 +189,9 @@ export class ChannelService {
     for (const entry of this.runtimes.values()) entry.abort.abort();
     for (const timer of this.sleeps) clearTimeout(timer);
     this.sleeps.clear();
+    for (const timer of this.typingTimers.values()) clearInterval(timer);
+    this.typingTimers.clear();
+    this.live.clear();
     await Promise.allSettled([...this.runtimes.values()].map((entry) => entry.loop ?? Promise.resolve()));
     // 发送中的调用交给它自己结束：这里只关连接，不改业务状态。
     await Promise.allSettled([...this.runtimes.values()].map((entry) => entry.adapter.close()));
@@ -331,6 +372,148 @@ export class ChannelService {
     }
   }
 
+  /** 会话开始处理：起"正在输入"心跳；能编辑的平台先发占位消息。 */
+  private async beginLive(sessionKey: string | null): Promise<void> {
+    if (sessionKey === null) return;
+    const target = this.targetOf(sessionKey);
+    if (!target) return;
+    this.startTyping(sessionKey, target.adapter, target.outbound);
+    if (!target.adapter.capabilities?.edit || !target.adapter.edit) return;
+    const outcome = await this.dispatch(sessionKey, target.adapter, {
+      target: target.outbound,
+      segment: {
+        index: 0,
+        kind: 'text',
+        text: '正在处理…',
+        status: 'pending',
+        platformMessageId: null,
+        error: null,
+      },
+      signal: new AbortController().signal,
+    });
+    if (outcome.status === 'sent' && outcome.platformMessageId) {
+      this.live.set(sessionKey, {
+        adapter: target.adapter,
+        messageId: outcome.platformMessageId,
+        lastText: '正在处理…',
+        lastEditAt: Date.now(),
+        editing: false,
+      });
+    }
+  }
+
+  /** 进度：把占位消息改成当前进展（限流，避免打爆平台）。 */
+  private updateLive(sessionKey: string | null, text: string): void {
+    if (sessionKey === null) return;
+    const entry = this.live.get(sessionKey);
+    if (!entry) return;
+    if (!entry.adapter.edit || entry.messageId === null) return;
+    const composed = text.trim();
+    if (composed === '' || composed === entry.lastText) return;
+    if (Date.now() - entry.lastEditAt < 1_000) return;
+    if (entry.editing) return;
+    entry.editing = true;
+    entry.lastText = composed;
+    entry.lastEditAt = Date.now();
+    const target = this.targetOf(sessionKey);
+    if (!target) {
+      entry.editing = false;
+      return;
+    }
+    void entry.adapter
+      .edit({
+        target: target.outbound,
+        messageId: entry.messageId,
+        text: composed,
+        signal: new AbortController().signal,
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        entry.editing = false;
+      });
+  }
+
+  /** 最终答案：改写占位消息。返回 false 表示这个会话没有占位消息，需要正常发送。 */
+  private async finishLive(sessionKey: string, text: string): Promise<boolean> {
+    this.stopTyping(sessionKey);
+    const entry = this.live.get(sessionKey);
+    if (!entry || entry.messageId === null || !entry.adapter.edit) {
+      this.live.delete(sessionKey);
+      return false;
+    }
+    this.live.delete(sessionKey);
+    const target = this.targetOf(sessionKey);
+    if (!target) return false;
+    const limit = TEXT_LIMITS[target.adapter.name] ?? 4000;
+    const [head, ...rest] = splitText(text.trim() === '' ? '（无内容）' : text, limit);
+    const outcome = await entry.adapter.edit({
+      target: target.outbound,
+      messageId: entry.messageId,
+      text: head ?? '',
+      signal: new AbortController().signal,
+    });
+    if (outcome.status !== 'sent') return false;
+    // 改写只能覆盖第一段，剩下的照常发。
+    for (const chunk of rest) {
+      this.enqueueOutbound(sessionKey, chunk, null, null);
+    }
+    return true;
+  }
+
+  private startTyping(sessionKey: string, adapter: ChannelAdapter, outbound: OutboundTarget): void {
+    if (!adapter.capabilities?.typing || !adapter.typing) return;
+    if (this.typingTimers.has(sessionKey)) return;
+    const beat = (): void => {
+      void adapter
+        .typing!({ target: outbound, signal: new AbortController().signal })
+        .catch(() => undefined);
+    };
+    beat();
+    const timer = setInterval(beat, 4_000);
+    timer.unref?.();
+    this.typingTimers.set(sessionKey, timer);
+  }
+
+  private stopTyping(sessionKey: string): void {
+    const timer = this.typingTimers.get(sessionKey);
+    if (!timer) return;
+    clearInterval(timer);
+    this.typingTimers.delete(sessionKey);
+  }
+
+  /** 会话键 → 适配器与发送目标；账号没接上就返回 null。 */
+  private targetOf(
+    sessionKey: string,
+  ): { adapter: ChannelAdapter; outbound: OutboundTarget } | null {
+    const parsed = parseSessionKey(sessionKey);
+    if (!parsed) return null;
+    const entry = this.runtimes.get(this.keyOf(parsed.channel, parsed.accountId));
+    if (!entry) return null;
+    return {
+      adapter: entry.adapter,
+      outbound: {
+        channel: entry.adapter.name,
+        accountId: entry.adapter.accountId,
+        peerId: parsed.peerId,
+        sessionKey,
+      },
+    };
+  }
+
+  /** 统一发送入口：便于流式与普通发送共用同一套错误处理。 */
+  private async dispatch(
+    sessionKey: string,
+    adapter: ChannelAdapter,
+    input: { target: OutboundTarget; segment: OutboundSegment; signal: AbortSignal },
+  ): Promise<SendOutcome> {
+    void sessionKey;
+    try {
+      return await adapter.send(input);
+    } catch (error) {
+      return { status: 'failed', error: (error as Error).message, retryable: true };
+    }
+  }
+
   /** 面向聊天的一条可投递内容写入发件记录。 */
   enqueueOutbound(
     sessionKey: string,
@@ -347,7 +530,8 @@ export class ChannelService {
     const limit = TEXT_LIMITS[channel] ?? 4000;
     const segments: OutboundSegment[] = [];
     let index = 0;
-    for (const chunk of splitText(text, limit)) {
+    // 空文本表示"这一条只有文件"：不要为了占位而发一条空消息。
+    for (const chunk of text.trim() === '' ? [] : splitText(text, limit)) {
       segments.push({ index, kind: 'text', text: chunk, status: 'pending', platformMessageId: null, error: null });
       index += 1;
     }

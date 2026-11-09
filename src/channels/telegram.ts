@@ -95,6 +95,7 @@ function classifyFailure(error: unknown): SendOutcome {
 export class TelegramAdapter implements ChannelAdapter {
   readonly name = 'telegram' as const;
   readonly accountId: string;
+  readonly capabilities = { typing: true, edit: true };
 
   private readonly options: TelegramAdapterOptions;
   private readonly fetchImpl: typeof fetch;
@@ -328,6 +329,40 @@ export class TelegramAdapter implements ChannelAdapter {
       if (retryAfterMs !== null) {
         return { status: 'failed', error: (error as Error).message, retryable: true, retryAfterMs };
       }
+      return classifyFailure(error);
+    }
+  }
+
+  /** "正在输入"：平台侧约 5 秒后自动消失，上层负责按节奏补发。 */
+  async typing(input: { target: OutboundTarget; signal: AbortSignal }): Promise<void> {
+    await this.call(
+      'sendChatAction',
+      { chat_id: input.target.peerId, action: 'typing' },
+      input.signal,
+    );
+  }
+
+  /** 原地改写：用于把占位消息逐步变成最终回答。 */
+  async edit(input: {
+    target: OutboundTarget;
+    messageId: string;
+    text: string;
+    signal: AbortSignal;
+  }): Promise<SendOutcome> {
+    try {
+      await this.call(
+        'editMessageText',
+        { chat_id: input.target.peerId, message_id: Number(input.messageId), text: input.text },
+        input.signal,
+      );
+      return { status: 'sent', platformMessageId: input.messageId };
+    } catch (error) {
+      const message = (error as Error).message;
+      // "消息内容未变化"是平台侧的幂等提示，不是失败。
+      if (/message is not modified/i.test(message)) {
+        return { status: 'sent', platformMessageId: input.messageId };
+      }
+      if (error instanceof ChannelAuthError) return { status: 'failed', error: message, retryable: false };
       return classifyFailure(error);
     }
   }

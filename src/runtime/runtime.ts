@@ -2193,6 +2193,9 @@ export class Runtime implements ToolHost {
     // 调用记录先按实例归属收敛：崩溃实例留下的 running 不能永远挂着，
     // 但存活实例和归属未知的记录一律不动。
     this.store.recoverModelCalls((instanceId) => this.isInstanceAlive(instanceId));
+    // 上个进程留下的 running 协调会话收回成待续接：同一时刻只有本进程在跑，
+    // running 一定属于已退出进程。不收回就永远接不上；收成 pending 后只续接一次。
+    this.store.resumeStaleRouterSessions();
 
     for (const worker of this.store.listWorkers()) {
       if (isTerminalWorker(worker.status)) continue;

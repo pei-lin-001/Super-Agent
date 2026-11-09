@@ -316,3 +316,100 @@ test('停机：渠道拉取失败不会把已完成任务改回活动状态', as
     await harness.cleanup();
   }
 });
+
+test('正在输入：会话开始处理时发送，结束后停止；不支持的平台不发', async () => {
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    router: () => mockReply({ text: '好了' }),
+  });
+  const service = serviceOf({ runtime: harness.runtime, store: harness.store, config: harness.config });
+  const supported = new FakeAdapter('telegram', 'bot_1', ['owner-1']);
+  const plain = new FakeAdapter('weixin', 'wx_1', ['owner-1']);
+  const typingCalls: string[] = [];
+  (supported as unknown as { capabilities: { typing: boolean; edit: boolean } }).capabilities = {
+    typing: true,
+    edit: false,
+  };
+  (supported as unknown as { typing: (input: { target: { channel: string } }) => Promise<void> }).typing = async (input) => {
+    typingCalls.push(input.target.channel);
+  };
+  service.register(supported);
+  service.register(plain);
+  service.start();
+  try {
+    await harness.router.handleUserMessage('你好', { sessionKey: TG_KEY });
+    await service.waitForIdle(3_000);
+    assert.ok(typingCalls.length > 0, '支持正在输入的平台应收到提示');
+    const before = typingCalls.length;
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(typingCalls.length, before, '回复发出后应停止心跳');
+  } finally {
+    await service.stop();
+    await harness.cleanup();
+  }
+});
+
+test('流式：支持编辑的平台只发一条占位消息，最终被改写成答案', async () => {
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    router: () => mockReply({ text: '这是最终答案' }),
+  });
+  const service = serviceOf({ runtime: harness.runtime, store: harness.store, config: harness.config });
+  const adapter = new FakeAdapter('telegram', 'bot_1', ['owner-1']);
+  const edits: { messageId: string; text: string }[] = [];
+  const sends: string[] = [];
+  (adapter as unknown as { capabilities: { typing: boolean; edit: boolean } }).capabilities = {
+    typing: false,
+    edit: true,
+  };
+  (adapter as unknown as { edit: (input: { messageId: string; text: string }) => Promise<{ status: string; platformMessageId: string }> }).edit = async (input) => {
+    edits.push({ messageId: input.messageId, text: input.text });
+    return { status: 'sent', platformMessageId: input.messageId };
+  };
+  adapter.sendPolicy = () => {
+    sends.push('send');
+    return { status: 'sent', platformMessageId: 'm-placeholder' };
+  };
+  service.register(adapter);
+  service.start();
+  try {
+    await harness.router.handleUserMessage('你好', { sessionKey: TG_KEY });
+    await service.waitForIdle(3_000);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    assert.equal(sends.length, 1, `只该发一条占位消息（实际 ${sends.length} 条）`);
+    assert.equal(edits.at(-1)?.text, '这是最终答案', '占位消息应被改写成最终答案');
+    assert.equal(edits.at(-1)?.messageId, 'm-placeholder', '改写的是同一条消息');
+    const rows = harness.store.listOutboundBySession(TG_KEY);
+    assert.equal(rows.length, 0, '改写成功就不该再有独立发件记录');
+  } finally {
+    await service.stop();
+    await harness.cleanup();
+  }
+});
+
+test('流式：不支持编辑的平台照常发新消息，不建占位', async () => {
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    router: () => mockReply({ text: '微信里的回答' }),
+  });
+  const service = serviceOf({ runtime: harness.runtime, store: harness.store, config: harness.config });
+  const adapter = new FakeAdapter('weixin', 'wx_1', ['owner-1']);
+  (adapter as unknown as { capabilities: { typing: boolean; edit: boolean } }).capabilities = {
+    typing: true,
+    edit: false,
+  };
+  (adapter as unknown as { typing: () => Promise<void> }).typing = async () => undefined;
+  service.register(adapter);
+  service.start();
+  try {
+    await harness.router.handleUserMessage('你好', { sessionKey: 'weixin|wx_1|owner-1' });
+    await service.waitForIdle(3_000);
+    await service.drainOutbound();
+    assert.equal(adapter.sent.length, 1, '不支持编辑就只发一条最终消息');
+    assert.equal(adapter.sent[0]!.segment.text, '微信里的回答');
+  } finally {
+    await service.stop();
+    await harness.cleanup();
+  }
+});

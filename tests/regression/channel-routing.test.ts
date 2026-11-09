@@ -254,3 +254,62 @@ test('入站：两个渠道的事件各自落到自己的会话键', async () =>
     await harness.cleanup();
   }
 });
+
+test('不重复回复：运行中的会话不能被定时恢复当成待续接再跑一遍', async () => {
+  let replies = 0;
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    router: () => {
+      replies += 1;
+      return mockReply({ text: `第 ${replies} 次回复` });
+    },
+  });
+  try {
+    // 模拟运行中途：会话已落库但还没结束
+    harness.store.saveRouterSession({
+      id: 'rs_inflight',
+      sessionKey: TG_KEY,
+      taskId: null,
+      messages: [{ role: 'user', content: '在吗' }],
+      reason: '进行中',
+      status: 'running',
+    });
+    // 定时恢复此时不该把它捡起来
+    assert.deepEqual(harness.store.pendingRouterSessionKeys(), [], '运行中的会话不是待续接');
+    await harness.router.resume();
+    assert.equal(replies, 0, '运行中的会话不能被续接，否则用户会收到重复回复');
+
+    // 进程重启后才收回成待续接，并且只续接一次
+    const recovered = harness.store.resumeStaleRouterSessions();
+    assert.equal(recovered, 1, '遗留的 running 应被收回');
+    assert.deepEqual(harness.store.pendingRouterSessionKeys(), [TG_KEY]);
+    await harness.router.resume();
+    assert.equal(replies, 1, '续接只跑一次');
+    assert.equal(harness.store.pendingRouterSessionKeys().length, 0, '续接后不再挂起');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('不重复回复：一条用户消息只产生一次回信', async () => {
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    router: () => mockReply({ text: '只回一次' }),
+  });
+  const service = serviceOf({ runtime: harness.runtime, store: harness.store, config: harness.config });
+  const adapter = new FakeAdapter('telegram', 'bot_1', ['owner-1']);
+  service.register(adapter);
+  service.start();
+  try {
+    await harness.router.handleUserMessage('你好', { sessionKey: TG_KEY });
+    // 模拟后台定时恢复在运行期间反复触发
+    for (let i = 0; i < 5; i += 1) await harness.router.resume();
+    await service.waitForIdle(5_000);
+
+    const rows = harness.store.listOutboundBySession(TG_KEY);
+    assert.equal(rows.length, 1, `一条消息只该有一条回信（实际 ${rows.length} 条）`);
+  } finally {
+    await service.stop();
+    await harness.cleanup();
+  }
+});

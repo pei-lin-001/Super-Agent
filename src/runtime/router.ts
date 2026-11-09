@@ -111,6 +111,13 @@ export class Router {
   private readonly readOnly: boolean;
   /** 正在续接的会话：防止定时 tick 把同一个会话排成一串重复执行。 */
   private readonly resuming = new Set<string>();
+  /** 正在执行的协调会话：用于挡住同会话的重复唤醒。 */
+  private readonly activeSessions = new Set<string>();
+  /** 每条串行链当前会话的上下文：失败时据此把会话收回"待续接"。 */
+  private readonly liveContexts = new Map<
+    string,
+    { sessionId: string; sessionKey: string | null; messages: ChatMessage[] }
+  >();
 
   constructor(runtime: Runtime, model: ModelClient, config: Config, options: { readOnly?: boolean } = {}) {
     this.runtime = runtime;
@@ -127,16 +134,21 @@ export class Router {
       history?: ChatMessage[];
       sessionKey?: string | null;
       onAccepted?: () => void;
+      /** 所在的串行链标识（= 会话键，CLI 为空串）。 */
+      chainKey?: string;
     } = {},
   ): Promise<'done' | 'suspended' | 'failed'> {
     const key = context.sessionKey ?? '';
+    context.chainKey = key;
     const previous = this.chains.get(key) ?? Promise.resolve();
     const run = previous.then(() => this.run(userText, context));
     // 内部串行链吞掉失败，避免一次故障让后续所有消息都直接失败。
     this.chains.set(
       key,
       run.then(
-        () => undefined,
+        () => {
+          this.liveContexts.delete(key);
+        },
         () => undefined,
       ),
     );
@@ -144,6 +156,20 @@ export class Router {
       (outcome) => outcome,
       (error: unknown) => {
         this.publish({ type: 'router.notice', text: `Router 运行失败：${(error as Error).message}` });
+        // 失败要回到"待续接"：运行中落库的状态是 running，不收回就再也续不上。
+        const context = this.liveContexts.get(key);
+        this.liveContexts.delete(key);
+        if (context) {
+          this.activeSessions.delete(context.sessionId);
+          this.runtime.store.saveRouterSession({
+            id: context.sessionId,
+            sessionKey: context.sessionKey,
+            taskId: null,
+            messages: context.messages.filter((message) => message.role !== 'system'),
+            reason: `执行失败，等待续接：${(error as Error).message}`,
+            status: 'pending',
+          });
+        }
         return 'failed' as const;
       },
     );
@@ -232,6 +258,7 @@ export class Router {
       history?: ChatMessage[];
       sessionKey?: string | null;
       onAccepted?: () => void;
+      chainKey?: string;
     } = {},
   ): Promise<'done' | 'suspended'> {
     const execution = new Execution('router');
@@ -243,6 +270,8 @@ export class Router {
       throw error;
     } finally {
       this.runtime.untrack(execution);
+      // 无论正常结束、挂起还是抛错，会话都不能继续被当成"正在跑"。
+      if (context.sessionId) this.activeSessions.delete(context.sessionId);
     }
   }
 
@@ -254,6 +283,7 @@ export class Router {
       history?: ChatMessage[];
       sessionKey?: string | null;
       onAccepted?: () => void;
+      chainKey?: string;
     } = {},
   ): Promise<'done' | 'suspended'> {
     if (this.runtime.isStopped) return 'done';
@@ -295,10 +325,14 @@ export class Router {
       messages.push({ role: 'user', content: '以上是 Worker 的最新消息，请判断是否需要向用户汇报或采取动作。' });
     }
 
-    this.publish({ type: 'router.start' });
+    this.publish({ type: 'router.start', sessionKey });
 
     // 一条协调会话贯穿多轮调度与重试。
     const sessionId = context.sessionId ?? `rs_${randomBytes(4).toString('hex')}`;
+    // 供上层在任意退出路径上清理"正在跑"标记。
+    context.sessionId = sessionId;
+    // 登记本次运行的会话上下文：失败时用它把会话收回"待续接"。
+    this.liveContexts.set(context.chainKey ?? '', { sessionId, sessionKey, messages });
     // 会话在第一次模型请求前就落库：额度耗尽或失败时，续接入口始终存在。
     this.runtime.store.saveRouterSession({
       id: sessionId,
@@ -306,10 +340,13 @@ export class Router {
       taskId: null,
       messages: messages.filter((message) => message.role !== 'system'),
       reason: '进行中',
+      // 运行中不能算"待续接"：定时恢复会看到它并再跑一遍，用户就收到重复回复。
+      status: 'running',
     });
     // 用户输入此刻已经持久化：渠道层据此把入站记录标成"已交接"。
     // 之后再崩溃，走的是续接原会话，不会把同一条消息重新派一次工。
     context.onAccepted?.();
+    this.activeSessions.add(sessionId);
     const maxRounds = Math.max(1, this.config.limits.maxRouterRounds);
 
     const runOptions = (calls: unknown, results: Map<number, string>): string[] => {
@@ -398,6 +435,8 @@ export class Router {
       }
 
       // 决策先落库，工具调用身份从这条记录派生，不依赖每轮从 0 开始的循环位置。
+      const names = result.toolCalls.map((call) => call.name).join('、');
+      this.publish({ type: 'router.progress', text: `正在执行：${names}`, sessionKey });
       const decisionId = `rd_${randomBytes(4).toString('hex')}`;
       this.runtime.store.saveRouterDecision({
         id: decisionId,
@@ -463,6 +502,7 @@ export class Router {
     messages: ChatMessage[],
     sessionKey: string | null = null,
   ): void {
+    this.activeSessions.delete(sessionId);
     if (outcome === 'done') {
       this.runtime.store.closeRouterSession(sessionId, 'done');
       return;
@@ -473,6 +513,7 @@ export class Router {
       taskId: null,
       messages: messages.filter((message) => message.role !== 'system'),
       reason: '执行失败，等待续接',
+      status: 'pending',
     });
   }
 
@@ -491,6 +532,8 @@ export class Router {
   private async resumeOne(sessionKey: string | null): Promise<void> {
     const session = this.runtime.store.pendingRouterSession(sessionKey);
     if (!session) return;
+    // 内存里也挡一道：同一会话正在跑时，任何唤醒都只是合并，不新开一轮。
+    if (this.activeSessions.has(session.id)) return;
     // 同一会话已经有续接在跑：本次唤醒直接合并，不排进串行队列再跑一遍。
     // 检查发生在任何 await 之前，所以同一 tick 内的多次唤醒都能被挡住。
     if (this.resuming.has(session.id)) return;

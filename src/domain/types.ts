@@ -192,7 +192,14 @@ export type RuntimeEvent =
   | { type: 'worker.created'; workerId: string; role: string; parentId: string | null }
   | { type: 'worker.status'; workerId: string; status: WorkerStatus }
   | { type: 'message.sent'; messageId: string; from: string; to: string; kind: MessageKind }
-  | { type: 'router.start' }
+  | { type: 'router.start'; sessionKey?: string | null }
+  /**
+   * 执行过程中的进度：给"流式显示"用的中间态。
+   *
+   * 不是业务结论，也不入库；渠道层可以拿它刷新占位消息，
+   * 不支持编辑的平台忽略即可。
+   */
+  | { type: 'router.progress'; text: string; sessionKey?: string | null }
   /** sessionKey 决定这条回复回哪个聊天；为空表示 CLI。 */
   | { type: 'router.reply'; text: string; sessionKey?: string | null }
   | { type: 'router.notice'; text: string; sessionKey?: string | null }

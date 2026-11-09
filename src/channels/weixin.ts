@@ -223,6 +223,10 @@ export interface WeixinAdapterOptions {
 export class WeixinAdapter implements ChannelAdapter {
   readonly name = 'weixin' as const;
   readonly accountId: string;
+  /** iLink 没有"改写已发消息"的接口：能显示正在输入，但做不到流式刷新。 */
+  readonly capabilities = { typing: true, edit: false };
+  /** 每个对端的 typing_ticket 缓存；过期就重新取。 */
+  private readonly typingTickets = new Map<string, { ticket: string; at: number }>();
 
   private readonly options: WeixinAdapterOptions;
   private readonly fetchImpl: typeof fetch;
@@ -583,6 +587,35 @@ export class WeixinAdapter implements ChannelAdapter {
     if (!downloadParam) throw new Error('CDN 上传响应缺少 x-encrypted-param');
     void name;
     return { downloadParam, aesKey, plainSize: rawSize };
+  }
+
+  /** 正在输入：先取 typing_ticket（有缓存就用缓存），再上报状态。 */
+  async typing(input: { target: OutboundTarget; signal: AbortSignal }): Promise<void> {
+    const peer = input.target.peerId;
+    const cached = this.typingTickets.get(peer);
+    let ticket = cached && Date.now() - cached.at < 10 * 60_000 ? cached.ticket : '';
+    if (ticket === '') {
+      const config = await this.post<{ ret?: number; typing_ticket?: string; errmsg?: string }>(
+        'ilink/bot/getconfig',
+        { ilink_user_id: peer },
+        10_000,
+      );
+      if ((config.ret ?? 0) !== 0 || !config.typing_ticket) {
+        throw new Error(`取 typing_ticket 失败：ret=${config.ret ?? '?'} ${config.errmsg ?? ''}`.trim());
+      }
+      ticket = config.typing_ticket;
+      this.typingTickets.set(peer, { ticket, at: Date.now() });
+    }
+    const response = await this.post<{ ret?: number; errmsg?: string }>(
+      'ilink/bot/sendtyping',
+      { ilink_user_id: peer, typing_ticket: ticket, status: 1 },
+      10_000,
+    );
+    if ((response.ret ?? 0) !== 0) {
+      // ticket 可能失效：丢掉缓存，下次重新取。
+      this.typingTickets.delete(peer);
+      throw new Error(`sendtyping 失败：ret=${response.ret} ${response.errmsg ?? ''}`.trim());
+    }
   }
 
   async close(): Promise<void> {

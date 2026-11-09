@@ -818,15 +818,23 @@ export class Store {
     reason: string | null;
     /** 来源会话；为空表示 CLI。同一会话的多条待续接互不覆盖。 */
     sessionKey?: string | null;
+    /**
+     * running = 正在跑（不可续接）；pending = 中断待续接。
+     *
+     * 运行中的会话也会落库（崩溃后才有续接入口），但绝不能当成"待续接"，
+     * 否则定时恢复会把它再跑一遍，用户就收到重复回复。
+     */
+    status?: 'running' | 'pending';
   }): void {
     const now = nowIso();
+    const status = session.status ?? 'pending';
     this.run(
       `INSERT INTO router_session (id, session_key, task_id, messages, reason, status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET messages = excluded.messages, reason = excluded.reason,
-         session_key = excluded.session_key, status = 'pending', updated_at = excluded.updated_at`,
+         session_key = excluded.session_key, status = excluded.status, updated_at = excluded.updated_at`,
       session.id, session.sessionKey ?? null, session.taskId, JSON.stringify(session.messages),
-      session.reason, now, now,
+      session.reason, status, now, now,
     );
   }
 
@@ -868,6 +876,19 @@ export class Store {
       "SELECT DISTINCT session_key FROM router_session WHERE status = 'pending'",
     );
     return rows.map((row) => strOrNull(row['session_key']));
+  }
+
+  /**
+   * 把上一个进程遗留的 running 会话收回成 pending。
+   *
+   * 只在启动时调用一次：同一时刻只有本进程在跑，所以 running 一定属于已退出的进程。
+   */
+  resumeStaleRouterSessions(): number {
+    const rows = this.all("SELECT id FROM router_session WHERE status = 'running'");
+    if (rows.length > 0) {
+      this.run("UPDATE router_session SET status = 'pending', updated_at = ? WHERE status = 'running'", nowIso());
+    }
+    return rows.length;
   }
 
   closeRouterSession(id: string, status: 'done' | 'abandoned'): void {
