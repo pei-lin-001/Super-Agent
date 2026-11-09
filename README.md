@@ -150,6 +150,10 @@ Message: queued → delivered → consumed
 | 近期历史 | `worker_turn` | 是，按字符预算 | `CONTEXT_WINDOW_CHARS`，默认 200000（≈50k token） |
 | Router 对话历史 | `router_turn` | 是，按 token 预算，超出压成摘要 | `CONTEXT_WINDOW_TOKENS` / `ROUTER_KEEP_RECENT_TOKENS` |
 
+> 上表的默认值**以 `src/config.ts` 为准**。文档与代码不一致时按代码执行；
+> 改默认值请同时改这两处。历史压测记录里的旧值（如 `CONTEXT_WINDOW_CHARS=16000`）
+> 描述的是当时的配置，不是当前默认值。
+
 ### 窗口怎么取
 
 维护者的对话历史取**最近 N 组**再按时间正序喂回去。直接「按时间正序 + LIMIT」拿到的是最早的历史，

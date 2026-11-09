@@ -7,10 +7,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createHarness } from '../helpers.ts';
+import { mockReply } from '../../src/model/mock.ts';
 import { nowIso } from '../../src/domain/ids.ts';
 
 test('worker_turn 记住工具失败，读回来仍是失败', async () => {
-  const harness = await createHarness({});
+  // 本用例只验落库/读回，不驱动模型；但 createHarness 要求 worker 必填，
+  // 给一个明确的桩而不是省略，避免类型不成立却靠 Node 擦除类型跑过。
+  const harness = await createHarness({ worker: () => mockReply({ text: '本用例不走模型' }) });
   try {
     const { owner } = harness.runtime.createTask({ title: 't', goal: 'g', ownerRole: 'r', ownerBrief: 'b' });
     harness.store.appendWorkerTurn({

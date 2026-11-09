@@ -12,7 +12,6 @@
 
 export const DEFAULT_MAX_LINES = 2000;
 export const DEFAULT_MAX_BYTES = 50 * 1024;
-export const GREP_MAX_LINE_LENGTH = 500;
 
 export interface TruncateOptions {
   maxLines?: number;
@@ -153,35 +152,3 @@ function truncateStringToBytesFromEnd(str: string, maxBytes: number): string {
   return buf.subarray(start).toString('utf-8');
 }
 
-export function truncateLine(line: string, maxChars = GREP_MAX_LINE_LENGTH): { text: string; wasTruncated: boolean } {
-  if (line.length <= maxChars) return { text: line, wasTruncated: false };
-  return { text: `${line.slice(0, maxChars)}... [truncated]`, wasTruncated: true };
-}
-
-/** 保留首尾各一半，中间替换成「…N chars truncated…」。 */
-export function truncateMiddle(
-  content: string,
-  maxBytes: number,
-): { content: string; truncated: boolean; removedChars: number; totalBytes: number; totalLines: number } {
-  const buf = Buffer.from(content, 'utf-8');
-  const totalLines = splitLinesForCounting(content).length;
-  if (buf.length <= maxBytes) {
-    return { content, truncated: false, removedChars: 0, totalBytes: buf.length, totalLines };
-  }
-  const isBoundary = (index: number): boolean => index >= buf.length || ((buf[index] ?? 0) & 0xc0) !== 0x80;
-  let headEnd = Math.floor(maxBytes / 2);
-  while (headEnd > 0 && !isBoundary(headEnd)) headEnd -= 1;
-  let tailStart = buf.length - (maxBytes - Math.floor(maxBytes / 2));
-  while (tailStart < buf.length && !isBoundary(tailStart)) tailStart += 1;
-
-  const head = buf.subarray(0, headEnd).toString('utf-8');
-  const tail = buf.subarray(tailStart).toString('utf-8');
-  const removedChars = Array.from(buf.subarray(headEnd, tailStart).toString('utf-8')).length;
-  return {
-    content: `${head}…${removedChars} chars truncated…${tail}`,
-    truncated: true,
-    removedChars,
-    totalBytes: buf.length,
-    totalLines,
-  };
-}

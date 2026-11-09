@@ -113,10 +113,6 @@ export interface CustomMessage {
 
 export type AgentMessage = Message | CustomMessage;
 
-export interface TranscriptContext {
-  messages: Message[];
-}
-
 export interface Context {
   systemPrompt?: string;
   tools?: ToolDeclaration[];

@@ -6,24 +6,6 @@
  */
 import type { AgentMessage, Message, SystemMessage, ToolDeclaration } from './types.ts';
 
-/** 把文本内容块拼成字符串。 */
-export function contentText(content: string | { type: string; text?: string }[], separator = '\n'): string {
-  if (typeof content === 'string') return content;
-  return content
-    .filter((block) => block.type === 'text')
-    .map((block) => block.text ?? '')
-    .join(separator);
-}
-
-/** 系统消息渲染成完整提示：正文 + 命名段落。 */
-export function getSystemMessageText(message: SystemMessage): string {
-  const parts: string[] = [contentText(message.content)];
-  for (const text of Object.values(message.sections ?? {})) {
-    if (text !== null) parts.push(text);
-  }
-  return parts.filter((part) => part.length > 0).join('\n\n');
-}
-
 function isSystemMessage(message: AgentMessage): message is SystemMessage {
   return message.role === 'system';
 }

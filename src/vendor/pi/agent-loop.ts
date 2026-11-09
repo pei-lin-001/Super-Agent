@@ -2,11 +2,16 @@
  * 移植自 pi @earendil-works/pi-coding-agent@1.5.0
  * 原文件：packages/agent-core/dist/agent-loop.js
  *
- * 与上游的差异（都是删减，没有改变控制流）：
+ * 与上游的差异：
  * - 去掉 pi-ai 的身份/归因字段（mergeClientIdentity、PI_ATTRIBUTION），宿主不需要
- * - 去掉并行工具执行与 beforeToolCall/afterToolCall 钩子，工具执行交给宿主
- *   `config.executeToolCall`，我们按顺序跑
- * - 去掉参数 schema 校验（工具层自己解析 JSON 并给出可读错误）
+ * - 去掉 beforeToolCall/afterToolCall 钩子与参数 schema 校验（工具层自己解析 JSON 并给出可读错误）
+ * - `executeToolCalls` 是改写而非删减：上游拆成 sequential/parallel 两个版本 + 独立的
+ *   `prepareToolCall` / `executePreparedToolCall` / `finalizeExecutedToolCall` / `shouldTerminateToolBatch`
+ *   一整组函数，这里内联成「一个 for 循环按顺序跑」，因此没有并行分支。
+ *
+ * 控制流骨架与上游逐函数比对（11 个同名函数）：其余 8 个完全一致，仅
+ * `runLoop`（while→for）与 `streamAssistantResponse`（一处 await 提前到 result 分支）有形态差异，
+ * 语义未变。比对脚本与本轮核对结论见 work/task_7c3fac59/。
  *
  * 保留：内外双层循环、steering/follow-up 队列、prepareNextTurn（compaction 挂载点）、
  * finishTurn 决策、事件流、输出被 token 上限截断时整批工具调用失败。
@@ -25,9 +30,6 @@ import type {
   AssistantMessage,
   AssistantMessageEvent,
   Context,
-  StopReason,
-  TextContent,
-  ThinkingContent,
   ToolCall,
   ToolDeclaration,
   ToolResultMessage,
@@ -493,21 +495,3 @@ async function executeToolCalls(
   return { messages };
 }
 
-// ---- 供适配层使用的小工具 ----
-
-export function textBlock(text: string): TextContent {
-  return { type: 'text', text };
-}
-
-export function thinkingBlock(thinking: string): ThinkingContent {
-  return { type: 'thinking', thinking };
-}
-
-export function emptyUsage(): { input: number; output: number; cacheRead: number; cacheWrite: number } {
-  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-}
-
-/** 把 stopReason 映射成我们模型层的 finishReason 文本，只用于日志与记录。 */
-export function stopReasonLabel(reason: StopReason): string {
-  return reason;
-}

@@ -174,7 +174,8 @@ test('pi loop：工具失败标记进 pi 消息，也进模型可见文本', asy
     return mockReply({ text: '读不到' });
   });
 
-  await runWorkerTurn({
+  const ran: string[] = [];
+  const result = await runWorkerTurn({
     model: 'mock',
     modelClient: model,
     systemPrompt: 'x',
@@ -185,14 +186,29 @@ test('pi loop：工具失败标记进 pi 消息，也进模型可见文本', asy
       { role: 'tool', content: '打开失败：文件不存在', toolCallId: 'call_old', isError: true },
     ],
     prompts: [],
-    executeToolCall: async () => ({
-      outcome: { type: 'failed', content: '打开失败：文件不存在' },
-      terminate: false,
-    }),
+    // 字段名必须是 runTool。写成别的名字时 input.runTool 为 undefined，
+    // runWorkerTurn 会把 TypeError 吞成 stop='error' 后静默返回——下面的断言专拦这种情况。
+    runTool: async (call) => {
+      ran.push(`${call.name}:${call.arguments}`);
+      return { outcome: { type: 'failed', content: '打开失败：文件不存在' }, terminate: false };
+    },
+    signal: null,
     maxSteps: 4,
   });
 
-  // 1) 历史里的失败状态不会被抹平
+  // 0) 这一轮必须真的跑起来，且工具失败之后把结果回灌给模型继续下一步。
+  assert.notEqual(result.stop, 'error', `本轮不应因内部错误中止：${result.reason ?? ''}`);
+  assert.equal(result.stop, 'steps');
+  assert.equal(result.steps, 2, '失败的工具结果也要回灌：第二次模型调用 = 第二步');
+  assert.deepEqual(ran, ['read_file:{"path":"nope.md"}'], '失败的工具确实被执行过一次');
+
+  // 1) 失败结果必须回流到模型：第二次请求带着它，且 isError 不能丢。
+  const echoed = seen[1]!.messages.filter((message) => message.role === 'tool').at(-1);
+  assert.ok(echoed, `第二次请求缺少工具结果：${JSON.stringify(seen[1]!.messages)}`);
+  assert.match(echoed.content ?? '', /打开失败/);
+  assert.equal(echoed.isError, true, '模型可见的失败标记不能丢');
+
+  // 2) 历史里的失败状态不会被抹平
   const round = toAgentMessages([
     { role: 'tool', content: '打开失败：文件不存在', toolCallId: 'call_old', isError: true },
   ]);
