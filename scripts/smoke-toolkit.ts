@@ -4,6 +4,7 @@
  * 拉协作者核对 → 登记真实文件产物 → 对具体版本取得 approved → 提交。
  * 使用独立数据库与工作目录，退出码 0 表示验收脚本自身通过。
  */
+import { spawnSync } from 'node:child_process';
 import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -44,7 +45,8 @@ const { task, owner } = runtime.createTask({
     '任务目录里有 calc.py 与 test_calc.py。先运行测试看失败信息，定位原因，做最小必要修改，再运行测试确认。' +
     '修复后把 calc.py 与一份说明文件登记为正式产物，请同组协作者检查后交付。',
   doneCriteria:
-    'test_calc.py 全部通过；交付的 calc.py 与说明文件是对应版本的正式产物；每份交付产物都有当前要求下的 approved 检查记录。',
+    'test_calc.py 全部通过（含取整约定与价格校验两组用例）；交付的 calc.py 与说明文件是对应版本的正式产物；' +
+    '每份交付产物都有当前要求下的 approved 检查记录。',
   requireReview: true,
   ownerRole: '修复负责人',
   ownerBrief: '运行测试、定位并修复 calc.py、复跑测试、登记产物并交付',
@@ -56,7 +58,12 @@ await writeFile(
   join(taskDir, 'calc.py'),
   [
     'def apply_discount(price, percent):',
-    '    """按百分比折扣计算最终价格。"""',
+    '    """按百分比折扣计算最终价格。',
+    '',
+    '    约定：',
+    '    - price 必须是正数，否则抛 ValueError；',
+    '    - 返回值保留两位小数。',
+    '    """',
     '    if percent < 0 or percent > 100:',
     '        raise ValueError("percent out of range")',
     '    return price - price * percent / 100',
@@ -74,6 +81,8 @@ await writeFile(
 await writeFile(
   join(taskDir, 'test_calc.py'),
   [
+    'import pytest',
+    '',
     'from calc import apply_discount, total',
     '',
     'def test_discount():',
@@ -83,9 +92,33 @@ await writeFile(
     '    # 两件各 100 元、整体 10% 折扣应得 180',
     '    assert total([100, 100], 10) == 180, total([100, 100], 10)',
     '',
+    'def test_discount_rounding():',
+    '    # 199.99 打 85 折，按约定保留两位小数',
+    '    assert apply_discount(199.99, 15) == 169.99, apply_discount(199.99, 15)',
+    '',
+    'def test_negative_price_rejected():',
+    '    # 约定：价格必须为正数',
+    '    with pytest.raises(ValueError):',
+    '        apply_discount(-10, 10)',
+    '',
   ].join('\n'),
   'utf8',
 );
+
+// 交给模型之前，先证明初始实现确实不通过：否则"修 bug"只是走过场。
+const baseline = spawnSync('python3', ['-m', 'pytest', '-q'], { cwd: taskDir, encoding: 'utf8' });
+const baselineOut = `${baseline.stdout ?? ''}${baseline.stderr ?? ''}`;
+log(`初始测试退出码：${baseline.status}`);
+if (baseline.status === 0) {
+  console.error('初始实现已经通过测试，这个验收场景无法复现缺陷，直接判定失败。');
+  console.error(baselineOut.slice(-800));
+  await runtime.stop();
+  store.close();
+  process.exit(1);
+}
+const failedNames = [...baselineOut.matchAll(/FAILED (\S+)/g)].map((match) => match[1]);
+log(`初始失败用例：${failedNames.join('、') || '（未解析到用例名）'}`);
+log(`初始失败摘要：${(baselineOut.match(/\d+ failed[^\n]*/) ?? ['（无）'])[0]}`);
 
 log(`任务 ${task.id}｜负责人 ${owner.id}`);
 runtime.enqueue(owner.id);
