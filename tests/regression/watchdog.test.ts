@@ -230,7 +230,10 @@ test('独立进程：Watchdog 作为分离进程启动，主系统不在也能�
     const pidInfo = JSON.parse(readFileSync(join(workDir, '.runtime', 'watchdog.json'), 'utf8')) as { pid: number };
     assert.equal(pidInfo.pid, child.pid);
     assert.notEqual(child.exitCode, 0, 'Watchdog 应该是活着的独立进程');
-    assert.match(output, /Watchdog 启动/);
+    // 启动横幅和子进程 stdout 的到达是两件事：pid 文件先落，数据块可能还在管道里。
+    // waitFor 只等条件、不返回布尔值，所以超时后单独断言，好让失败信息带上实际输出。
+    await waitFor(() => output.includes('Watchdog 启动'), 10_000).catch(() => undefined);
+    assert.match(output, /Watchdog 启动/, `实际输出：${JSON.stringify(output.slice(0, 200))}`);
     // 它建好了自己的表，但没有碰主系统的作业
     const { DatabaseSync } = await import('node:sqlite');
     const db = new DatabaseSync(dbPath, { readOnly: true });

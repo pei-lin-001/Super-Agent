@@ -110,3 +110,52 @@ test('Router 提示词：任务描述不能替用户重写要求', () => {
   assert.match(prompt, /必须做到/);
   assert.match(prompt, /明确不做/);
 });
+
+test('提示词与最新能力对齐：申请重启、不读凭据、指派模型', () => {
+  const system = workerSystemPrompt({
+    task: {
+      id: 't', groupId: 'g', title: 't', goal: 'g', brief: '', doneCriteria: '',
+      requireReview: false, reviewEpoch: 0, ownerWorkerId: 'w', status: 'active',
+      closeReason: null, createdAt: '', updatedAt: '', sourceChannel: null,
+      sourceAccountId: null, sourcePeerId: null, sourceSessionKey: null,
+      sourceConversationId: null, maintenance: 0,
+    },
+    worker: {
+      id: 'w', groupId: 'g', role: '负责人', brief: 'b', status: 'running',
+      model: null, parentId: null, stepCount: 0, createdAt: '', updatedAt: '',
+    },
+    isOwner: true,
+    collaborators: [],
+    taskFacts: '',
+    artifactTable: '',
+    noteText: null,
+    noteStaleEpoch: null,
+    noteCoveredSeq: 0,
+    windowSummary: '',
+    modelCatalog: {
+      models: [
+        { alias: 'default', model: 'flash', note: '执行', costHint: null },
+        { alias: 'pro', model: 'gpt-6.1-sol', note: '规划', costHint: '较高' },
+      ],
+      currentAlias: 'default',
+    },
+    override: null,
+  });
+  // 新能力必须出现在提示词里，否则 Worker 不知道自己能申请重启
+  assert.match(system, /request_maintenance/);
+  assert.match(system, /调用前先 artifact_save/, '重启会中断执行，必须要求先落盘');
+  assert.match(system, /不要自己去 kill 进程/, '杀进程是维护者的活');
+  assert.match(system, /共享仓库/, '切分支会影响别人，这条踩过');
+  // 读文件的教训
+  assert.match(system, /之后每一轮都重发一次/, '要说清 shell 读文件为什么更贵');
+  assert.match(system, /247 次/, '用真实事故做警示比抽象告诫有效');
+  assert.match(system, /\.env/, '凭据读不到要有解释，否则它会以为是工具坏了');
+});
+
+test('Router 提示词：知道 model 参数，且默认不填', () => {
+  const prompt = routerSystemPrompt({ taskCards: '（无）', pendingMessages: '（无）' });
+  assert.match(prompt, /create_task 的 model 参数/);
+  assert.match(prompt, /默认不要填/, '不能让 Router 见任务就派强模型');
+  assert.match(prompt, /用强模型做这件事/, '用户明确要求时才填');
+  assert.match(prompt, /模型配置而不是角色/);
+});
