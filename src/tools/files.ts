@@ -32,20 +32,38 @@ export function taskDir(context: ToolContext): string {
  * 相对路径先看任务目录，没有就按仓库根解释——这样 Worker 像用 pi 一样
  * 直接读代码库，而不是被迫走 shell（shell 输出无界，会撑爆上下文窗口）。
  */
+/**
+ * 凭据文件一律不读。
+ *
+ * 读文件工具能到仓库根，`.env.local` 就在根目录——一条 `fs_read(".env.local")`
+ * 就能把全部密钥送进模型上下文，而且之后每一轮都会重发。实测发生过：
+ * 2026-11-10 的 task_cae7d504 里 Worker 用 shell 读出了整个 .env.local。
+ * shell 那条拦不住（proc_run 本来就没沙箱），这里至少堵住 fs_* 这一路。
+ */
+function assertNotSecret(absolute: string): string {
+  const name = basename(absolute);
+  if (name === '.env' || name.startsWith('.env.')) {
+    throw new Error(
+      `拒绝读取 ${name}：凭据文件不进入模型上下文。需要某个配置项时，请让程序读出非敏感字段，或由维护者说明取值。`,
+    );
+  }
+  return absolute;
+}
+
 export function resolveReadPath(context: ToolContext, logicalPath: string): string {
   if (logicalPath === 'materials' || logicalPath.startsWith('materials/')) {
     const rest = logicalPath.slice('materials'.length).replace(/^\/+/, '');
-    return resolveInside(context.materialsDir, rest);
+    return assertNotSecret(resolveInside(context.materialsDir, rest));
   }
   const trimmed = logicalPath.trim();
   if (isAbsolute(trimmed)) {
-    const absolute = resolve(trimmed);
+    const absolute = assertNotSecret(resolve(trimmed));
     assertInsideRoot(context.readRoot, absolute);
     return absolute;
   }
-  const inTask = resolveInside(taskDir(context), trimmed);
+  const inTask = assertNotSecret(resolveInside(taskDir(context), trimmed));
   if (existsSync(inTask)) return inTask;
-  return resolveInside(context.readRoot, trimmed);
+  return assertNotSecret(resolveInside(context.readRoot, trimmed));
 }
 
 async function readTextFile(absolute: string): Promise<string> {

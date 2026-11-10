@@ -9,6 +9,7 @@ import { createHarness } from '../helpers.ts';
 import { FakeAdapter, eventOf, serviceOf } from '../channel-helpers.ts';
 import { mockReply } from '../../src/model/mock.ts';
 import { sessionKeyOf, type OutboundSegment } from '../../src/channels/types.ts';
+import { fileTools } from '../../src/tools/files.ts';
 import { safeFileName, sha256Of, writeInboundAttachment, resolveArtifactPath } from '../../src/channels/storage.ts';
 import { composeInboundText } from '../../src/channels/service.ts';
 import { ConversationService } from '../../src/channels/conversations.ts';
@@ -766,6 +767,40 @@ test('补材料：负责人被通知、要求版本推进；终态任务拒绝�
     const rejected = harness.runtime.attachSessionMaterials(task.id, TG_KEY);
     assert.equal(rejected.ok, false);
     assert.match(rejected.ok ? '' : rejected.message, /不能再补材料/);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('凭据文件：fs_* 一律拒绝读取 .env*', async () => {
+  const harness = await createHarness({});
+  try {
+    const { owner } = harness.runtime.createTask({ title: 't', goal: 'g', ownerRole: 'r', ownerBrief: 'b' });
+    const context = {
+      host: harness.runtime as never,
+      worker: owner,
+      task: harness.runtime.store.getTaskByGroup(owner.groupId)!,
+      workDir: harness.config.workDir,
+      materialsDir: harness.config.materialsDir,
+      readRoot: harness.config.readRoot,
+      signal: null,
+    };
+    const run = async (path: string): Promise<string> => {
+      try {
+        const tool = fileTools.find((item) => item.name === 'fs_read')!;
+        const outcome = await tool.run({ path }, context);
+        return outcome.type === 'ok' ? outcome.content : String((outcome as { content?: string }).content ?? '');
+      } catch (error) {
+        return `THROW: ${(error as Error).message}`;
+      }
+    };
+    for (const path of ['.env.local', '.env', '.env.production']) {
+      const text = await run(path);
+      assert.match(text, /拒绝读取|凭据文件/, `${path} 必须被拒绝，实际：${text.slice(0, 60)}`);
+    }
+    // 普通文件不受影响
+    const normal = await run('README.md');
+    assert.doesNotMatch(normal, /拒绝读取/, '正常文件不能被误伤');
   } finally {
     await harness.cleanup();
   }
