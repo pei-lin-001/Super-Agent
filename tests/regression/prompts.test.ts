@@ -3,7 +3,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { workerSystemPrompt } from '../../src/runtime/prompts.ts';
+import { renderModelCatalog, routerSystemPrompt, workerSystemPrompt } from '../../src/runtime/prompts.ts';
 
 function prompt(overrides: Partial<Parameters<typeof workerSystemPrompt>[0]> = {}): string {
   return workerSystemPrompt({
@@ -84,4 +84,29 @@ test('角色边界：通用提示词不写具体用户画像', () => {
   assert.doesNotMatch(text, /用户(?:的)?(?:服务器|电脑|机器)是/, '不描述用户的运行环境');
   assert.doesNotMatch(text, /你服务的用户(?!在当前)/, '不预设服务对象的身份');
   assert.match(text, /不预设用户身份/, '应当明确说明不预设身份');
+});
+
+test('多模型提示词：只在真有多个别名时讲分工，并且讲清代价与材料要求', () => {
+  const models = [
+    { alias: 'default', model: 'flash', note: '日常执行', costHint: null },
+    { alias: 'pro', model: 'gpt-6.1-sol', note: '规划与检查', costHint: '较高' },
+  ];
+  const multi = renderModelCatalog(models, 'default');
+  assert.match(multi, /什么时候值得换用更强的模型/);
+  assert.match(multi, /花掉额外预算换一个判断/, '要说清这是花钱买判断，不是流程步骤');
+  assert.match(multi, /通常不值得/, '只写"什么时候用"会让它到处叫人');
+  assert.match(multi, /每改一个文件/, '必须点明最常见的浪费');
+  assert.match(multi, /要解决什么/, '材料六要素要有');
+  assert.match(multi, /不要把自己的结论写成事实/, '否则强模型只会确认，不会判断');
+
+  const single = renderModelCatalog([models[0]!], 'default');
+  assert.doesNotMatch(single, /什么时候值得换用更强的模型/, '单模型环境讲换模型是空话，白占窗口');
+});
+
+test('Router 提示词：任务描述不能替用户重写要求', () => {
+  const prompt = routerSystemPrompt({ taskCards: '（无）', pendingMessages: '（无）' });
+  assert.match(prompt, /不要替用户重写要求/);
+  assert.match(prompt, /照抄比概括安全/, '必须给出可操作的判据');
+  assert.match(prompt, /必须做到/);
+  assert.match(prompt, /明确不做/);
 });
