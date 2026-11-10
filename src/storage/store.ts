@@ -18,6 +18,7 @@ import type {
   Task,
   TaskStatus,
   WaitReason,
+  Workspace,
   WaitRecord,
   Worker,
   WorkerNote,
@@ -40,6 +41,20 @@ function num(value: unknown): number {
 }
 
 /** router_turn 行 → 结构体；只暴露给模型需要的字段。 */
+function toWorkspace(row: Row): Workspace {
+  return {
+    id: str(row['id']),
+    title: str(row['title']),
+    brief: str(row['brief']),
+    sessionKey: strOrNull(row['session_key']),
+    conversationId: strOrNull(row['conversation_id']),
+    status: str(row['status']) as Workspace['status'],
+    createdAt: str(row['created_at']),
+    updatedAt: str(row['updated_at']),
+    lastActiveAt: strOrNull(row['last_active_at']),
+  };
+}
+
 function toRouterTurn(row: Record<string, unknown>): RouterTurn {
   return {
     id: str(row['id']),
@@ -61,6 +76,7 @@ function mapTask(row: Row): Task {
   return {
     id: str(row['id']),
     groupId: str(row['group_id']),
+    workspaceId: strOrNull(row['workspace_id']) ?? str(row['group_id']),
     title: str(row['title']),
     goal: str(row['goal']),
     brief: str(row['brief']),
@@ -86,6 +102,8 @@ function mapWorker(row: Row): Worker {
   return {
     id: str(row['id']),
     groupId: str(row['group_id']),
+    workspaceId: strOrNull(row['workspace_id']) ?? str(row['group_id']),
+    currentTaskId: strOrNull(row['current_task_id']),
     parentId: strOrNull(row['parent_id']),
     role: str(row['role']),
     brief: str(row['brief']),
@@ -287,6 +305,33 @@ export class Store {
     `);
     ensureColumn('router_session', 'conversation_id', 'conversation_id TEXT');
     ensureColumn('task', 'source_conversation_id', 'source_conversation_id TEXT');
+    // 任务与成员都挂到 workspace 上。迁移期沿用 group_id 作为 workspace id，
+    // 所以这里不再加新列：语义变了，值不变。
+    ensureColumn('worker', 'current_task_id', 'current_task_id TEXT');
+    ensureColumn('worker', 'workspace_id', 'workspace_id TEXT');
+    ensureColumn('task', 'workspace_id', 'workspace_id TEXT');
+    // 回填：老任务的 group_id 就是它当初的 workspace id，一对一，直接抄。
+    this.db.exec("UPDATE task SET workspace_id = group_id WHERE workspace_id IS NULL");
+    this.db.exec("UPDATE worker SET workspace_id = group_id WHERE workspace_id IS NULL");
+    this.db.exec(`
+      INSERT INTO workspace (id, title, brief, session_key, conversation_id, status, created_at, updated_at, last_active_at)
+      SELECT t.group_id, t.title, t.brief, t.source_session_key, t.source_conversation_id,
+             CASE WHEN t.status IN ('completed','cancelled','failed') THEN 'active' ELSE 'active' END,
+             t.created_at, t.updated_at, t.updated_at
+        FROM task t
+       WHERE NOT EXISTS (SELECT 1 FROM workspace w WHERE w.id = t.group_id)
+    `);
+    // 成员的当前任务：取它所在组里最早的活跃任务，没有就为空（休眠）。
+    this.db.exec(`
+      UPDATE worker
+         SET current_task_id = (
+           SELECT t.id FROM task t
+            WHERE t.group_id = worker.group_id
+              AND t.status NOT IN ('completed','cancelled','failed')
+            ORDER BY t.created_at ASC LIMIT 1
+         )
+       WHERE current_task_id IS NULL
+    `);
     // 索引必须建在补列之后：老库里这两列还不存在，先建索引会直接报 no such column。
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_router_turn_session ON router_turn(session_key, created_at)');
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_router_session_key ON router_session(session_key, status)');
@@ -380,16 +425,83 @@ export class Store {
     this.db.prepare(sql).run(...(params.map(bind) as never[]));
   }
 
+  // ---------------- workspace ----------------
+
+  createWorkspace(input: {
+    id: string;
+    title: string;
+    brief?: string;
+    sessionKey?: string | null;
+    conversationId?: string | null;
+  }): void {
+    const now = nowIso();
+    this.run(
+      `INSERT INTO workspace (id, title, brief, session_key, conversation_id, status, created_at, updated_at, last_active_at)
+       VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
+      input.id, input.title, input.brief ?? '', input.sessionKey ?? null, input.conversationId ?? null,
+      now, now, now,
+    );
+  }
+
+  getWorkspace(id: string): Workspace | null {
+    const row = this.get('SELECT * FROM workspace WHERE id = ?', id);
+    return row ? toWorkspace(row) : null;
+  }
+
+  /** 列表默认只给活跃的：归档的不该占据 Router 的表单。 */
+  listWorkspaces(options: { status?: 'active' | 'archived'; limit?: number } = {}): Workspace[] {
+    const status = options.status ?? 'active';
+    return this.all(
+      'SELECT * FROM workspace WHERE status = ? ORDER BY COALESCE(last_active_at, updated_at) DESC LIMIT ?',
+      status, options.limit ?? 50,
+    ).map(toWorkspace);
+  }
+
+  /**
+   * 某个会话可见的工作空间。
+   *
+   * 三种情况分开写，因为 SQL 里 `= NULL` 永远不成立，混在一个条件里会漏。
+   * 归属在创建时固化：别的会话引用过的空间不会跑到这里来。
+   */
+  listWorkspacesForConversation(sessionKey: string | null, conversationId: string | null): Workspace[] {
+    const order = 'ORDER BY COALESCE(last_active_at, updated_at) DESC LIMIT 50';
+    if (sessionKey === null) {
+      return this.all(
+        `SELECT * FROM workspace WHERE status = 'active' AND session_key IS NULL ${order}`,
+      ).map(toWorkspace);
+    }
+    const rows = conversationId === null
+      ? this.all(
+          `SELECT * FROM workspace WHERE status = 'active' AND session_key = ? AND conversation_id IS NULL ${order}`,
+          sessionKey,
+        )
+      : this.all(
+          `SELECT * FROM workspace WHERE status = 'active' AND session_key = ?
+             AND (conversation_id = ? OR conversation_id IS NULL) ${order}`,
+          sessionKey, conversationId,
+        );
+    return rows.map(toWorkspace);
+  }
+
+  touchWorkspace(id: string): void {
+    const now = nowIso();
+    this.run('UPDATE workspace SET last_active_at = ?, updated_at = ? WHERE id = ?', now, now, id);
+  }
+
+  setWorkspaceStatus(id: string, status: 'active' | 'archived'): void {
+    this.run('UPDATE workspace SET status = ?, updated_at = ? WHERE id = ?', status, nowIso(), id);
+  }
+
   // ---------------- task ----------------
 
   createTask(task: Task): Task {
     this.run(
-      `INSERT INTO task (id, group_id, title, goal, brief, done_criteria, require_review,
+      `INSERT INTO task (id, group_id, workspace_id, title, goal, brief, done_criteria, require_review,
                          owner_worker_id, source_channel, source_account_id, source_peer_id,
                          source_session_key, source_conversation_id, status, close_reason,
                          created_at, updated_at, closed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      task.id, task.groupId, task.title, task.goal, task.brief, task.doneCriteria,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      task.id, task.groupId, task.workspaceId ?? task.groupId, task.title, task.goal, task.brief, task.doneCriteria,
       task.requireReview ? 1 : 0,
       task.ownerWorkerId, task.sourceChannel ?? null, task.sourceAccountId ?? null,
       task.sourcePeerId ?? null, task.sourceSessionKey ?? null, task.sourceConversationId ?? null,
@@ -454,9 +566,10 @@ export class Store {
 
   createWorker(worker: Worker): Worker {
     this.run(
-      `INSERT INTO worker (id, group_id, parent_id, role, brief, status, model, step_count, created_at, updated_at, last_error)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      worker.id, worker.groupId, worker.parentId, worker.role, worker.brief, worker.status,
+      `INSERT INTO worker (id, group_id, workspace_id, current_task_id, parent_id, role, brief, status, model, step_count, created_at, updated_at, last_error)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      worker.id, worker.groupId, worker.workspaceId ?? worker.groupId, worker.currentTaskId ?? null,
+      worker.parentId, worker.role, worker.brief, worker.status,
       worker.model, worker.stepCount, worker.createdAt, worker.updatedAt, worker.lastError,
     );
     return worker;

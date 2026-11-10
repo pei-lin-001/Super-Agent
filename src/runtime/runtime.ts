@@ -90,6 +90,10 @@ export interface CreateTaskInput {
   ownerRole: string;
   ownerBrief: string;
   model?: string | null;
+  /** 复用已有的工作空间；不填则用这次任务的 groupId 新建一个。 */
+  workspaceId?: string | null;
+  /** 新建空间时的标题；不填用任务标题。 */
+  workspaceBrief?: string;
   /** 任务来源：由哪个聊天发起。后台结果按它送回原聊天。 */
   source?: {
     channel: string;
@@ -301,9 +305,13 @@ note: null,
     const taskId = newTaskId();
     const groupId = `grp_${taskId.slice(5)}`;
     const now = nowIso();
+    // 归属在创建时固化：一个空间可以被多个话题引用，但归属只属于建它的那个。
+    // 传了 workspaceId 就复用它，否则用这次任务的 groupId 新建一个——迁移期两者同值。
+    const workspaceId = input.workspaceId ?? groupId;
     const task: Task = {
       id: taskId,
       groupId,
+      workspaceId,
       title: input.title,
       goal: input.goal,
       brief: input.brief ?? '',
@@ -339,9 +347,21 @@ note: null,
     let owner!: Worker;
     try {
       this.store.tx(() => {
+        // 空间必须先存在：任务和成员都要挂上去，回填只在启动时做一次。
+        if (!this.store.getWorkspace(workspaceId)) {
+          this.store.createWorkspace({
+            id: workspaceId,
+            title: input.title,
+            brief: input.workspaceBrief ?? input.brief ?? '',
+            sessionKey: input.source?.sessionKey ?? null,
+            conversationId: input.source?.conversationId ?? null,
+          });
+        } else {
+          this.store.touchWorkspace(workspaceId);
+        }
         this.store.createTask(task);
         owner = this.createWorkerRecord({
-          groupId,
+          groupId: workspaceId,
           parentId: null,
           role: input.ownerRole,
           brief: input.ownerBrief,
@@ -535,9 +555,13 @@ note: null,
     }
     this.workerSequence = Math.max(this.workerSequence, createdInGroup) + 1;
     const now = nowIso();
+    const workspaceId = this.store.getWorkspace(input.groupId) ? input.groupId : null;
     const worker: Worker = {
       id: newWorkerId(this.workerSequence),
       groupId: input.groupId,
+      workspaceId: workspaceId ?? input.groupId,
+      // 负责人服务创建它的那个任务；协作者同样挂在当前活跃任务上。
+      currentTaskId: this.store.getTaskByGroup(input.groupId)?.id ?? null,
       parentId: input.parentId,
       role: input.role,
       brief: input.brief,

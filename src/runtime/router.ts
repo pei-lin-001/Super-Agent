@@ -9,7 +9,8 @@ import type { ChatMessage, ModelClient, ToolSchema } from '../model/types.ts';
 import type { Runtime } from './runtime.ts';
 import { Execution, ExecutionRevoked } from './execution.ts';
 
-import { routerSystemPrompt, taskCardLine } from './prompts.ts';
+import { renderWorkspaces, routerSystemPrompt } from './prompts.ts';
+import { isDormantWorker, isTerminalWorker } from '../domain/state.ts';
 import { boundRouterHistory, planRouterContext, runRouterNote } from './router-context.ts';
 
 const ROUTER_TOOLS: ToolSchema[] = [
@@ -417,7 +418,7 @@ export class Router {
       {
         role: 'system',
         content: routerSystemPrompt({
-          taskCards: this.renderTaskCards(sessionKey, conversationId),
+          taskCards: this.renderWorkspaces(sessionKey, conversationId),
           pendingMessages: pending,
           conversationNote: assembled?.note ?? null,
         }),
@@ -919,7 +920,7 @@ export class Router {
             .join('\n')}`;
         }
         case 'list_tasks':
-          return this.renderTaskCards(receipt?.sessionKey ?? null, receipt?.scope?.conversationId ?? null);
+          return this.renderWorkspaces(receipt?.sessionKey ?? null, receipt?.scope?.conversationId ?? null);
         case 'read_task': {
           const allowed = this.taskForAction(
               text(args['task_id'], 'task_id'),
@@ -1041,28 +1042,56 @@ export class Router {
     return this.runtime.models.list().map((item) => item.alias);
   }
 
-  private renderTaskCards(sessionKey: string | null = null, conversationId: string | null = null): string {
-    const tasks = this.runtime.store
-      .listTasks()
-      .filter((task) => this.visibleTo(task, sessionKey, conversationId));
-    if (tasks.length === 0) return '（暂无任务）';
-    return tasks
-      .map((task) => {
-        const workers = this.runtime.listGroupWorkers(task.groupId);
-        const owner = task.ownerWorkerId ? this.runtime.store.getWorker(task.ownerWorkerId) : null;
-        const latestResult = [...this.runtime.store.listGroupMessages(task.groupId, 200)]
+  /**
+   * 工作空间表单：Router 不用调工具就能回答「现在在干什么」。
+   *
+   * 数据全部现成：「在干什么」取该成员最后一条 assistant 文本，
+   * 「最近交付」取组里最后一条 result 消息，「待处理」数它收件箱里没消费的。
+   */
+  private renderWorkspaces(sessionKey: string | null = null, conversationId: string | null = null): string {
+    const spaces = this.runtime.store.listWorkspacesForConversation(sessionKey, conversationId);
+    if (spaces.length === 0) return '（暂无工作空间）';
+    return renderWorkspaces(
+      spaces.slice(0, 8).map((space) => {
+        const workers = this.runtime.store.listGroupWorkers(space.id);
+        const active = workers.filter((worker) => !isTerminalWorker(worker.status) && !isDormantWorker(worker.status));
+        const dormantCount = workers.filter((worker) => isDormantWorker(worker.status)).length;
+        const latestResult = [...this.runtime.store.listGroupMessages(space.id, 200)]
           .reverse()
           .find((message) => message.kind === 'result');
-        return taskCardLine({
-          id: task.id,
-          title: task.title,
-          status: task.status,
-          ownerId: task.ownerWorkerId,
-          ownerRole: owner?.role ?? null,
-          workerCount: workers.length,
+        return {
+          id: space.id,
+          title: space.title,
+          status: space.status,
+          currentTask: (() => {
+            const task = this.runtime.store.getTaskByGroup(space.id);
+            return task ? { id: task.id, title: task.title, status: task.status } : null;
+          })(),
+          active: active.slice(0, 6).map((worker) => ({
+            workerId: worker.id,
+            role: worker.role,
+            status: worker.status,
+            doing: this.lastAssistantText(worker.id),
+            steps: Number(worker.stepCount ?? 0),
+          })),
+          dormantCount,
+          lastActiveAt: space.lastActiveAt ? space.lastActiveAt.slice(11, 16) : null,
           latestResult: latestResult?.body ?? null,
-        });
-      })
-      .join('\n');
+          pending: active.reduce((sum, worker) => sum + this.runtime.store.listInbox(worker.id).length, 0),
+        };
+      }),
+    );
+  }
+
+  /** 成员此刻在做什么：最后一条 assistant 的自然语言，截短。 */
+  private lastAssistantText(workerId: string): string | null {
+    const turns = this.runtime.store.listWorkerTurns(workerId, 6);
+    for (let index = turns.length - 1; index >= 0; index -= 1) {
+      const turn = turns[index]!;
+      if (turn.role !== 'assistant') continue;
+      const text = (turn.content ?? '').replace(/\s+/g, ' ').trim();
+      if (text !== '') return text.length > 60 ? `${text.slice(0, 60)}…` : text;
+    }
+    return null;
   }
 }

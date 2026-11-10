@@ -14,7 +14,13 @@ export type TaskStatus = 'pending' | 'active' | 'waiting' | 'completed' | 'faile
  * 因此重启后可以直接从数据库重建调度，而不靠内存队列。
  * idle 仅用于兼容历史数据。
  */
-export type WorkerStatus = 'queued' | 'idle' | 'running' | 'waiting' | 'done' | 'failed' | 'cancelled';
+/**
+ * 成员状态。
+ *
+ * dormant 和 done 的区别：dormant 是"没活干，还能叫醒"，done 是"用完了，不再唤醒"。
+ * 任务结束只让成员休眠，不销毁——下次在同一个空间里遇到相似问题，它还记得上次。
+ */
+export type WorkerStatus = 'queued' | 'idle' | 'running' | 'waiting' | 'dormant' | 'done' | 'failed' | 'cancelled';
 
 export type MessageStatus = 'queued' | 'delivered' | 'consumed' | 'failed' | 'expired';
 
@@ -39,9 +45,29 @@ export type ReviewOutcome = 'pending' | 'approved' | 'changes_required' | 'incon
 /** 等待原因，决定恢复时如何处理。 */
 export type WaitReason = 'reply' | 'provider' | 'user' | 'job' | 'maintenance';
 
+/**
+ * 工作空间：相似任务长期共用的容器。
+ *
+ * 和任务的区别：任务有终态（不可逆），空间没有——它一直在，接不同的活。
+ */
+export interface Workspace {
+  id: string;
+  title: string;
+  brief: string;
+  sessionKey: string | null;
+  conversationId: string | null;
+  status: 'active' | 'archived';
+  createdAt: string;
+  updatedAt: string;
+  lastActiveAt: string | null;
+}
+
 export interface Task {
   id: string;
+  /** @deprecated 用 workspaceId。迁移期两者同值，下一版只保留后者。 */
   groupId: string;
+  /** 这个任务属于哪个工作空间。 */
+  workspaceId?: string | null;
   title: string;
   goal: string;
   brief: string;
@@ -73,7 +99,16 @@ export interface Task {
 
 export interface Worker {
   id: string;
+  /** @deprecated 用 workspaceId。 */
   groupId: string;
+  /** 成员属于哪个工作空间；跨任务不变。 */
+  workspaceId?: string | null;
+  /**
+   * 正在服务的任务。为 null 表示休眠：没活干，但没被销毁。
+   *
+   * 和 status 分开：status 说"能不能被调度"，currentTaskId 说"在为谁干"。
+   */
+  currentTaskId?: string | null;
   parentId: string | null;
   role: string;
   brief: string;

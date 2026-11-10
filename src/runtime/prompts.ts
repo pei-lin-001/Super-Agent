@@ -229,6 +229,49 @@ ${input.conversationNote ? `\n# 更早对话的累计记录\n（这段对话已�
 - 信息不足就明确说明不足；不编造执行、验证、产物内容，也不承诺当前系统没有的能力。`;
 }
 
+/**
+ * 工作空间卡片：Router 每轮都能看到「有哪些空间、各自在干什么」，
+ * 不必为了回答「现在怎么样」去调工具。
+ *
+ * 活跃成员展开、休眠成员折叠——休眠的可能有几十个，全展开会把表单撑爆。
+ */
+export function renderWorkspaces(items: {
+  id: string;
+  title: string;
+  status: 'active' | 'archived';
+  /** 这个空间里当前在干的那件活。空间是长期容器，任务才是「这次做什么」。 */
+  currentTask: { id: string; title: string; status: string } | null;
+  active: { workerId: string; role: string; status: string; doing: string | null; steps: number }[];
+  dormantCount: number;
+  lastActiveAt: string | null;
+  latestResult: string | null;
+  pending: number;
+}[]): string {
+  if (items.length === 0) return '（暂无工作空间）';
+  return items
+    .map((item) => {
+      const busy = item.active.some((member) => member.status === 'running');
+      const state = busy ? '进行中' : item.active.length > 0 ? '在等' : '空闲';
+      const head = `「${item.title}」（${item.id}）｜${state}｜${item.active.length} 名活跃成员${
+        item.dormantCount > 0 ? `（另有 ${item.dormantCount} 名休眠）` : ''
+      }`;
+      const lines = [head];
+      if (item.currentTask) {
+        lines.push(`  当前任务：${item.currentTask.title}（${item.currentTask.id}）${item.currentTask.status}`);
+      }
+      for (const member of item.active.slice(0, 4)) {
+        const doing = member.doing ? `：${member.doing}` : '';
+        lines.push(`  - ${member.workerId}（${member.role}）${member.status}｜第 ${member.steps} 步${doing}`);
+      }
+      if (item.active.length > 4) lines.push(`  - 还有 ${item.active.length - 4} 名活跃成员`);
+      if (item.lastActiveAt) lines.push(`  最近活动：${item.lastActiveAt}`);
+      if (item.latestResult) lines.push(`  最近交付：${item.latestResult.slice(0, 80)}`);
+      if (item.pending > 0) lines.push(`  待处理：${item.pending} 条未回的消息`);
+      return lines.join('\n');
+    })
+    .join('\n\n');
+}
+
 export function taskCardLine(input: {
   id: string;
   title: string;

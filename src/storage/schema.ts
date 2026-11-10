@@ -3,6 +3,26 @@ export const SCHEMA_SQL = `
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
+-- Workspace：相似任务的工作空间。
+--
+-- 之前 group 只是 task 的哈希后缀（grp_<taskId>），任务一结束整组就散了。
+-- 现在它是独立实体：有自己的名字、记忆、成员，任务只是它接的一次活。
+-- 沿用 group_id 作为 id（迁移期兼容），新代码一律叫 workspace_id。
+CREATE TABLE IF NOT EXISTS workspace (
+  id              TEXT PRIMARY KEY,
+  title           TEXT NOT NULL,
+  brief           TEXT NOT NULL DEFAULT '',
+  -- 归属在创建时固化：之后别的话题引用它也只是引用，不改归属。
+  session_key     TEXT,
+  conversation_id TEXT,
+  status          TEXT NOT NULL DEFAULT 'active',
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT NOT NULL,
+  last_active_at  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_workspace_conversation ON workspace(conversation_id, last_active_at);
+CREATE INDEX IF NOT EXISTS idx_workspace_status ON workspace(status, last_active_at);
+
 CREATE TABLE IF NOT EXISTS task (
   id               TEXT PRIMARY KEY,
   group_id         TEXT NOT NULL UNIQUE,

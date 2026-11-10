@@ -118,11 +118,11 @@ test('提示词与最新能力对齐：申请重启、不读凭据、指派模�
       requireReview: false, reviewEpoch: 0, ownerWorkerId: 'w', status: 'active',
       closeReason: null, createdAt: '', updatedAt: '', sourceChannel: null,
       sourceAccountId: null, sourcePeerId: null, sourceSessionKey: null,
-      sourceConversationId: null, maintenance: 0,
+      sourceConversationId: null, maintenance: 0, closedAt: null,
     },
     worker: {
       id: 'w', groupId: 'g', role: '负责人', brief: 'b', status: 'running',
-      model: null, parentId: null, stepCount: 0, createdAt: '', updatedAt: '',
+      model: null, parentId: null, stepCount: 0, createdAt: '', updatedAt: '', lastError: null,
     },
     isOwner: true,
     collaborators: [],

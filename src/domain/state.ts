@@ -16,10 +16,12 @@ const TASK_TRANSITIONS: Record<TaskStatus, readonly TaskStatus[]> = {
 
 const WORKER_TRANSITIONS: Record<WorkerStatus, readonly WorkerStatus[]> = {
   // done 表示工作完成，从任何非终态都可能直接到达（例如等待中由别人代提交）。
-  queued: ['running', 'waiting', 'done', 'cancelled', 'failed'],
-  idle: ['queued', 'running', 'done', 'cancelled', 'failed'],
-  running: ['queued', 'waiting', 'done', 'failed', 'cancelled'],
-  waiting: ['queued', 'running', 'done', 'cancelled', 'failed'],
+  queued: ['running', 'waiting', 'done', 'cancelled', 'failed', 'dormant'],
+  idle: ['queued', 'running', 'done', 'cancelled', 'failed', 'dormant'],
+  running: ['queued', 'waiting', 'done', 'failed', 'cancelled', 'dormant'],
+  waiting: ['queued', 'running', 'done', 'cancelled', 'failed', 'dormant'],
+  // 休眠可以唤醒：这是它和 done 的唯一区别。长期不用的休眠由归档流程转成 done。
+  dormant: ['queued', 'idle', 'done'],
   done: [],
   failed: [],
   cancelled: [],
@@ -70,4 +72,9 @@ export function isTerminalTask(status: TaskStatus): boolean {
 
 export function isTerminalWorker(status: WorkerStatus): boolean {
   return status === 'done' || status === 'failed' || status === 'cancelled';
+}
+
+/** 休眠不等于结束：还能被唤醒接到新任务上。调度层要把它和终态分开看。 */
+export function isDormantWorker(status: WorkerStatus): boolean {
+  return status === 'dormant';
 }
