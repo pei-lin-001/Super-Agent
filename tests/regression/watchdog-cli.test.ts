@@ -25,7 +25,7 @@ interface Env {
   close: () => Promise<void>;
 }
 
-async function makeEnv(): Promise<Env> {
+async function makeEnv(intervalMs = 4000): Promise<Env> {
   const dir = mkdtempSync(join(tmpdir(), 'sa-wdcli-'));
   const workDir = join(dir, 'work');
   const dbPath = join(dir, 'db.sqlite');
@@ -64,7 +64,7 @@ async function makeEnv(): Promise<Env> {
     OLLAMA_API_KEY: 'test',
     MODEL_NAME: 'local',
     MODEL_RETRY: '1',
-    WATCHDOG_INTERVAL_MS: '4000',
+    WATCHDOG_INTERVAL_MS: String(intervalMs),
   };
   return {
     dir,
@@ -285,7 +285,10 @@ test('巡检进行中同时提交两个问题：并发始终为 1，两个问题
 });
 
 test('--answer 纯查询：不恢复作业、不启动模型、不新增维护动作', async () => {
-  const ctx = await makeEnv();
+  // 这条断言数的是 model_call 行数。常驻维护者每 4 秒自己会巡检一次，
+  // 全量并行跑时 CLI 一旦跨过 4 秒边界就把计数顶上去——不是查询触发的。
+  // 所以这里把间隔拉长到测试窗口之外，测的才是"查询本身没调用模型"。
+  const ctx = await makeEnv(600_000);
   let resident: ChildProcess | null = null;
   try {
     resident = spawn(process.execPath, ['src/watchdog/main.ts'], { cwd: root, env: ctx.env, stdio: ['ignore', 'pipe', 'pipe'] });

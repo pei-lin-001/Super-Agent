@@ -475,3 +475,40 @@ test('记账层：退避中取消后不再继续重试', async () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('图片：走多模态数组发出，纯文本仍发字符串', async () => {
+  const seen: unknown[] = [];
+  const srv = createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      seen.push(JSON.parse(body));
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 1, completion_tokens: 1 },
+      }));
+    });
+  });
+  await new Promise<void>((resolve) => srv.listen(0, '127.0.0.1', resolve));
+  const port = (srv.address() as { port: number }).port;
+  try {
+    const client = new OpenAICompatibleModel({ baseUrl: `http://127.0.0.1:${port}`, apiKey: 'x', timeoutMs: 5000, retry: 0 });
+    await client.chat({
+      model: 'm',
+      messages: [{ role: 'user', content: '这是什么', images: [{ mimeType: 'image/png', data: 'AAA' }] }],
+      tools: [],
+    });
+    await client.chat({ model: 'm', messages: [{ role: 'user', content: '纯文字' }], tools: [] });
+
+    const withImage = (seen[0] as { messages: { content: unknown }[] }).messages[0]!.content as unknown[];
+    assert.ok(Array.isArray(withImage), '带图要发数组');
+    assert.deepEqual(withImage[0], { type: 'text', text: '这是什么' });
+    assert.deepEqual(withImage[1], { type: 'image_url', image_url: { url: 'data:image/png;base64,AAA' } });
+
+    const plain = (seen[1] as { messages: { content: unknown }[] }).messages[0]!.content;
+    assert.equal(plain, '纯文字', '不带图仍然是字符串，有些兼容实现只认这种');
+  } finally {
+    await new Promise<void>((resolve) => srv.close(() => resolve()));
+  }
+});

@@ -78,6 +78,19 @@ function toWireMessage(message: ChatMessage): Record<string, unknown> {
   if (message.role === 'tool') {
     return { role: 'tool', tool_call_id: message.toolCallId, content: message.content ?? '' };
   }
+  // 带图的消息要发多模态数组，纯文本仍发字符串：有些兼容实现只认后者。
+  if (message.images && message.images.length > 0) {
+    return {
+      role: message.role,
+      content: [
+        ...(message.content ? [{ type: 'text', text: message.content }] : []),
+        ...message.images.map((image) => ({
+          type: 'image_url',
+          image_url: { url: `data:${image.mimeType};base64,${image.data}` },
+        })),
+      ],
+    };
+  }
   if (message.role === 'assistant') {
     const wire: Record<string, unknown> = { role: 'assistant', content: message.content ?? '' };
     if (message.toolCalls && message.toolCalls.length > 0) {

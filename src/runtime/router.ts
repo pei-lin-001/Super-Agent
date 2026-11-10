@@ -11,6 +11,7 @@ import { Execution, ExecutionRevoked } from './execution.ts';
 
 import { renderWorkspaces, routerSystemPrompt } from './prompts.ts';
 import type { DecisionClient } from '../model/decision.ts';
+import type { ImagePart } from '../model/types.ts';
 import { isDormantWorker, isTerminalWorker } from '../domain/state.ts';
 import { boundRouterHistory, planRouterContext, runRouterNote } from './router-context.ts';
 
@@ -240,6 +241,8 @@ export class Router {
       onAccepted?: () => void;
       /** 所在的串行链标识（= 会话键，CLI 为空串）。 */
       chainKey?: string;
+      /** 本条消息自带的图：只在这一次请求里出现，不进历史。 */
+      images?: ImagePart[];
     } = {},
   ): Promise<'done' | 'suspended' | 'failed'> {
     const key = context.sessionKey ?? '';
@@ -288,12 +291,19 @@ export class Router {
    */
   handleUserMessage(
     content: string,
-    options: { sessionKey?: string | null; conversationId?: string | null; onAccepted?: () => void } = {},
+    options: {
+      sessionKey?: string | null;
+      conversationId?: string | null;
+      onAccepted?: () => void;
+      /** 当轮要看的图。只在本轮有效，落历史时会被剥掉（见 planRouterContext）。 */
+      images?: ImagePart[];
+    } = {},
   ): Promise<void> {
     return this.enqueue(content, {
       sessionKey: options.sessionKey ?? null,
       conversationId: options.conversationId ?? null,
       onAccepted: options.onAccepted,
+      images: options.images,
     }).then(() => undefined);
   }
 
@@ -366,6 +376,7 @@ export class Router {
       conversationId?: string | null;
       onAccepted?: () => void;
       chainKey?: string;
+      images?: ImagePart[];
     } = {},
   ): Promise<'done' | 'suspended'> {
     const execution = new Execution('router');
@@ -392,6 +403,7 @@ export class Router {
       conversationId?: string | null;
       onAccepted?: () => void;
       chainKey?: string;
+      images?: ImagePart[];
     } = {},
   ): Promise<'done' | 'suspended'> {
     if (this.runtime.isStopped) return 'done';
@@ -455,7 +467,12 @@ export class Router {
     }
 
     if (userText !== null) {
-      messages.push({ role: 'user', content: userText });
+      // 图片只挂在这一次请求上；落库的历史只有文字，下一轮不会重发 base64。
+      messages.push({
+        role: 'user',
+        content: userText,
+        ...(context.images && context.images.length > 0 ? { images: context.images } : {}),
+      });
       this.runtime.store.appendRouterTurn({
         id: `rt_${randomBytes(4).toString('hex')}_u`,
         role: 'user',

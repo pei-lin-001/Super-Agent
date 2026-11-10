@@ -7,9 +7,22 @@ export interface ToolCall {
   arguments: string;
 }
 
+/** 随消息带的一小段图片。base64，不带 data: 前缀。 */
+export interface ImagePart {
+  mimeType: string;
+  data: string;
+}
+
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string | null;
+  /**
+   * 当轮要看的图。
+   *
+   * 和历史分开：图片进了历史就会每一轮重发一次，一张 50KB 的图 base64 后约 17k
+   * token。所以历史装配会把它剥掉，只留 content 里的一句占位。
+   */
+  images?: ImagePart[];
   toolCalls?: ToolCall[];
   toolCallId?: string;
   /**

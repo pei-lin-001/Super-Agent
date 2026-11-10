@@ -261,3 +261,23 @@ test('工作空间表单：休眠成员带 id，Router 才知道叫醒谁', asyn
     await harness.cleanup();
   }
 });
+
+test('图片：当轮进 Router 上下文，下一轮不重发 base64', async () => {
+  const harness = await createHarness({ worker: () => mockReply({ text: 'ok' }) });
+  try {
+    const png = { mimeType: 'image/png', data: 'QUJD' };
+    await harness.router.handleUserMessage('这张图是什么', { images: [png] });
+
+    const first = harness.routerModel.calls.at(-1)!;
+    const userTurn = first.messages.filter((m) => m.role === 'user').at(-1)!;
+    assert.deepEqual(userTurn.images, [png], '当轮要带上图');
+
+    // 再问一句（不带图）：历史里的那条不能再拖着 base64。
+    await harness.router.handleUserMessage('继续');
+    const second = harness.routerModel.calls.at(-1)!;
+    const leaked = second.messages.filter((m) => m.role === 'user' && m.images && m.images.length > 0);
+    assert.equal(leaked.length, 0, '图片不能留在历史里每轮重发');
+  } finally {
+    await harness.cleanup();
+  }
+});

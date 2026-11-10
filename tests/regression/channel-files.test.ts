@@ -300,13 +300,14 @@ test('入站文件 → 建任务：材料真的落进任务目录，且写进任
 });
 
 test('入站描述：附件只说明存在与大小，不编造内容', () => {
+  // 图片本身随请求走多模态，这里只留一句可回溯的事实。
   const text = composeInboundText('这是什么', [
     { kind: 'image', name: 'shot.png', mime: 'image/png', bytes: 2048, path: '.inbox/x', sha256: 'a' },
     { kind: 'file', name: 'data.csv', mime: 'text/csv', bytes: 4096, path: '.inbox/y', sha256: 'b' },
   ]);
   assert.match(text, /这是什么/);
   assert.match(text, /shot\.png/);
-  assert.match(text, /没有视觉输入/, '必须如实说明模型读不了图');
+  assert.match(text, /画面内容见随附图片/, '图跟着当轮请求一起发，说明要指向它');
   assert.match(text, /data\.csv/);
   assert.doesNotMatch(text, /内容是/, '不能编造文件内容');
 });

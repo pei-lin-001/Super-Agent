@@ -281,6 +281,30 @@ export class ChannelService {
     }
   }
 
+  /**
+   * 把入站图片读成当轮可用的 base64。
+   *
+   * 上限 4 张、单张 8MB：图片进了上下文就是每轮重发的量，多一张就贵一轮。
+   * 历史装配时会被剥掉，只留一句文字占位（见 router 的 planRouterContext）。
+   */
+  private async readInboundImages(attachments: InboundAttachment[]): Promise<{ mimeType: string; data: string }[]> {
+    const picked = attachments
+      .filter((item) => item.kind === 'image' && (item.mime ?? '').startsWith('image/') && item.bytes <= 8 * 1024 * 1024)
+      .slice(0, 4);
+    const out: { mimeType: string; data: string }[] = [];
+    for (const item of picked) {
+      try {
+        const { readFile } = await import('node:fs/promises');
+        const { resolve } = await import('node:path');
+        const bytes = await readFile(resolve(this.config.workDir, item.path));
+        out.push({ mimeType: item.mime ?? 'image/jpeg', data: bytes.toString('base64') });
+      } catch {
+        // 读不到就当作没有：文字里已经写了"已保存"，用户仍然知道有这个文件。
+      }
+    }
+    return out;
+  }
+
   private dbg(message: string): void {
     if (process.env['CH_DEBUG']) console.error(`[ch] ${message}`);
   }
@@ -397,12 +421,16 @@ export class ChannelService {
       const conversation = this.conversations.ensureCurrent(sessionKey, item.body);
       this.store.touchConversation(conversation.id);
       const text = composeInboundText(item.body, attachments);
-      this.dbg(`calling router for ${item.id}`);
+      // 图片要在当轮就进模型上下文：只存成文件的话，用户问"这是什么"时谁都答不上来。
+      // 读不出来（文件丢了、太大）就退回文字说明，不因为一张图挡住建任务。
+      const images = await this.readInboundImages(attachments);
+      this.dbg(`calling router for ${item.id}${images.length > 0 ? `（含 ${images.length} 张图）` : ''}`);
       let accepted = false;
       try {
         await router.handleUserMessage(text, {
           sessionKey,
           conversationId: conversation.id,
+          images,
           // 用户输入一旦持久化就标记已交接：之后崩溃走续接，不重复派工。
           onAccepted: () => {
             accepted = true;
@@ -988,7 +1016,9 @@ export function composeInboundText(body: string, attachments: InboundAttachment[
   for (const attachment of attachments) {
     const size = `${Math.max(1, Math.round(attachment.bytes / 1024))} KB`;
     if (attachment.kind === 'image') {
-      lines.push(`（用户发来一张图片：${attachment.name}，${size}，已保存；当前模型没有视觉输入，不能解读画面内容）`);
+      // 图片本身跟着这次请求一起发（多模态），这里只留一句可核对的事实，
+      // 供没有图片的历史轮次回溯。
+      lines.push(`（用户发来一张图片：${attachment.name}，${size}，已保存；画面内容见随附图片）`);
     } else if (attachment.kind === 'voice' || attachment.kind === 'video') {
       lines.push(`（用户发来一段${attachment.kind === 'voice' ? '语音' : '视频'}：${attachment.name}，${size}，已保存；本轮不处理这类内容）`);
     } else {

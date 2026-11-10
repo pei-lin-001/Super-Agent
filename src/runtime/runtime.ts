@@ -126,7 +126,12 @@ export interface RouterBridge {
   notify(): void;
   handleUserMessage(
     text: string,
-    options?: { sessionKey?: string | null; conversationId?: string | null; onAccepted?: () => void },
+    options?: {
+      sessionKey?: string | null;
+      conversationId?: string | null;
+      onAccepted?: () => void;
+      images?: { mimeType: string; data: string }[];
+    },
   ): Promise<void>;
   /** 有达到单轮额度后保存的协调进度。 */
   hasPendingSession?(): boolean;

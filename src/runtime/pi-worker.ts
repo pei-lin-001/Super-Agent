@@ -79,7 +79,22 @@ export function toAgentMessages(messages: ChatMessage[]): AgentMessage[] {
   for (const message of messages) {
     if (message.role === 'system') continue;
     if (message.role === 'user') {
-      out.push({ role: 'user', content: message.content ?? '', timestamp: Date.now() });
+      // 带图时按 pi 的多模态形状给：字符串 + 图片块分开，内核转 wire 时再合并。
+      out.push({
+        role: 'user',
+        content:
+          message.images && message.images.length > 0
+            ? [
+                ...(message.content ? [{ type: 'text' as const, text: message.content }] : []),
+                ...message.images.map((image) => ({
+                  type: 'image' as const,
+                  data: image.data,
+                  mimeType: image.mimeType,
+                })),
+              ]
+            : message.content ?? '',
+        timestamp: Date.now(),
+      });
       continue;
     }
     if (message.role === 'assistant') {
@@ -143,7 +158,13 @@ export function toLlmMessages(messages: AgentMessage[]): { system: string; chat:
       continue;
     }
     if (message.role === 'user') {
-      chat.push({ role: 'user', content: typeof message.content === 'string' ? message.content : textOf(message.content) });
+      const text = typeof message.content === 'string' ? message.content : textOf(message.content);
+      const images = typeof message.content === 'string'
+        ? []
+        : message.content
+            .filter((block): block is { type: 'image'; data: string; mimeType: string } => block.type === 'image')
+            .map((block) => ({ mimeType: block.mimeType, data: block.data }));
+      chat.push({ role: 'user', content: text, ...(images.length > 0 ? { images } : {}) });
       continue;
     }
     if (message.role === 'assistant') {
