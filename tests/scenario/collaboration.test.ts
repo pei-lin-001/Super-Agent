@@ -340,8 +340,10 @@ test('协作：自主创建协作者、直接沟通、检查引发修改、旧�
     assert.match(finalContent, /来源：materials\/a\.md/, '检查意见应引发实际修改');
 
     assert.equal(owner.status, 'done');
-    // 任务交付后群组关闭，协作者被系统收尾；这属于任务结束，不是创建者随意终止协作者。
-    assert.ok(others.every((worker) => worker.status === 'cancelled'));
+    // 任务交付后协作者被系统收尾——现在收成 dormant 而不是 cancelled：
+    // 它还记得这次协作的内容，下次在同一空间遇到相似问题不用从头再来。
+    // 真正的终止（用户取消、任务失败）仍然走 closeGroup，那条路是 cancelled。
+    assert.ok(others.every((worker) => worker.status === 'dormant' || worker.status === 'cancelled'));
   } finally {
     await harness.cleanup();
   }

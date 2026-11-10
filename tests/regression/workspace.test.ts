@@ -86,3 +86,44 @@ test('工作空间：下一个任务可以复用成员，不必重建', async ()
     await harness.cleanup();
   }
 });
+
+test('成员限制：任务完成后成员休眠，同职责不能重复创建', async () => {
+  const harness = await createHarness({ worker: () => mockReply({ text: 'ok' }) });
+  try {
+    const { task, owner } = harness.runtime.createTask({ ...brief, title: 't', goal: 'g' });
+    // 模拟任务完成后的收敛：成员进入休眠，空间还在
+    harness.store.setWorkerStatus(owner.id, 'dormant', '任务已完成');
+    harness.store.setWorkerCurrentTask(owner.id, null);
+
+    const dormant = harness.store.listDormantWorkers(task.groupId);
+    assert.equal(dormant.length, 1, '任务结束后成员应当休眠而不是消失');
+    assert.equal(dormant[0]!.currentTaskId, null, '休眠时不该还挂着任务');
+
+    // 同职责再建一个：应当被拒
+    const dup = harness.runtime.createCollaborator(owner, brief.ownerRole, '再做一遍');
+    assert.equal(dup.ok, false, '同职责不能重复创建');
+    assert.match(dup.reason ?? '', /职责相同/);
+
+    // 不同职责可以
+    const other = harness.runtime.createCollaborator(owner, '独立检查', '核对产物');
+    assert.equal(other.ok, true, `不同职责应当放行（${other.reason ?? ''}）`);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('成员限制：达到空间上限后拒绝创建，提示用现有成员', async () => {
+  const harness = await createHarness({ limits: { maxWorkersPerGroup: 2 }, worker: () => mockReply({ text: 'ok' }) });
+  try {
+    const { owner } = harness.runtime.createTask({ ...brief, title: 't', goal: 'g' });
+    // 负责人已经占一个名额，再加一个就到上限
+    const first = harness.runtime.createCollaborator(owner, '第一个', 'b');
+    assert.equal(first.ok, true, `负责人 + 1 应该还能进（${first.reason ?? ''}）`);
+    const second = harness.runtime.createCollaborator(owner, '第二个', 'b');
+    assert.equal(second.ok, false, '上限 2 时，再拉一个人就该被拦');
+    assert.match(second.reason ?? '', /达到上限/);
+    assert.match(second.reason ?? '', /归档|派给已有/, '要给出可执行的下一步');
+  } finally {
+    await harness.cleanup();
+  }
+});

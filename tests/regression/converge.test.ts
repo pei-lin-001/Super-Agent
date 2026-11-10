@@ -178,7 +178,9 @@ test('负责人完成、协作者仍在等待时：任务终结后协作者收�
     const workerAfter = h.store.getWorker(collaborator.id);
     assert.ok(workerAfter, '协作者必须仍然存在');
     assert.notEqual(workerAfter?.status, 'done', '没干完活的协作者不能被标成 done');
-    assert.equal(workerAfter?.status, 'cancelled', `协作者应收敛为 cancelled（实际 ${workerAfter?.status}）`);
+    // 任务完成 → 成员休眠，不是销毁：下次在同一个空间里遇到相似问题还能叫醒它。
+    // 取消/失败走的是 closeGroup，那条路仍然是 cancelled。
+    assert.equal(workerAfter?.status, 'dormant', `协作者应收敛为 dormant（实际 ${workerAfter?.status}）`);
     assert.match(workerAfter?.lastError ?? '', /任务已完成/, '必须写明终止原因');
 
     // 迟到响应不应产生业务副作用

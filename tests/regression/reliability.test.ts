@@ -528,7 +528,7 @@ test('配额：历史 Worker 不占活跃额度，组内累计创建仍有上限
     assert.equal(extra.ok, true, extra.reason);
     const tooMany = harness.runtime.createCollaborator(next.owner, '第三人', '协助');
     assert.equal(tooMany.ok, false);
-    assert.match(tooMany.reason ?? '', /累计创建/);
+    assert.match(tooMany.reason ?? '', /达到上限/);
   } finally {
     await harness.cleanup();
   }

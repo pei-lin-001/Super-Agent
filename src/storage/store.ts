@@ -617,6 +617,28 @@ export class Store {
     return { ...worker, status, updatedAt: nowIso(), lastError: error === undefined ? worker.lastError : error };
   }
 
+  /** 成员在为哪个任务干活；null 表示休眠。 */
+  setWorkerCurrentTask(id: string, taskId: string | null): void {
+    this.run('UPDATE worker SET current_task_id = ?, updated_at = ? WHERE id = ?', taskId, nowIso(), id);
+  }
+
+  /** 某个空间下可以叫醒的成员（休眠且没有在服务的任务）。 */
+  listDormantWorkers(workspaceId: string): Worker[] {
+    return this.all(
+      "SELECT * FROM worker WHERE group_id = ? AND status = 'dormant' ORDER BY updated_at DESC",
+      workspaceId,
+    ).map(mapWorker);
+  }
+
+  listAllDormantWorkers(): Worker[] {
+    return this.all("SELECT * FROM worker WHERE status = 'dormant'").map(mapWorker);
+  }
+
+  countDormantWorkers(): number {
+    const row = this.get("SELECT COUNT(*) AS n FROM worker WHERE status = 'dormant'");
+    return Number((row as { n?: unknown } | undefined)?.n ?? 0);
+  }
+
   bumpWorkerStep(id: string, delta = 1): void {
     this.run('UPDATE worker SET step_count = step_count + ?, updated_at = ? WHERE id = ?', delta, nowIso(), id);
   }

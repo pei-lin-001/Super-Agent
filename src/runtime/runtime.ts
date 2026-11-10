@@ -16,7 +16,7 @@ import {
   newWorkerId,
   nowIso,
 } from '../domain/ids.ts';
-import { isTerminalTask, isTerminalWorker } from '../domain/state.ts';
+import { isDormantWorker, isTerminalTask, isTerminalWorker } from '../domain/state.ts';
 import { Execution, ExecutionRevoked } from './execution.ts';
 import { runWorkerTurn, toStepResult } from './pi-worker.ts';
 import type { AssistantMessage } from '../vendor/pi/types.ts';
@@ -366,6 +366,7 @@ note: null,
           role: input.ownerRole,
           brief: input.ownerBrief,
           modelAlias: input.model ?? this.config.defaultModelAlias,
+          skipRoleDedup: true,
         });
         this.store.setTaskOwner(taskId, owner.id);
         // 认领和建任务同一个事务：任务回滚了，附件不能被一个不存在的任务占着，
@@ -537,6 +538,11 @@ note: null,
     /** 模型别名；必须是目录里已配置的别名。 */
     modelAlias: string;
     /**
+     * 创建任务负责人时跳过同职责去重：负责人是任务的必需品，
+     * 不是「为同一件事再造一个人」。去重只针对协作者。
+     */
+    skipRoleDedup?: boolean;
+    /**
      * 初始化状态。
      *
      * 协作者建出来时还没有任何消息，用 idle 表示"在等第一份活"；
@@ -544,16 +550,32 @@ note: null,
      */
     status?: 'queued' | 'idle';
   }): Worker {
-    // 组内按「累计创建」计预算，防止一个任务无限拉人；全局按「当前活跃」计资源。
-    const createdInGroup = this.store.countWorkersInGroup(input.groupId);
-    if (createdInGroup >= this.config.limits.maxWorkersPerGroup) {
-      throw new Error(`本任务已累计创建 ${createdInGroup} 个 Worker，达到上限 ${this.config.limits.maxWorkersPerGroup}`);
+    // 四条限制。休眠成员不占并发槽，但会占「谁能被派活」的注意力，
+    // 而且成员一多，Router 的表单就开始说不清谁在干什么。所以按空间人数卡。
+    const members = this.store.listGroupWorkers(input.groupId).filter(
+      (worker) => !isTerminalWorker(worker.status),
+    );
+    if (members.length >= this.config.limits.maxWorkersPerGroup) {
+      throw new Error(
+        `本工作空间已有 ${members.length} 名成员，达到上限 ${this.config.limits.maxWorkersPerGroup}；` +
+          '先归档不用的成员，或者派给已有成员',
+      );
+    }
+    // 休眠成员也算成员：同职责优先叫醒它，而不是再造一个。
+    const sameRole = input.skipRoleDedup
+      ? undefined
+      : members.find((worker) => worker.role.trim() === input.role.trim());
+    if (sameRole) {
+      throw new Error(
+        `本空间已有职责相同的成员 ${sameRole.id}（${sameRole.role}）；` +
+          '直接给它发消息，不要为同一件事再造一个人',
+      );
     }
     const active = this.store.countActiveWorkers();
     if (active >= this.config.limits.maxTotalWorkers) {
       throw new Error(`当前活跃 Worker 已达上限 ${this.config.limits.maxTotalWorkers}，请等待现有任务结束`);
     }
-    this.workerSequence = Math.max(this.workerSequence, createdInGroup) + 1;
+    this.workerSequence = Math.max(this.workerSequence, members.length) + 1;
     const now = nowIso();
     const workspaceId = this.store.getWorkspace(input.groupId) ? input.groupId : null;
     const worker: Worker = {
@@ -1441,13 +1463,41 @@ note: null,
    *
    * 这不改变任务本身的结果：任务状态在调用前就已经定了。
    */
-  private convergeGroup(groupId: string, reason: string): void {
-    for (const worker of this.store.listGroupWorkers(groupId)) {
+  /**
+   * 归档长期不用的休眠成员。
+   *
+   * dormant 是为了「下次遇到相似问题还记得上次」，但如果一直不叫醒，它就只是
+   * 占着成员名额。30 天是经验值：现有任务的生命周期从几小时到几天，留了 10 倍余量。
+   * 归档不是删除：记录、历史、产物都还在，只是不再出现在成员表里。
+   */
+  private archiveStaleDormant(days = 30): number {
+    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+    let archived = 0;
+    for (const worker of this.store.listAllDormantWorkers()) {
+      if (Date.parse(worker.updatedAt) > cutoff) continue;
+      this.store.setWorkerStatus(worker.id, 'done', `超过 ${days} 天未唤醒，归档`);
+      archived += 1;
+    }
+    return archived;
+  }
+
+  /**
+   * 任务收尾：成员转休眠，不销毁。
+   *
+   * 之前这里写的是 cancelled——任务一结束，整组人就没了。代价是下一次遇到同类
+   * 问题只能重建一遍，重新摸仓库结构、重新读约定、重新踩同一个坑。一个休眠成员
+   * 的常驻成本只有几行记录：它不占并发槽、不占内存、不发请求。
+   *
+   * 真正销毁交给归档流程（长期不用的 dormant 转 done），不在这里做。
+   */
+  private convergeGroup(workspaceId: string, reason: string): void {
+    for (const worker of this.store.listGroupWorkers(workspaceId)) {
       if (isTerminalWorker(worker.status)) continue;
       this.store.clearWaitsForWorker(worker.id);
       this.runs.get(worker.id)?.revoke('任务已结束');
-      this.store.setWorkerStatus(worker.id, 'cancelled', reason);
-      this.emit({ type: 'worker.status', workerId: worker.id, status: 'cancelled' });
+      this.store.setWorkerStatus(worker.id, 'dormant', reason);
+      this.store.setWorkerCurrentTask(worker.id, null);
+      this.emit({ type: 'worker.status', workerId: worker.id, status: 'dormant' });
     }
   }
 
@@ -2459,6 +2509,11 @@ note: null,
     let waiting = 0;
     // 调用记录先按实例归属收敛：崩溃实例留下的 running 不能永远挂着，
     // 但存活实例和归属未知的记录一律不动。
+    // 先归档长期休眠的成员，再恢复任务：不然它们会占着成员名额。
+    const archivedWorkers = this.archiveStaleDormant();
+    if (archivedWorkers > 0) {
+      this.store.appendEvent(null, null, 'worker.archived', `${archivedWorkers} 名成员超过 30 天未唤醒`);
+    }
     this.store.recoverModelCalls((instanceId) => this.isInstanceAlive(instanceId));
     // 上个进程留下的 running 协调会话收回成待续接：同一时刻只有本进程在跑，
     // running 一定属于已退出进程。不收回就永远接不上；收成 pending 后只续接一次。
