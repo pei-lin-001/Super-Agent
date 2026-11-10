@@ -295,7 +295,7 @@ Router：`create_task` `send_to_worker` `stop_task` `list_tasks` `read_task` `se
 | `fs_glob` | 按 `**/*.py` 这类模式找文件 | 任务目录内，跳过 node_modules/.git |
 | `fs_search` | 按内容搜索，带行号与上下文 | 任务目录内 |
 | `fs_read` | 分段读取，尾部给下一次 offset | 单次上限 2MB |
-| `fs_view_image` | 看图片：把图片本身交给模型，能读到画面内容 | png/jpeg/gif/webp，单张 8MB |
+| `fs_view_image` | 看图片：把图片本身交给模型，能读到画面内容 | png/jpeg/gif/webp，单张 4MB |
 | `fs_write` | 创建或整体覆盖 | 任务目录内 |
 | `fs_edit` | 按原文精确替换 | 见下 |
 
@@ -930,12 +930,16 @@ pnpm accept:channel         # 进程级验收：本地假平台，真实启动 d
 - Ollama Cloud 会返回 `finish_reason: "load"`，长任务明显变慢；程序会持久化等待并自动重试，但单次长任务仍可能耗时十分钟以上。
 - 没有长期记忆、权限系统、图形界面。
 - IM 渠道只覆盖单聊：群聊、频道、语音与视频识别不在本轮范围。
-- 图片能看：入站图片随当轮请求以多模态（`image_url`）发给 Router，最多 4 张、单张 8MB；
+- 图片能看：入站图片随当轮请求以多模态（`image_url`）发给 Router，最多 4 张、单张 4MB；
   模型必须支持视觉，否则该轮会返回"模型调用失败"。图片不进对话历史（只留一句文字占位），
   所以追问"刚才那张图"时 Router 需要重新引用附件路径。
-- Worker 有视觉：`fs_view_image` 把图片本身交给模型（png/jpeg/gif/webp，单张 8MB 上限），
+- Worker 有视觉：`fs_view_image` 把图片本身交给模型（png/jpeg/gif/webp，单张 4MB 上限），
   截图里的报错、图表里的数字、设计稿的布局都能读。图片随工具结果进入当轮上下文，
   落库的只有文字——重启后要重看得再调一次，不会每轮重发 base64。
+- 每次请求有图片预算（默认 8 张 / 16MB，`MODEL_MAX_IMAGES`、`MODEL_MAX_IMAGE_BYTES` 可调）。
+  超了从最老的开始丢，原位留一句「已省略以控制请求体积」。上游按固定档位压图
+  （实测 49KB→约 500 token，288KB 与 1MB 都是 1056 token），所以撑爆的不是 token
+  而是上传体积。
 - 微信 `context_token` 是回复上下文而非长期推送凭据，缺它时不保证主动推送能送达。
 
 ## 14. 恢复范围（明确边界）

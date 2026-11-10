@@ -191,11 +191,61 @@ export function fromPiMessage(message: AssistantMessage): StepResult {
   };
 }
 
+/**
+ * 一次请求的图片预算。
+ *
+ * 上游对单次请求的体积是有限的，而我们这边的图片会沿对话累积：Router 一轮带几张、
+ * Worker 连看几张，都会原样进同一个请求。光靠提示词说"不要反复看"没用——
+ * 模型忘性大，而且它看不见字节数。
+ *
+ * 实测 ollama cloud：一张 49KB 的截图算约 500 token，288KB 与 1MB 的都是 1056 token
+ * （它把图压到固定档位）。所以真正会撑爆的不是 token，而是上传体积：
+ * 十几张未压缩的手机截图就能让请求体到几十 MB。
+ *
+ * 超预算时从最老的开始丢，并在原位留一句占位——不能让模型以为那里本来什么都没有。
+ */
+const MAX_IMAGES_PER_REQUEST = Number(process.env['MODEL_MAX_IMAGES'] ?? 8) || 8;
+const MAX_IMAGE_BYTES_PER_REQUEST = Number(process.env['MODEL_MAX_IMAGE_BYTES'] ?? 16 * 1024 * 1024) || 16 * 1024 * 1024;
+
+function budgetImages(messages: ChatMessage[]): { messages: ChatMessage[]; dropped: number } {
+  // 先按从新到旧的顺序数出哪些留得下。
+  const keep = new Set<number>();
+  let count = 0;
+  let bytes = 0;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const images = messages[index]!.images;
+    if (!images || images.length === 0) continue;
+    const size = images.reduce((sum, image) => sum + image.data.length, 0);
+    if (count + images.length > MAX_IMAGES_PER_REQUEST) continue;
+    if (bytes + size > MAX_IMAGE_BYTES_PER_REQUEST) continue;
+    keep.add(index);
+    count += images.length;
+    bytes += size;
+  }
+  if (keep.size === messages.filter((message) => message.images && message.images.length > 0).length) {
+    return { messages, dropped: 0 };
+  }
+  let dropped = 0;
+  const out = messages.map((message, index) => {
+    if (!message.images || message.images.length === 0 || keep.has(index)) return message;
+    dropped += message.images.length;
+    return {
+      ...message,
+      images: undefined,
+      // 原位留一句，别让模型以为这里从来没有图。
+      content: `${message.content ?? ''}\n（此处的 ${message.images.length} 张图片已省略以控制请求体积；需要再看请重新调用看图工具）`.trim(),
+    };
+  });
+  return { messages: out, dropped };
+}
+
 export class PiModel implements ModelClient {
   readonly kind = 'real' as const;
   readonly label: string;
   private readonly options: PiModelOptions;
   private readonly model: Model<'openai-completions'>;
+  /** 上一次调用因为预算被丢掉的图片数，供记账/排障读取。 */
+  lastDroppedImages = 0;
 
   constructor(options: PiModelOptions, modelId: string) {
     this.options = options;
@@ -239,8 +289,12 @@ export class PiModel implements ModelClient {
       }
       callAttempts += 1;
       try {
+        const budgeted = budgetImages(request.messages);
+        if (budgeted.dropped > 0) {
+          this.lastDroppedImages = budgeted.dropped;
+        }
         const messages: Message[] = [];
-        for (const message of request.messages) {
+        for (const message of budgeted.messages) {
           const converted = toPiMessage(message, request.model);
           if (converted) messages.push(converted);
         }

@@ -86,7 +86,7 @@ const IMAGE_MIME: Record<string, string> = {
   '.webp': 'image/webp',
 };
 
-const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
 
 async function readImageFile(absolute: string, size: number): Promise<{ mimeType: string; data: string }> {
   const ext = absolute.slice(absolute.lastIndexOf('.')).toLowerCase();

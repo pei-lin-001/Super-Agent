@@ -189,3 +189,46 @@ test('工具带图：折成 tool 文本 + 一条带图的 user 消息', async ()
   assert.equal(chat[1]!.images, undefined);
   assert.deepEqual(chat[2]!.images, [{ mimeType: 'image/png', data: 'AAA' }]);
 });
+
+test('图片预算：超量的图从最老的开始丢，原位留占位', async () => {
+  const { PiModel } = await import('../../src/model/pi.ts');
+  const { createServer } = await import('node:http');
+  const seen: { messages: { role: string; content: unknown }[] }[] = [];
+  const srv = createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      seen.push(JSON.parse(body));
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(
+        `data: ${JSON.stringify({ id: 'x', object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content: 'ok' }, finish_reason: null }] })}\n\n` +
+        `data: ${JSON.stringify({ id: 'x', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 1 } })}\n\n` +
+        'data: [DONE]\n\n',
+      );
+    });
+  });
+  await new Promise<void>((resolve) => srv.listen(0, '127.0.0.1', resolve));
+  const port = (srv.address() as { port: number }).port;
+  try {
+    const client = new PiModel({ baseUrl: `http://127.0.0.1:${port}`, apiKey: 'k', timeoutMs: 5000, retry: 0 }, 'm');
+    // 造 12 条带图消息，默认预算 8 张
+    const messages = Array.from({ length: 12 }, (_, index) => ({
+      role: 'user' as const,
+      content: `第 ${index} 张`,
+      images: [{ mimeType: 'image/png', data: 'AAA' }],
+    }));
+    await client.chat({ model: 'm', messages, tools: [] });
+
+    const sent = seen[0]!.messages.filter((m) => Array.isArray(m.content));
+    assert.equal(sent.length, 8, '只发预算内的 8 张');
+    // 丢的是最老的 4 条：它们变成纯文本占位。
+    const placeholders = seen[0]!.messages.filter(
+      (m) => typeof m.content === 'string' && m.content.includes('已省略以控制请求体积'),
+    );
+    assert.equal(placeholders.length, 4, '丢掉的要在原位说清楚');
+    assert.match(String(placeholders[0]!.content), /第 0 张/, '占位必须留在原来那条消息上');
+    assert.equal(client.lastDroppedImages, 4);
+  } finally {
+    await new Promise<void>((resolve) => srv.close(() => resolve()));
+  }
+});

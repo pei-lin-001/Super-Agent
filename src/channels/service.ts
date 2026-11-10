@@ -284,12 +284,13 @@ export class ChannelService {
   /**
    * 把入站图片读成当轮可用的 base64。
    *
-   * 上限 4 张、单张 8MB：图片进了上下文就是每轮重发的量，多一张就贵一轮。
+   * 上限 4 张、单张 4MB：单次请求的总量还有一道预算（PiModel.budgetImages），
+   * 这里只是别让明显过大的东西进内存。
    * 历史装配时会被剥掉，只留一句文字占位（见 router 的 planRouterContext）。
    */
   private async readInboundImages(attachments: InboundAttachment[]): Promise<{ mimeType: string; data: string }[]> {
     const picked = attachments
-      .filter((item) => item.kind === 'image' && (item.mime ?? '').startsWith('image/') && item.bytes <= 8 * 1024 * 1024)
+      .filter((item) => item.kind === 'image' && (item.mime ?? '').startsWith('image/') && item.bytes <= 4 * 1024 * 1024)
       .slice(0, 4);
     const out: { mimeType: string; data: string }[] = [];
     for (const item of picked) {
