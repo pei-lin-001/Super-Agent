@@ -6,6 +6,7 @@
  * 真实模型的判断质量由另一条验收（accept-watchdog-real）观察。
  */
 import { spawn } from 'node:child_process';
+import { clockStamp } from '../src/domain/ids.ts';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -24,7 +25,7 @@ const check = (ok: boolean, text: string): void => {
   if (!ok) failures.push(text);
 };
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
-const log = (line: string): void => console.log(`[${new Date().toISOString().slice(11, 19)}] ${line}`);
+const log = (line: string): void => console.log(`[${clockStamp()}] ${line}`);
 
 // 业务 Worker：前两轮只做无效动作（spins.txt 反复重写同一内容），收到维护提示后改为推进并提交。
 let busyCalls = 0;

@@ -10,6 +10,7 @@ import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { loadConfig } from '../config.ts';
+import { clockStamp } from '../domain/ids.ts';
 import { PiModel } from '../model/pi.ts';
 import { Store } from '../storage/store.ts';
 import { mkdirSync as mkdir, writeFileSync as writeJson } from 'node:fs';
@@ -287,7 +288,7 @@ holdLock();
 ensureJobs();
 
 const log = (message: string): void => {
-  console.log(`[${new Date().toISOString().slice(11, 19)}] ${message}`);
+  console.log(`[${clockStamp()}] ${message}`);
 };
 
 /** 巡检间隔可以在线调整：watchdog.interval 覆盖项优先于配置。 */
@@ -320,7 +321,9 @@ function dueForReview(): { run: boolean; reason: string } {
   if (due.length > 0) return { run: true, reason: `${due.length} 个事件到期待复查` };
   const active = store.listTasks().some((item) => item.status === 'active' || item.status === 'waiting');
   if (active && now - lastModelReview >= intervalMs) return { run: true, reason: '存在活跃任务，周期性审视' };
-  if (!active && now - lastModelReview >= intervalMs * 5) return { run: true, reason: '长时间未审视，做一次巡检' };
+  // 系统闲置时每 5 分钟审视一次纯属空转：实测 33 轮巡检全是「无需介入」，
+  // 每轮却要重发 15 万 token 的上下文。闲置时半小时看一眼足够。
+  if (!active && now - lastModelReview >= intervalMs * 30) return { run: true, reason: '长时间未审视，做一次巡检' };
   return { run: false, reason: '没有到期事件，也没有新的活跃任务' };
 }
 

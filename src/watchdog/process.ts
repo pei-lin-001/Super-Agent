@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { Config } from '../config.ts';
+import { clockStamp } from '../domain/ids.ts';
 import { isPidAlive, looksLikeOurProcess, readInstance } from './observer.ts';
 
 export type MainState = 'absent' | 'exited' | 'unverified' | 'alive' | 'unresponsive';
@@ -135,7 +136,7 @@ export function spawnMain(
   child.on('exit', (code) => {
     // 启动失败保留诊断，不丢弃输出。
     try {
-      writeFileSync(logPath, `${new Date().toISOString()} exit=${code}\n${output}`, 'utf8');
+      writeFileSync(logPath, `${clockStamp()} exit=${code}\n${output}`, 'utf8');
     } catch {
       // 忽略写日志失败。
     }
@@ -143,7 +144,7 @@ export function spawnMain(
   child.unref();
   setTimeout(() => {
     try {
-      writeFileSync(logPath, `${new Date().toISOString()} running pid=${child.pid}\n${output}`, 'utf8');
+      writeFileSync(logPath, `${clockStamp()} running pid=${child.pid}\n${output}`, 'utf8');
     } catch {
       // 忽略写日志失败。
     }

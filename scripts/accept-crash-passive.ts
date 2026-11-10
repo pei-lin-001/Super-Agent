@@ -15,6 +15,7 @@
  * 任何一步失败或超时，脚本以非零退出码结束。心跳只作为辅助证据。
  */
 import { spawn } from 'node:child_process';
+import { clockStamp } from '../src/domain/ids.ts';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { join } from 'node:path';
@@ -28,7 +29,7 @@ const workDir = base;
 const dbPath = join(root, '.data', `accept-crash-passive-${stamp}.db`);
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
-const log = (line: string): void => console.log(`[${new Date().toISOString().slice(11, 19)}] ${line}`);
+const log = (line: string): void => console.log(`[${clockStamp()}] ${line}`);
 
 const failures: string[] = [];
 function require_(condition: boolean, message: string): void {

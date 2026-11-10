@@ -4,6 +4,7 @@
  * 退出码：0 通过；1 未通过；2 超时；3 环境问题。
  */
 import { randomBytes } from 'node:crypto';
+import { clockStamp } from '../src/domain/ids.ts';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { loadConfig } from '../src/config.ts';
@@ -13,7 +14,7 @@ import { Runtime } from '../src/runtime/runtime.ts';
 import { Store } from '../src/storage/store.ts';
 import { isolateRun, judgeTask, report } from './smoke-lib.ts';
 
-const log = (message: string): void => console.log(`[${new Date().toISOString().slice(11, 19)}] ${message}`);
+const log = (message: string): void => console.log(`[${clockStamp()}] ${message}`);
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function main(): Promise<void> {

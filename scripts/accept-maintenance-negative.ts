@@ -5,6 +5,7 @@
  * 如果脚本把这种情况也判成"维护成功"，就说明判据只看了命令回执。
  */
 import { spawn } from 'node:child_process';
+import { clockStamp } from '../src/domain/ids.ts';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -23,7 +24,7 @@ const check = (ok: boolean, text: string): void => {
   if (!ok) failures.push(text);
 };
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
-const log = (line: string): void => console.log(`[${new Date().toISOString().slice(11, 19)}] ${line}`);
+const log = (line: string): void => console.log(`[${clockStamp()}] ${line}`);
 
 let busyCalls = 0;
 let wdCalls = 0;

@@ -3,6 +3,7 @@
  * 运行：node --env-file-if-exists=.env.local scripts/smoke-real.ts
  */
 import { randomBytes } from 'node:crypto';
+import { clockStamp } from '../src/domain/ids.ts';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { loadConfig } from '../src/config.ts';
@@ -37,7 +38,7 @@ const MATERIALS: Record<string, string> = {
 };
 
 function log(message: string): void {
-  console.log(`[${new Date().toISOString().slice(11, 19)}] ${message}`);
+  console.log(`[${clockStamp()}] ${message}`);
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));

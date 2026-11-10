@@ -5,6 +5,7 @@
  * 使用独立数据库与工作目录，退出码 0 表示验收脚本自身通过。
  */
 import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
+import { clockStamp } from '../src/domain/ids.ts';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadConfig } from '../src/config.ts';
@@ -31,7 +32,7 @@ const router = new Router(runtime, model(), config);
 runtime.attachRouter(router);
 
 const log = (message: string): void => {
-  console.log(`[${new Date().toISOString().slice(11, 19)}] ${message}`);
+  console.log(`[${clockStamp()}] ${message}`);
 };
 
 log(`本次运行：${runId}`);

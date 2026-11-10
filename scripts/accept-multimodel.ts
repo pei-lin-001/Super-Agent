@@ -9,6 +9,7 @@
  * 调查方法与协作顺序交给模型决定，脚本只检查证据。
  */
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { clockStamp } from '../src/domain/ids.ts';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadConfig } from '../src/config.ts';
@@ -31,7 +32,7 @@ const config = {
 };
 await mkdir(config.workDir, { recursive: true });
 
-const log = (message: string): void => console.log(`[${new Date().toISOString().slice(11, 19)}] ${message}`);
+const log = (message: string): void => console.log(`[${clockStamp()}] ${message}`);
 const failures: string[] = [];
 const check = (ok: boolean, message: string): void => {
   log(`${ok ? '✓' : '✗'} ${message}`);

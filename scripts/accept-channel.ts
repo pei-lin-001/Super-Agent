@@ -8,6 +8,7 @@
  * 这不是真实平台联调：真实 Telegram/微信需要你提供机器人令牌与扫码，脚本不会假装通过。
  */
 import { spawn, type ChildProcess } from 'node:child_process';
+import { clockStamp } from '../src/domain/ids.ts';
 import { createServer } from 'node:http';
 import { existsSync, mkdirSync, openSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -22,7 +23,7 @@ const stateDir = join(base, 'channels');
 const token = '424242:ACCEPTANCE_TOKEN';
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
-const log = (line: string): void => console.log(`[${new Date().toISOString().slice(11, 19)}] ${line}`);
+const log = (line: string): void => console.log(`[${clockStamp()}] ${line}`);
 
 const failures: string[] = [];
 function require_(condition: boolean, message: string): void {
