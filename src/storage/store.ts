@@ -747,6 +747,45 @@ export class Store {
    * 真正的对话轮次（只有 user / assistant）。
    * 调查日志里的工具记录不在这里：它们没有调用标识，不能当正式 tool 消息重发。
    */
+  /** 水位线之后的维护对话（摘要已覆盖的部分不重复取）。 */
+  listWdDialogueSince(afterRow: number, limit = 400): { row: number; id: string; role: 'user' | 'assistant'; content: string }[] {
+    return this.all(
+      `SELECT rowid AS rid, id, role, content FROM wd_turn WHERE rowid > ? ORDER BY rowid ASC LIMIT ?`,
+      afterRow, limit,
+    ).map((row) => ({
+      row: Number((row as { rid?: unknown }).rid ?? 0),
+      id: str((row as { id?: unknown }).id),
+      role: str((row as { role?: unknown }).role) as 'user' | 'assistant',
+      content: str((row as { content?: unknown }).content),
+    }));
+  }
+
+  latestWatchdogNote(): { content: string; coveredRow: number } | null {
+    const row = this.get('SELECT content, covered_row FROM wd_note ORDER BY created_at DESC, rowid DESC LIMIT 1');
+    if (!row) return null;
+    return {
+      content: str((row as { content?: unknown }).content),
+      coveredRow: Number((row as { covered_row?: unknown }).covered_row ?? 0),
+    };
+  }
+
+  insertWatchdogNote(input: {
+    id: string;
+    fromRow: number;
+    toRow: number;
+    coveredRow: number;
+    content: string;
+    sourceTurns: number;
+    sourceChars: number;
+  }): void {
+    this.run(
+      `INSERT INTO wd_note (id, from_row, to_row, covered_row, content, source_turns, source_chars, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      input.id, input.fromRow, input.toRow, input.coveredRow, input.content,
+      input.sourceTurns, input.sourceChars, nowIso(),
+    );
+  }
+
   listWdDialogue(limit = 10): { id: string; role: 'user' | 'assistant'; content: string }[] {
     // 先取最近的若干条，再按时间正序返回：直接正序 + LIMIT 拿到的是最早的历史，
     // 问答超过十组之后，新内容永远进不了下一次请求。

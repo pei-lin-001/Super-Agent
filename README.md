@@ -937,3 +937,20 @@ pnpm accept:channel         # 进程级验收：本地假平台，真实启动 d
 - `recover()` 幂等：重复调用不会重复入队。
 
 未恢复的部分：进程崩溃时正在进行的工具调用不会重做，也不会假装成功；模型只能看到「中断」提示并自己核对文件与消息。
+
+### Watchdog 的循环与上下文
+
+Watchdog 与 Worker 走同一条路：循环交给 `src/vendor/pi/agent-loop.ts`（见上方「移植自 pi」），
+步数上限 40。不同点只在工具与作用域：
+
+| 项 | Worker | Watchdog |
+| --- | --- | --- |
+| 循环 | pi agent-loop | pi agent-loop（同一函数 `runWorkerTurn`） |
+| 读文件 | `fs_read` 等 | 同一套 `fs_*`（只读，不含 `fs_write`） |
+| 执行命令 | `proc_run`（异步作业，scope=业务） | `run_command` + `job_output`（scope=watchdog，与业务作业分开恢复） |
+| 维护动作 | 无 | `maintain` / `inspect_task` / `record` / `check_main` / `command_status` |
+| 上下文 | `CONTEXT_WINDOW_CHARS` 字符预算 | token 预算 + `wd_note` 累计摘要 |
+
+读文件复用 Worker 的实现（行语义、2000 行/50KB 截断、能读仓库根），不再自己按字节读。
+执行命令仍分开：Watchdog 的作业带 `scope=watchdog`，主系统恢复时不会把它的 running 作业
+误标成 unknown，反过来也一样——这套隔离不能为省一个工具而拆掉。

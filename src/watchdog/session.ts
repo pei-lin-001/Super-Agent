@@ -9,9 +9,27 @@ import { observe, renderObservation } from './observer.ts';
 import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { assertInsideRoot, resolveInside } from '../tools/paths.ts';
+import { fileTools } from '../tools/files.ts';
+import { runWorkerTurn } from '../runtime/pi-worker.ts';
+import type { ToolContext, ToolDefinition } from '../tools/types.ts';
+import { planWindow } from '../runtime/window.ts';
 import { observationPrompt, WATCHDOG_SYSTEM } from './prompts.ts';
 
+/**
+ * 单次调查的步数上限。原来是无限循环，「结束条件由模型给出」——但那意味着
+ * 模型不收敛时没有任何东西能停住它（Worker 侧已经因为同样的设计跑飞过）。
+ * 40 步足够查完一个卡住的任务；到顶就带着当前结论收尾。
+ */
+const MAX_WATCHDOG_STEPS = 40;
+
 const WD_TOOLS: ToolSchema[] = [
+  // 读文件不再自己造：直接用 Worker 那套 fs_*（行语义、2000 行/50KB 截断、能读仓库根）。
+  // 维护专用的 run_command / job_output 保留——它们的作业 scope=watchdog，
+  // 与业务作业分开恢复，套 Worker 的 proc_run 会把两套作业混在一起。
+  // 只取只读的：fs_write 会把文件写进 work/__watchdog__/，维护者不该有写权限。
+  ...fileTools
+    .filter((tool) => tool.name !== 'fs_write')
+    .map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters })),
   {
     name: 'inspect_task',
     description: '读取一个任务的详细证据：Worker 分支、最近消息、最近工具调用与结果、作业、产物与检查。',
@@ -69,19 +87,6 @@ const WD_TOOLS: ToolSchema[] = [
       type: 'object',
       properties: { command_id: { type: 'string', description: '不填则返回最近 10 条' } },
       required: [],
-    },
-  },
-  {
-    name: 'read_file',
-    description: '读取主系统工作目录内的证据文件（日志、产物、作业输出）。只读，路径不能跳出工作目录。',
-    parameters: {
-      type: 'object',
-      properties: {
-        path: { type: 'string' },
-        offset: { type: 'number', description: '从第几个字节开始，默认 0' },
-        limit: { type: 'number', description: '本次最多读取字节数，默认 8000，上限 200000' },
-      },
-      required: ['path'],
     },
   },
   {
@@ -250,6 +255,121 @@ export class WatchdogSession {
     return lines.join('\n');
   }
 
+  /**
+   * 文件工具要的上下文。Watchdog 没有业务任务，用占位 id：
+   * resolveReadPath 找不到任务目录时会退到仓库根，正是维护者要读的地方。
+   */
+  private readContext(): ToolContext {
+    return {
+      host: null as unknown as ToolContext['host'],
+      worker: null as unknown as ToolContext['worker'],
+      task: { id: '__watchdog__' } as ToolContext['task'],
+      workDir: this.deps.config.workDir,
+      materialsDir: this.deps.config.materialsDir,
+      readRoot: this.deps.config.readRoot,
+      signal: null,
+    };
+  }
+
+  /**
+   * 维护对话的近期历史：按 token 预算从尾部取，超出阈值就压进累计摘要。
+   *
+   * 原来是硬编码 10 条——条数不等于规模，10 条长回答照样能把窗口塞满；
+   * 而超过 200 条之后更早的记录会被直接丢掉，连痕迹都没有。
+   */
+  private dialogueHistory(): { history: ChatMessage[]; note: string | null; toSummarize: {
+    turns: { row: number; role: 'user' | 'assistant'; content: string }[];
+    fromRow: number;
+    toRow: number;
+  } | null } {
+    const limits = this.deps.config.limits;
+    const note = this.deps.store.latestWatchdogNote();
+    // 只取问答：wd_turn 里的 tool 记录是给人看的摘要，没有 toolCallId，
+    // 塞进请求会变成「没有归属的工具结果」，提供方直接拒绝。
+    const turns = this.deps.store
+      .listWdDialogueSince(note?.coveredRow ?? 0)
+      .filter((turn) => turn.role === 'user' || turn.role === 'assistant');
+    const plan = planWindow({
+      items: turns.map((turn) => ({ turn, chars: turn.content.length })),
+      keepRecentTokens: limits.routerKeepRecentTokens,
+      contextWindowTokens: limits.contextWindowTokens,
+      reserveTokens: limits.routerReserveTokens,
+    });
+    const kept = plan.kept.map((item) => item.turn);
+    const dropped = plan.dropped.map((item) => item.turn);
+    return {
+      history: kept.map((item): ChatMessage => ({ role: item.role, content: item.content })),
+      note: note?.content ?? null,
+      toSummarize:
+        plan.shouldCompact && dropped.length > 0
+          ? { turns: dropped, fromRow: dropped[0]!.row, toRow: dropped[dropped.length - 1]!.row }
+          : null,
+    };
+  }
+
+  /** 把被挤出窗口的旧对话压成一份累计摘要；失败不阻断本轮。 */
+  private async runNote(input: {
+    previous: string | null;
+    turns: { row: number; role: 'user' | 'assistant'; content: string }[];
+    fromRow: number;
+    toRow: number;
+  }): Promise<string | null> {
+    const { store, model, modelName, config } = this.deps;
+    try {
+      const result = await new RecordingModel(model, store, 'watchdog', { sessionId: null }).chat({
+        model: modelName,
+        messages: [
+          {
+            role: 'system',
+            content:
+              '你是 Super-Agent 维护会话的摘要器。输出会成为 Watchdog 后续唯一可见的旧对话记忆，' +
+              '必须准确、可追溯，不能编造，也不要继续对话。',
+          },
+          {
+            role: 'user',
+            content: `# 上一份记录\n${input.previous ?? '（这是第一次整理）'}\n\n` +
+              `# 本次需要并入的对话\n${input.turns.map((turn) => `[${turn.role === 'user' ? '维护者' : 'Watchdog'}] ${turn.content}`).join('\n\n')}\n\n` +
+              `# 输出要求\n1. 保留上一份里仍然有效的内容，并入这次的新内容。\n` +
+              '2. 只记事实：观察到的现象、采取的维护动作、动作结果、未解决事件、下次复查条件。\n' +
+              '3. 不写寒暄和流水账；冲突的旧内容写「已失效：<原因>」。\n' +
+              `4. 全文不超过 ${config.limits.routerNoteMaxChars} 字符。只输出正文。\n\n` +
+              '建议小节：## 已确认的事实 / ## 已采取的动作与结果 / ## 未解决事件 / ## 下次复查条件',
+          },
+        ],
+        tools: [],
+        reasoningEffort: 'low',
+      });
+      const content = (result.text ?? '').trim();
+      if (content === '') return null;
+      store.insertWatchdogNote({
+        id: `wdn_${randomBytes(4).toString('hex')}`,
+        fromRow: input.fromRow,
+        toRow: input.toRow,
+        coveredRow: input.toRow,
+        content,
+        sourceTurns: input.turns.length,
+        sourceChars: input.turns.reduce((sum, turn) => sum + turn.content.length, 0),
+      });
+      return content;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 本轮要用的 system 与历史。
+   *
+   * 顺序不能反：先判断要不要压缩、压完落水位线，再取历史——
+   * 否则刚被压掉的那几条会同时出现在摘要和原文里。
+   */
+  private async contextForTurn(): Promise<{ system: string; history: ChatMessage[] }> {
+    const { note, toSummarize } = this.dialogueHistory();
+    let merged = note;
+    if (toSummarize) merged = (await this.runNote({ previous: note, ...toSummarize })) ?? note;
+    const system = merged ? `${WATCHDOG_SYSTEM}\n\n# 更早维护对话的累计记录\n${merged}` : WATCHDOG_SYSTEM;
+    return { system, history: this.dialogueHistory().history };
+  }
+
   private async executeTool(name: string, args: Record<string, unknown>): Promise<string> {
     void 0;
     const store = this.deps.store;
@@ -272,8 +392,11 @@ export class WatchdogSession {
         .map((item) => `${item.id} ${item.command} ${item.status}${item.result ? `｜${item.result}` : ''}`)
         .join('\n');
     }
-    if (name === 'read_file') {
-      return this.readInsideRoot(str('path'), num('offset', 0), num('limit', 8000));
+    if (name.startsWith('fs_')) {
+      const tool = fileTools.find((item) => item.name === name && item.name !== 'fs_write');
+      if (!tool) return `未知工具：${name}`;
+      const outcome = await tool.run(args, this.readContext());
+      return outcome.type === 'ok' ? outcome.content : (outcome as { content?: string }).content ?? '';
     }
     if (name === 'run_command') {
       if (!this.deps.processes) return '当前环境没有配置维护者作业服务';
@@ -399,46 +522,40 @@ export class WatchdogSession {
     const observation = observe(store, config);
     const health = this.deps.health?.();
     const toolLog = store.listWdToolLog(12);
-    const messages: ChatMessage[] = [
-      { role: 'system', content: WATCHDOG_SYSTEM },
-      ...store.listWdDialogue(10).map((turn): ChatMessage => ({ role: turn.role, content: turn.content })),
-      ...(toolLog.length > 0
-        ? [
-            {
-              role: 'user' as const,
-              content:
-                '# 上一次调查的工具记录（仅作背景，不是重新发起的调用）\n' +
-                toolLog.map((entry) => `- ${entry.tool}：${entry.summary}`).join('\n'),
-            },
-          ]
-        : []),
-      {
-        role: 'user',
-        content:
-          `# 维护者提问\n${question}\n\n## 当前观察\n${renderObservation(observation)}\n\n` +
-          `## 主系统健康\n${health ? `${health.state}｜${health.detail}` : '未知'}\n\n` +
-          `## 未解决事件\n${store.listOpenIssues().map((issue) => `- ${issue.id}｜${issue.title}｜${issue.note ?? ''}`).join('\n') || '（无）'}\n\n` +
-          `先用工具核对证据再回答。说清楚哪些是已确认的事实、哪些还不确定。`,
-      },
-    ];
     store.appendWdTurn({ id: `wdt_${randomBytes(4).toString('hex')}`, role: 'user', content: question });
-    // 不设调用次数上限：维护者要调查多久就多久，直到它自己认为证据够了。
-    // 结束条件由模型给出（不再调用工具），不由程序的计数决定。
+
+    // 循环交给 pi 的 agent-loop（和 Worker 同一条路）：工具批处理、步数、截断作废都在内核里。
     const repeats = new Map<string, number>();
-    for (;;) {
-      const result = await new RecordingModel(model, store, 'watchdog', { sessionId: null }).chat({
-        model: modelName,
-        messages,
-        tools: WD_TOOLS,
-        reasoningEffort: config.reasoningEffort,
-      });
-      messages.push({ role: 'assistant', content: result.text, ...(result.toolCalls.length > 0 ? { toolCalls: result.toolCalls } : {}) });
-      if (result.toolCalls.length === 0) {
-        const answer = result.text?.trim() ?? '';
-        store.appendWdTurn({ id: `wdt_${randomBytes(4).toString('hex')}`, role: 'assistant', content: answer });
-        return answer;
-      }
-      for (const call of result.toolCalls) {
+    const context = await this.contextForTurn();
+    const result = await runWorkerTurn({
+      model: modelName,
+      modelClient: new RecordingModel(model, store, 'watchdog', { sessionId: null }),
+      systemPrompt: context.system,
+      history: context.history,
+      prompts: [
+        ...(toolLog.length > 0
+          ? [
+              {
+                role: 'user' as const,
+                content:
+                  '# 上一次调查的工具记录（仅作背景，不是重新发起的调用）\n' +
+                  toolLog.map((entry) => `- ${entry.tool}：${entry.summary}`).join('\n'),
+              },
+            ]
+          : []),
+        {
+          role: 'user',
+          content:
+            `# 维护者提问\n${question}\n\n## 当前观察\n${renderObservation(observation)}\n\n` +
+            `## 主系统健康\n${health ? `${health.state}｜${health.detail}` : '未知'}\n\n` +
+            `## 未解决事件\n${store.listOpenIssues().map((issue) => `- ${issue.id}｜${issue.title}｜${issue.note ?? ''}`).join('\n') || '（无）'}\n\n` +
+            `先用工具核对证据再回答。说清楚哪些是已确认的事实、哪些还不确定。`,
+        },
+      ],
+      tools: WD_TOOLS,
+      maxSteps: MAX_WATCHDOG_STEPS,
+      signal: null,
+      runTool: async (call) => {
         const key = `${call.name}|${call.arguments}`;
         const seen = (repeats.get(key) ?? 0) + 1;
         repeats.set(key, seen);
@@ -458,9 +575,16 @@ export class WatchdogSession {
           role: 'tool',
           content: `${call.name}: ${output.slice(0, 300)}`,
         });
-        messages.push({ role: 'tool', content: output, toolCallId: call.id });
-      }
+        return { outcome: { type: 'ok' as const, content: output }, terminate: false };
+      },
+    });
+
+    const answer = (result.assistantText ?? '').trim();
+    if (answer !== '') {
+      store.appendWdTurn({ id: `wdt_${randomBytes(4).toString('hex')}`, role: 'assistant', content: answer });
+      return answer;
     }
+    return `（本轮达到 ${result.steps} 步上限，没有得出结论；已记录当前观察）`;
   }
 
   async runOnce(intervalMinutes: number): Promise<WatchdogResult> {
@@ -483,76 +607,63 @@ export class WatchdogSession {
       .map((action) => `- ${action.createdAt} ${action.action}｜${action.reason}｜结果：${action.result}`)
       .join('\n');
 
-    const messages: ChatMessage[] = [
-      { role: 'system', content: WATCHDOG_SYSTEM },
-      ...store.listWdDialogue(10).map((turn): ChatMessage => ({ role: turn.role, content: turn.content })),
-      ...(toolLog.length > 0
-        ? [
-            {
-              role: 'user' as const,
-              content:
-                '# 上一次调查的工具记录（仅作背景，不是重新发起的调用）\n' +
-                toolLog.map((entry) => `- ${entry.tool}：${entry.summary}`).join('\n'),
-            },
-          ]
-        : []),
-      {
-        role: 'user',
-        content: observationPrompt({
-          observation: renderObservation(observation),
-          issues,
-          lastActions: actions,
-          now: nowIso(),
-          intervalMinutes,
-        }),
-      },
-    ];
-
-    let steps = 0;
     let acted = false;
-    // 巡检同样不设步数上限：结束条件由模型给出，不由程序计数决定。
-    for (;;) {
-      const result = await new RecordingModel(model, store, 'watchdog', { sessionId: null }).chat({
-        model: modelName,
-        messages,
-        tools: WD_TOOLS,
-        reasoningEffort: config.reasoningEffort,
-      });
-      steps += 1;
-      messages.push({
-        role: 'assistant',
-        content: result.text,
-        ...(result.toolCalls.length > 0 ? { toolCalls: result.toolCalls } : {}),
-      });
-      if (result.toolCalls.length === 0) {
-        const answer = result.text?.trim() ?? '';
-        if (answer !== '') {
-          store.appendWdTurn({ id: `wdt_${randomBytes(4).toString('hex')}`, role: 'assistant', content: answer });
-          store.appendWdAction({
-            id: `wda_${randomBytes(4).toString('hex')}`,
-            issueId: null,
-            action: 'inspect',
-            reason: '定时巡检',
-            expected: '',
-            result: answer.slice(0, 400),
-          });
-        }
-        return { acted, summary: answer, steps };
-      }
-      for (const call of result.toolCalls) {
+    const context = await this.contextForTurn();
+    const result = await runWorkerTurn({
+      model: modelName,
+      modelClient: new RecordingModel(model, store, 'watchdog', { sessionId: null }),
+      systemPrompt: context.system,
+      history: context.history,
+      prompts: [
+        ...(toolLog.length > 0
+          ? [
+              {
+                role: 'user' as const,
+                content:
+                  '# 上一次调查的工具记录（仅作背景，不是重新发起的调用）\n' +
+                  toolLog.map((entry) => `- ${entry.tool}：${entry.summary}`).join('\n'),
+              },
+            ]
+          : []),
+        {
+          role: 'user',
+          content: observationPrompt({
+            observation: renderObservation(observation),
+            issues,
+            lastActions: actions,
+            now: nowIso(),
+            intervalMinutes,
+          }),
+        },
+      ],
+      tools: WD_TOOLS,
+      maxSteps: MAX_WATCHDOG_STEPS,
+      signal: null,
+      runTool: async (call) => {
         let output: string;
         try {
-          const parsed = JSON.parse(call.arguments || '{}') as Record<string, unknown>;
-          output = await this.executeTool(call.name, parsed);
+          output = await this.executeTool(call.name, JSON.parse(call.arguments || '{}') as Record<string, unknown>);
           if (call.name === 'maintain' || call.name === 'record') acted = true;
         } catch (error) {
           output = `执行失败：${(error as Error).message}`;
         }
-        messages.push({ role: 'tool', content: output, toolCallId: call.id });
-      }
+        return { outcome: { type: 'ok' as const, content: output }, terminate: false };
+      },
+    });
+
+    const answer = (result.assistantText ?? '').trim();
+    const summary = answer !== '' ? answer : `本轮达到 ${result.steps} 步上限，已记录当前观察`;
+    if (answer !== '') {
+      store.appendWdTurn({ id: `wdt_${randomBytes(4).toString('hex')}`, role: 'assistant', content: answer });
+      store.appendWdAction({
+        id: `wda_${randomBytes(4).toString('hex')}`,
+        issueId: null,
+        action: 'inspect',
+        reason: '定时巡检',
+        expected: '',
+        result: answer.slice(0, 400),
+      });
     }
-    const summary = '本轮达到工具调用上限，已记录当前观察';
-    store.appendWdTurn({ id: `wdt_${randomBytes(4).toString('hex')}`, role: 'assistant', content: summary });
-    return { acted, summary, steps };
+    return { acted, summary, steps: result.steps };
   }
 }

@@ -327,6 +327,19 @@ CREATE TABLE IF NOT EXISTS wd_turn (
   created_at TEXT NOT NULL
 );
 
+-- 维护对话的累计摘要：wd_turn 只增不减，不压会一路撞窗口。
+-- 水位线用 wd_turn 的隐式 rowid，不必再加列。
+CREATE TABLE IF NOT EXISTS wd_note (
+  id           TEXT PRIMARY KEY,
+  from_row     INTEGER NOT NULL,
+  to_row       INTEGER NOT NULL,
+  covered_row  INTEGER NOT NULL,
+  content      TEXT NOT NULL,
+  source_turns INTEGER NOT NULL,
+  source_chars INTEGER NOT NULL,
+  created_at   TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS wd_issue (
   id          TEXT PRIMARY KEY,
   task_id     TEXT,
