@@ -470,9 +470,11 @@ export class Store {
         `SELECT * FROM workspace WHERE status = 'active' AND session_key IS NULL ${order}`,
       ).map(toWorkspace);
     }
+    // 没有话题上下文（例如「某个任务完成了」的通知轮）时，退回会话级全貌：
+    // 这时不是"在某个话题里提问"，而是要在整个会话里找产物属于谁。
     const rows = conversationId === null
       ? this.all(
-          `SELECT * FROM workspace WHERE status = 'active' AND session_key = ? AND conversation_id IS NULL ${order}`,
+          `SELECT * FROM workspace WHERE status = 'active' AND session_key = ? ${order}`,
           sessionKey,
         )
       : this.all(
@@ -517,6 +519,18 @@ export class Store {
 
   getTaskByGroup(groupId: string): Task | null {
     const row = this.get('SELECT * FROM task WHERE group_id = ?', groupId);
+    return row ? mapTask(row) : null;
+  }
+
+  /**
+   * 这个工作空间里最近的一条任务。
+   *
+   * 和 getTaskByGroup 的区别：那个只给一条（同组可能已经有多条任务），
+   * 这个按时间倒序取最新——任务完成后成员会休眠、currentTaskId 归空，
+   * Router 仍然要能看到「最近做完的是哪件事」，否则它连产物属于哪个任务都不知道。
+   */
+  latestTaskForWorkspace(workspaceId: string): Task | null {
+    const row = this.get('SELECT * FROM task WHERE workspace_id = ? ORDER BY created_at DESC LIMIT 1', workspaceId);
     return row ? mapTask(row) : null;
   }
 

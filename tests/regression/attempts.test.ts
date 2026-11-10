@@ -8,10 +8,19 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
-import { OpenAICompatibleModel } from '../../src/model/openai.ts';
+import { PiModel } from '../../src/model/pi.ts';
 import { RecordingModel } from '../../src/model/recorder.ts';
 import { ModelError, type ModelClient } from '../../src/model/types.ts';
 import { Store } from '../../src/storage/store.ts';
+
+/** pi 的适配器强制流式；假服务端必须回 SSE，普通 JSON 会被当成"流提前结束"。 */
+function sse(content: string): string {
+  return (
+    `data: ${JSON.stringify({ id: 'x', choices: [{ index: 0, delta: { content }, finish_reason: null }] })}\n\n` +
+    `data: ${JSON.stringify({ id: 'x', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 1 } })}\n\n` +
+    'data: [DONE]\n\n'
+  );
+}
 
 interface Fixture {
   url: string;
@@ -29,13 +38,8 @@ async function server(statuses: number[]): Promise<Fixture> {
       count += 1;
       const status = statuses[index]!;
       if (status === 200) {
-        res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(
-          JSON.stringify({
-            choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
-            usage: { prompt_tokens: 1, completion_tokens: 1 },
-          }),
-        );
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.end(sse('ok'));
         return;
       }
       res.writeHead(status, { 'content-type': 'application/json' });
@@ -53,15 +57,15 @@ async function server(statuses: number[]): Promise<Fixture> {
   };
 }
 
-function model(url: string, retry: number): OpenAICompatibleModel {
-  return new OpenAICompatibleModel({
+function model(url: string, retry: number): PiModel {
+  return new PiModel({
     baseUrl: url,
     apiKey: 'k',
     timeoutMs: 20_000,
     retry,
     reasoningEffort: 'low',
     maxTokens: 32,
-  });
+  }, 'test-model');
 }
 
 const req = (signal?: AbortSignal) => ({ model: 'm', messages: [], tools: [], ...(signal ? { signal } : {}) });
@@ -328,8 +332,8 @@ function failingFetch(error: Error): typeof fetch {
   }) as unknown as typeof fetch;
 }
 
-function networkModel(url: string, retry: number, error: Error): OpenAICompatibleModel {
-  return new OpenAICompatibleModel({
+function networkModel(url: string, retry: number, error: Error): PiModel {
+  return new PiModel({
     baseUrl: url,
     apiKey: 'k',
     timeoutMs: 30_000,
@@ -337,7 +341,7 @@ function networkModel(url: string, retry: number, error: Error): OpenAICompatibl
     reasoningEffort: 'low',
     maxTokens: 32,
     fetchImpl: failingFetch(error),
-  });
+  }, 'test-model');
 }
 
 test('记账层：网络失败进入退避后取消，落库为 1 次 cancelled', async () => {
@@ -348,7 +352,7 @@ test('记账层：网络失败进入退避后取消，落库为 1 次 cancelled'
     let outcome: unknown = null;
     try {
       let calls = 0;
-      const model = new OpenAICompatibleModel({
+      const model = new PiModel({
         baseUrl: 'http://127.0.0.1:9/v1',
         apiKey: 'k',
         timeoutMs: 30_000,
@@ -359,7 +363,7 @@ test('记账层：网络失败进入退避后取消，落库为 1 次 cancelled'
           calls += 1;
           throw new TypeError('network down');
         }) as unknown as typeof fetch,
-      });
+      }, 'test-model');
       const recorder = new RecordingModel(model, store, 'worker');
       const pending = recorder.chat(req(controller.signal)).then(
         () => null,
@@ -393,7 +397,7 @@ test('记账层：超时失败进入退避后取消，落库为 1 次 cancelled'
       const timeoutError = new Error('The operation was aborted due to timeout');
       timeoutError.name = 'TimeoutError';
       let calls = 0;
-      const model = new OpenAICompatibleModel({
+      const model = new PiModel({
         baseUrl: 'http://127.0.0.1:9/v1',
         apiKey: 'k',
         timeoutMs: 30_000,
@@ -404,7 +408,7 @@ test('记账层：超时失败进入退避后取消，落库为 1 次 cancelled'
           calls += 1;
           throw timeoutError;
         }) as unknown as typeof fetch,
-      });
+      }, 'test-model');
       const recorder = new RecordingModel(model, store, 'worker');
       const pending = recorder.chat(req(controller.signal)).then(
         () => null,
@@ -438,7 +442,7 @@ test('记账层：退避中取消后不再继续重试', async () => {
     const controller = new AbortController();
     const store = new Store(join(dir, 'db.sqlite'), { instanceId: 'inst_rec' });
     try {
-      const model = new OpenAICompatibleModel({
+      const model = new PiModel({
         baseUrl: 'http://127.0.0.1:9/v1',
         apiKey: 'k',
         timeoutMs: 30_000,
@@ -449,7 +453,7 @@ test('记账层：退避中取消后不再继续重试', async () => {
           calls += 1;
           throw new TypeError('network down');
         }) as unknown as typeof fetch,
-      });
+      }, 'test-model');
       const recorder = new RecordingModel(model, store, 'worker');
       const pending = recorder.chat(req(controller.signal)).catch(() => undefined);
       for (let i = 0; i < 300 && calls === 0; i += 1) await new Promise((r) => setTimeout(r, 10));
@@ -483,17 +487,14 @@ test('图片：走多模态数组发出，纯文本仍发字符串', async () =>
     req.on('data', (chunk) => { body += chunk; });
     req.on('end', () => {
       seen.push(JSON.parse(body));
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({
-        choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
-        usage: { prompt_tokens: 1, completion_tokens: 1 },
-      }));
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(sse('ok'));
     });
   });
   await new Promise<void>((resolve) => srv.listen(0, '127.0.0.1', resolve));
   const port = (srv.address() as { port: number }).port;
   try {
-    const client = new OpenAICompatibleModel({ baseUrl: `http://127.0.0.1:${port}`, apiKey: 'x', timeoutMs: 5000, retry: 0 });
+    const client = new PiModel({ baseUrl: `http://127.0.0.1:${port}`, apiKey: 'x', timeoutMs: 5000, retry: 0 }, 'test-model');
     await client.chat({
       model: 'm',
       messages: [{ role: 'user', content: '这是什么', images: [{ mimeType: 'image/png', data: 'AAA' }] }],

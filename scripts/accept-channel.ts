@@ -9,7 +9,7 @@
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createServer } from 'node:http';
-import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, openSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
@@ -125,29 +125,41 @@ const model = createServer((req, res) => {
       .join('\n');
     const taskIdInContext =
       (parsed.messages ?? [])
-        .filter((message) => message.role === 'system')
+        // 有些适配器把 system 发成 developer，两种都要认。
+        .filter((message) => message.role === 'system' || message.role === 'developer')
         .map((message) => message.content ?? '')
         .join('\n')
         .match(/task_[a-z0-9]{6,}/)?.[0] ?? '';
 
-    const reply = (name: string, args: Record<string, unknown>): unknown => ({
-      choices: [
-        {
-          message: {
-            content: null,
-            tool_calls: [{ id: `c${Date.now()}`, type: 'function', function: { name, arguments: JSON.stringify(args) } }],
+    // pi 的适配器强制流式，假模型也必须回 SSE。
+    // 一段流只能有一个 [DONE]：中途结尾会让客户端以为流提前结束、拿不到 finish_reason。
+    const chunk = (payload: {
+      choices: { index: number; delta: Record<string, unknown>; finish_reason: string | null }[];
+      usage?: { prompt_tokens: number; completion_tokens: number };
+    }): string => `data: ${JSON.stringify({ id: 'x', object: 'chat.completion.chunk', ...payload })}\n\n`;
+    const finish = (reason: string): string =>
+      chunk({
+        choices: [{ index: 0, delta: {}, finish_reason: reason }],
+        usage: { prompt_tokens: 10, completion_tokens: 5 },
+      }) + 'data: [DONE]\n\n';
+    const reply = (name: string, args: Record<string, unknown>): string =>
+      chunk({
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [
+                { index: 0, id: `c${Date.now()}`, type: 'function', function: { name, arguments: JSON.stringify(args) } },
+              ],
+            },
+            finish_reason: null,
           },
-          finish_reason: 'tool_calls',
-        },
-      ],
-      usage: { prompt_tokens: 10, completion_tokens: 5 },
-    });
-    const text = (content: string): unknown => ({
-      choices: [{ message: { content }, finish_reason: 'stop' }],
-      usage: { prompt_tokens: 10, completion_tokens: 5 },
-    });
+        ],
+      }) + finish('tool_calls');
+    const text = (content: string): string =>
+      chunk({ choices: [{ index: 0, delta: { content }, finish_reason: null }] }) + finish('stop');
 
-    let payload: unknown;
+    let payload: string;
     if (isRouter) {
       routerCalls += 1;
       if (routerCalls === 1) {
@@ -175,8 +187,8 @@ const model = createServer((req, res) => {
     } else {
       payload = reply('submit_result', { summary: '已生成交付文件', artifacts: ['deliverable.md'] });
     }
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify(payload));
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(payload);
   });
 });
 
@@ -238,7 +250,7 @@ async function startDaemon(): Promise<void> {
   daemon = spawn(process.execPath, ['src/main.ts', '--daemon'], {
     cwd: root,
     env,
-    stdio: 'ignore',
+    stdio: ['ignore', openSync(join(workDir,'.runtime','daemon.log'),'a'), openSync(join(workDir,'.runtime','daemon.log'),'a')],
   });
   // 重启时心跳文件已经存在，不能只看文件：等进程真的活着并稳定一小会儿。
   await sleep(1500);

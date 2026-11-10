@@ -7,6 +7,7 @@
 import assert from 'node:assert/strict';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createServer } from 'node:http';
+import { sseText } from '../sse.ts';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -42,13 +43,8 @@ async function makeEnv(intervalMs = 4000): Promise<Env> {
       maxActive = Math.max(maxActive, active);
       const reply = (): void => {
         active -= 1;
-        res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(
-          JSON.stringify({
-            choices: [{ message: { content: `维护结论 ${count}：数据层可读，调度层状态如上。` }, finish_reason: 'stop' }],
-            usage: { prompt_tokens: 5, completion_tokens: 5 },
-          }),
-        );
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.end(sseText(`维护结论 ${count}：数据层可读，调度层状态如上。`, { prompt: 5, completion: 5 }));
       };
       // 每次请求都慢一点，让巡检与提问有机会重叠
       setTimeout(reply, 250);

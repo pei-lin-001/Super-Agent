@@ -332,12 +332,17 @@ Router：`create_task` `send_to_worker` `stop_task` `list_tasks` `read_task` `se
 | 工具 | 做什么 | 依赖 |
 |---|---|---|
 | `net_fetch` | 抓取已知 URL：状态码、最终 URL、内容类型、正文；HTML 提正文，二进制落盘 | 无 |
-| `net_search` | 联网搜索，返回标题/URL/摘要 | `SEARCH_API_KEY`（未配置则报错，不伪造） |
+| `net_search` | 联网搜索，返回标题/URL/摘要 | `SEARCH_API_KEY`（Tavily）或 `SEARCH_PROVIDER=ollama` 复用模型凭据 |
 | `doc_pdf` | PDF 按页提取文字 | 系统 `pdftotext` |
 | `doc_notebook` | 读 .ipynb 的单元格与文本输出 | 无 |
 | `env_capabilities` | 报告当前可用能力（不输出密钥） | 无 |
 
 搜索摘要不等于网页正文，拿到线索后仍要用 `net_fetch` 打开来源。
+
+两个后端的请求/响应协议相同（`POST {query, max_results}` → `{results:[{title,url,content}]}`），
+因此只有端点与凭据来源不同。`SEARCH_PROVIDER=ollama` 时端点自动推导为
+`https://<host>/api/web_search`（注意是根路径，`/v1/web_search` 会 404），
+凭据复用 `OLLAMA_API_KEY`——配过 ollama 模型就不必再填一遍。
 
 ### 产物
 

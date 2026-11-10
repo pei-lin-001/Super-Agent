@@ -6,7 +6,7 @@ import { randomBytes } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { loadConfig } from '../src/config.ts';
-import { OpenAICompatibleModel } from '../src/model/openai.ts';
+import { PiModel } from '../src/model/pi.ts';
 import { Router } from '../src/runtime/router.ts';
 import { Runtime } from '../src/runtime/runtime.ts';
 import { Store } from '../src/storage/store.ts';
@@ -79,7 +79,7 @@ async function main(): Promise<void> {
   };
 
   const store = new Store(config.dbPath);
-  const workerModel = new OpenAICompatibleModel({
+  const workerModel = new PiModel({
     baseUrl: config.baseUrl,
     apiKey: config.apiKey,
     timeoutMs: config.timeoutMs,
@@ -87,8 +87,8 @@ async function main(): Promise<void> {
     reasoningEffort: config.reasoningEffort,
     maxTokens: config.maxTokens,
     fetchImpl: loggingFetch,
-  });
-  const routerModel = new OpenAICompatibleModel({
+  }, config.modelName);
+  const routerModel = new PiModel({
     baseUrl: config.baseUrl,
     apiKey: config.apiKey,
     timeoutMs: config.timeoutMs,
@@ -96,7 +96,7 @@ async function main(): Promise<void> {
     reasoningEffort: config.reasoningEffort,
     maxTokens: config.maxTokens,
     fetchImpl: loggingFetch,
-  });
+  }, config.modelName);
   config.limits.maxConcurrentRuns = Math.min(config.limits.maxConcurrentRuns, 1);
   const runtime = new Runtime({ store, config, workerModel });
   const router = new Router(runtime, routerModel, config);
@@ -201,7 +201,7 @@ async function main(): Promise<void> {
     verdict.lines.push(`Worker ${worker.id}｜${worker.status}｜${worker.stepCount} 步｜${worker.lastError ?? '-'}`);
   }
   verdict.lines.push(
-    `模型调用：worker ${workerModel.httpAttempts} 次 HTTP 尝试，router ${routerModel.httpAttempts} 次（与请求体转储数不同）`,
+    `模型调用：见上表每条记录的 http_attempts（与请求体转储数不同）`,
   );
   store.close();
   report(verdict);

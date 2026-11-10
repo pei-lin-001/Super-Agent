@@ -317,17 +317,27 @@ test('网络：真实 HTTP 服务的正文、重定向、404 与大小限制', a
 
 test('网络：没有搜索凭据时明确报错，不返回伪造结果', async () => {
   const fixture = await setup();
-  const saved = { key: process.env['SEARCH_API_KEY'], tavily: process.env['TAVILY_API_KEY'] };
+  const saved = {
+    key: process.env['SEARCH_API_KEY'],
+    tavily: process.env['TAVILY_API_KEY'],
+    provider: process.env['SEARCH_PROVIDER'],
+    ollama: process.env['OLLAMA_API_KEY'],
+  };
   delete process.env['SEARCH_API_KEY'];
   delete process.env['TAVILY_API_KEY'];
+  // ollama 后端会复用模型凭据，所以"没有凭据"这条要把它的来源也清掉。
+  delete process.env['SEARCH_PROVIDER'];
+  delete process.env['OLLAMA_API_KEY'];
   try {
     await expectFail(
       tool(netTools, 'net_search').run({ query: '测试' }, fixture.context),
-      /尚未配置搜索服务凭据/,
+      /尚未配置搜索凭据/,
     );
   } finally {
     if (saved.key !== undefined) process.env['SEARCH_API_KEY'] = saved.key;
     if (saved.tavily !== undefined) process.env['TAVILY_API_KEY'] = saved.tavily;
+    if (saved.provider !== undefined) process.env['SEARCH_PROVIDER'] = saved.provider;
+    if (saved.ollama !== undefined) process.env['OLLAMA_API_KEY'] = saved.ollama;
     await fixture.harness.cleanup();
   }
 });

@@ -11,7 +11,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadConfig } from '../../src/config.ts';
-import { OpenAICompatibleModel } from '../../src/model/openai.ts';
+import { sseText } from '../sse.ts';
+import { PiModel } from '../../src/model/pi.ts';
 import { Runtime } from '../../src/runtime/runtime.ts';
 import { Store } from '../../src/storage/store.ts';
 
@@ -29,13 +30,8 @@ function slowServer(options: { delayMs: number; respectAbort: boolean }): Promis
     req.on('end', () => {
       const timer = setTimeout(() => {
         try {
-          res.writeHead(200, { 'content-type': 'application/json' });
-          res.end(
-            JSON.stringify({
-              choices: [{ message: { content: '迟到的响应' }, finish_reason: 'stop' }],
-              usage: { prompt_tokens: 1, completion_tokens: 1 },
-            }),
-          );
+          res.writeHead(200, { 'content-type': 'text/event-stream' });
+          res.end(sseText('迟到的响应'));
         } catch {
           // 客户端已断开
         }
@@ -88,14 +84,14 @@ async function setup(port: number): Promise<{
   }
   const config = loadConfig();
   const store = new Store(config.dbPath);
-  const model = new OpenAICompatibleModel({
+  const model = new PiModel({
     baseUrl: config.baseUrl,
     apiKey: config.apiKey,
     timeoutMs: config.timeoutMs,
     retry: 1,
     reasoningEffort: config.reasoningEffort,
     maxTokens: config.maxTokens,
-  });
+  }, 'test-model');
   const runtime = new Runtime({ store, config, workerModel: model });
   runtime.start();
   return {
@@ -236,16 +232,16 @@ test('记账：并发调用各自计算重试次数，不互相串账', async ()
   const env = await setup(server.port);
   try {
     const { RecordingModel } = await import('../../src/model/recorder.ts');
-    const { OpenAICompatibleModel } = await import('../../src/model/openai.ts');
+    const { PiModel } = await import('../../src/model/pi.ts');
     // 每次调用都经过真实 HTTP，成功返回，httpAttempts 应为 1
-    const inner = new OpenAICompatibleModel({
+    const inner = new PiModel({
       baseUrl: `http://127.0.0.1:${server.port}/v1`,
       apiKey: 'k',
       timeoutMs: 30_000,
       retry: 1,
       reasoningEffort: 'low',
       maxTokens: 64,
-    });
+    }, 'test-model');
     const recorder = new RecordingModel(inner, env.store, 'worker', {});
     await Promise.all([
       recorder.chat({ model: 'm', messages: [], tools: [] }),

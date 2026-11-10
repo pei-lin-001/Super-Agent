@@ -1,0 +1,9 @@
+# 这两个是 pi-ai 的传递依赖，只有用到 Google/Bedrock 那几家 provider 才需要
+# 它们的原生构建产物。我们只走 openai-completions，关掉即可，不用每次安装都问。
+allowBuilds:
+  '@google/genai': false
+  protobufjs: false
+minimumReleaseAgeExclude:
+  - '@earendil-works/pi-ai@1.5.1'
+  - '@earendil-works/pi-schema@1.5.1'
+  - '@earendil-works/pi-telemetry@1.5.1'

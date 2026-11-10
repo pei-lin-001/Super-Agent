@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { loadConfig } from '../../src/config.ts';
-import { OpenAICompatibleModel } from '../../src/model/openai.ts';
+import { PiModel } from '../../src/model/pi.ts';
 import { ModelError } from '../../src/model/types.ts';
 import { Runtime } from '../../src/runtime/runtime.ts';
 import { Store } from '../../src/storage/store.ts';
@@ -85,14 +85,14 @@ async function makeHarness(port: number): Promise<Harness> {
   }
   const config = loadConfig();
   const store = new Store(config.dbPath);
-  const model = new OpenAICompatibleModel({
+  const model = new PiModel({
     baseUrl: config.baseUrl,
     apiKey: config.apiKey,
     timeoutMs: config.timeoutMs,
     retry: config.limits.modelRetry,
     reasoningEffort: 'low',
     maxTokens: 64,
-  });
+  }, 'test-model');
   const runtime = new Runtime({ store, config, workerModel: model });
   runtime.start();
   return {
@@ -168,14 +168,14 @@ test('正常停机后重新启动：同一任务能继续推进', async () => {
     const runtime2 = new Runtime({
       store: store2,
       config: config2,
-      workerModel: new OpenAICompatibleModel({
+      workerModel: new PiModel({
         baseUrl: config2.baseUrl,
         apiKey: config2.apiKey,
         timeoutMs: config2.timeoutMs,
         retry: 1,
         reasoningEffort: 'low',
         maxTokens: 64,
-      }),
+      }, 'test-model'),
     });
     const recovered = runtime2.recover();
     runtime2.start();
@@ -224,14 +224,14 @@ test('模型错误分类：取消、超时、网络、提供方各归各的类�
   });
   await new Promise<void>((resolve) => failing.listen(0, '127.0.0.1', resolve));
   const port = (failing.address() as { port: number }).port;
-  const model = new OpenAICompatibleModel({
+  const model = new PiModel({
     baseUrl: `http://127.0.0.1:${port}/v1`,
     apiKey: 'k',
     timeoutMs: 60_000,
     retry: 1,
     reasoningEffort: 'low',
     maxTokens: 32,
-  });
+  }, 'test-model');
   try {
     setTimeout(() => controller.abort(), 300);
     const error = await model
@@ -302,17 +302,17 @@ test('Router 请求中途停机：不写库、不产生未处理异常', async (
   process.on('unhandledRejection', onRejection);
   try {
     const { Router } = await import('../../src/runtime/router.ts');
-    const { OpenAICompatibleModel } = await import('../../src/model/openai.ts');
+    const { PiModel } = await import('../../src/model/pi.ts');
     const router = new Router(
       h.runtime,
-      new OpenAICompatibleModel({
+      new PiModel({
         baseUrl: `http://127.0.0.1:${srv.port}/v1`,
         apiKey: 'k',
         timeoutMs: 60_000,
         retry: 1,
         reasoningEffort: 'low',
         maxTokens: 64,
-      }),
+      }, 'test-model'),
       loadConfig(),
     );
     const pending = router.handleUserMessage('请汇报当前进展').catch(() => undefined);

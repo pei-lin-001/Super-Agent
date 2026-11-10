@@ -53,6 +53,35 @@ function htmlToText(html: string): string {
     .trim();
 }
 
+/**
+ * 搜索后端。两种协议长得一样（POST {query,max_results} → {results:[{title,url,content}]}），
+ * 所以只是端点与凭据来源不同，不需要两套实现。
+ *
+ * ollama 那条是自动推导的：它的检索端点在根路径 `/api/web_search`（不是 `/v1`），
+ * 凭据与模型调用同一个 key，所以配过 ollama 模型就不必再填一遍。
+ */
+function resolveSearchTarget(): { name: string; endpoint: string; apiKey: string; keyHint: string } {
+  const explicitUrl = process.env['SEARCH_API_URL'];
+  const explicitKey = process.env['SEARCH_API_KEY'] ?? process.env['TAVILY_API_KEY'] ?? '';
+  const provider = (process.env['SEARCH_PROVIDER'] ?? '').trim().toLowerCase();
+
+  if (provider === 'ollama' || explicitUrl?.includes('ollama.com')) {
+    const base = (process.env['OLLAMA_BASE_URL'] ?? 'https://ollama.com/v1').replace(/\/+$/, '');
+    return {
+      name: 'ollama cloud 检索',
+      endpoint: explicitUrl ?? `${base.replace(/\/v1$/, '')}/api/web_search`,
+      apiKey: explicitKey || (process.env['SEARCH_API_KEY'] ?? process.env['OLLAMA_API_KEY'] ?? ''),
+      keyHint: 'SEARCH_API_KEY（或 OLLAMA_API_KEY）',
+    };
+  }
+  return {
+    name: '搜索服务',
+    endpoint: explicitUrl ?? 'https://api.tavily.com/search',
+    apiKey: explicitKey,
+    keyHint: 'SEARCH_API_KEY（或 TAVILY_API_KEY）',
+  };
+}
+
 export const netTools: ToolDefinition[] = [
   {
     name: 'net_fetch',
@@ -172,11 +201,11 @@ export const netTools: ToolDefinition[] = [
     async run(args, context) {
       const query = argString(args, 'query');
       const limit = Math.max(1, Math.min(10, argOptionalNumber(args, 'limit') ?? 5));
-      const endpoint = process.env['SEARCH_API_URL'] ?? 'https://api.tavily.com/search';
-      const apiKey = process.env['SEARCH_API_KEY'] ?? process.env['TAVILY_API_KEY'] ?? '';
+      const target = resolveSearchTarget();
+      const { endpoint, apiKey } = target;
       if (apiKey.trim() === '') {
         throw new ToolError(
-          '尚未配置搜索服务凭据：需要 SEARCH_API_KEY（或 TAVILY_API_KEY）。' +
+          `${target.name} 尚未配置搜索凭据：需要 ${target.keyHint}。` +
             '可以在 .env.local 里设置后重启；在此之前请改用 net_fetch 直接访问已知 URL。',
         );
       }

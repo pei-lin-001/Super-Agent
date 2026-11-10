@@ -93,3 +93,16 @@ SOFTWARE.
 | 事件流 | 逐事件驱动 UI | 事件回调未接，状态仍以 `worker_turn` 为唯一事实源 |
 
 MIT 许可要求保留版权声明与许可声明；本仓库以本文件承担该声明义务。
+
+## @earendil-works/pi-ai
+
+- 包名与版本：`@earendil-works/pi-ai@1.5.1`（依赖 pi-schema@1.5.1、pi-telemetry@1.5.1）
+- 许可：MIT（npm 包内 metadata 为 MIT，与 pi-coding-agent 同源）
+- 用途：聊天协议层。`src/model/pi.ts` 通过 `@earendil-works/pi-ai/compat` 的
+  `stream()` 发起请求，复用它的内容块（text/thinking/toolCall/image）、
+  OpenAI 兼容适配器与 usage 归一化。
+- 没有直接 import 上游源码文件，走的是包的公开导出，因此不需要逐文件标注。
+- 我们额外覆盖的行为：`compat.supportsDeveloperRole = false`（让 system 指令
+  保持 `system` role，不被换成 `developer`）；重试关掉由本层负责，
+  以便 `http_attempts` 精确到真正发出的请求数。
+

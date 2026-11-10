@@ -7,7 +7,7 @@ import { randomBytes } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { loadConfig } from '../src/config.ts';
-import { OpenAICompatibleModel } from '../src/model/openai.ts';
+import { PiModel } from '../src/model/pi.ts';
 import { Router } from '../src/runtime/router.ts';
 import { Runtime } from '../src/runtime/runtime.ts';
 import { Store } from '../src/storage/store.ts';
@@ -40,8 +40,8 @@ async function main(): Promise<void> {
     reasoningEffort: config.reasoningEffort,
     maxTokens: config.maxTokens,
   };
-  const workerModel = new OpenAICompatibleModel(modelOptions);
-  const routerModel = new OpenAICompatibleModel(modelOptions);
+  const workerModel = new PiModel(modelOptions, config.modelName);
+  const routerModel = new PiModel(modelOptions, config.modelName);
   config.limits.maxConcurrentRuns = 1;
   const runtime = new Runtime({ store, config, workerModel });
   const router = new Router(runtime, routerModel, config);

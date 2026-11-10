@@ -10,7 +10,7 @@ import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { loadConfig } from '../config.ts';
-import { OpenAICompatibleModel } from '../model/openai.ts';
+import { PiModel } from '../model/pi.ts';
 import { Store } from '../storage/store.ts';
 import { mkdirSync as mkdir, writeFileSync as writeJson } from 'node:fs';
 import { identifyProcess, instancePath, isPidAlive, looksLikeOurProcess, readInstance } from './observer.ts';
@@ -23,14 +23,14 @@ const config = loadConfig();
 const instanceId = `watchdog_${randomBytes(8).toString('hex')}`;
 const store = new Store(config.dbPath, { instanceId });
 
-const model = new OpenAICompatibleModel({
+const model = new PiModel({
   baseUrl: config.baseUrl,
   apiKey: config.apiKey,
   timeoutMs: config.timeoutMs,
   retry: config.limits.modelRetry,
   reasoningEffort: config.reasoningEffort,
   maxTokens: config.maxTokens,
-});
+}, config.modelName);
 
 const stopFile = join(config.workDir, '.runtime', 'watchdog.stop');
 const pidFile = join(config.workDir, '.runtime', 'watchdog.json');

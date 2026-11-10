@@ -12,7 +12,7 @@ import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadConfig } from '../src/config.ts';
-import { OpenAICompatibleModel } from '../src/model/openai.ts';
+import { PiModel } from '../src/model/pi.ts';
 import { ModelRegistry } from '../src/model/registry.ts';
 import { Router } from '../src/runtime/router.ts';
 import { Runtime } from '../src/runtime/runtime.ts';
@@ -50,7 +50,7 @@ if (!aliases.includes('default') || !aliases.includes('strong')) {
 
 const clients = new Map<string, ReturnType<typeof makeClient>>();
 function makeClient(profile: (typeof config.models)[number]) {
-  return new OpenAICompatibleModel({
+  return new PiModel({
     baseUrl: profile.baseUrl,
     apiKey: profile.apiKey,
     timeoutMs: config.timeoutMs,
@@ -58,7 +58,7 @@ function makeClient(profile: (typeof config.models)[number]) {
     reasoningEffort: 'low',
     maxTokens: config.maxTokens,
     label: `accept:${profile.alias}`,
-  });
+  }, profile.model);
 }
 for (const profile of config.models) clients.set(profile.alias, makeClient(profile));
 

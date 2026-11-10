@@ -1096,7 +1096,9 @@ export class Router {
           title: space.title,
           status: space.status,
           currentTask: (() => {
-            const task = this.runtime.store.getTaskByGroup(space.id);
+            // 任务完成后成员休眠、currentTaskId 归空，所以这里取「最近一条任务」，
+            // 而不是「谁现在挂在这个任务上」——Router 要靠它认产物归谁。
+            const task = this.runtime.store.latestTaskForWorkspace(space.id);
             return task ? { id: task.id, title: task.title, status: task.status } : null;
           })(),
           active: active.slice(0, 6).map((worker) => ({

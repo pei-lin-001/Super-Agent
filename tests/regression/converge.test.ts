@@ -9,7 +9,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { loadConfig } from '../../src/config.ts';
-import { OpenAICompatibleModel } from '../../src/model/openai.ts';
+import { sendSse, sseTools } from '../sse.ts';
+import { PiModel } from '../../src/model/pi.ts';
 import { Runtime } from '../../src/runtime/runtime.ts';
 import { Store } from '../../src/storage/store.ts';
 
@@ -40,14 +41,14 @@ async function makeCtx(port: number): Promise<Ctx> {
   }
   const config = loadConfig();
   const store = new Store(config.dbPath);
-  const model = new OpenAICompatibleModel({
+  const model = new PiModel({
     baseUrl: config.baseUrl,
     apiKey: config.apiKey,
     timeoutMs: config.timeoutMs,
     retry: 1,
     reasoningEffort: 'low',
     maxTokens: 64,
-  });
+  }, 'test-model');
   const runtime = new Runtime({ store, config, workerModel: model });
   runtime.start();
   return {
@@ -103,25 +104,13 @@ test('负责人完成、协作者仍在等待时：任务终结后协作者收�
         .join('\n');
       // 用各自独有的 brief 区分：负责人先做完，协作者的请求一直挂着。
       const isOwner = !raw.includes('会迟到');
-      const reply = (name: string, args: Record<string, unknown>, id: string): unknown => ({
-        choices: [
-          {
-            message: {
-              content: null,
-              tool_calls: [{ id, type: 'function', function: { name, arguments: JSON.stringify(args) } }],
-            },
-            finish_reason: 'tool_calls',
-          },
-        ],
-        usage: { prompt_tokens: 5, completion_tokens: 5 },
-      });
+      const reply = (name: string, args: Record<string, unknown>, id: string): string =>
+        sseTools([{ id, name, args }]);
       if (isOwner) {
         if (!outputs.includes('deliverable.md')) {
-          res.writeHead(200, { 'content-type': 'application/json' });
-          res.end(JSON.stringify(reply('artifact_save', { name: 'deliverable.md', content: '# done\n' }, 'o1')));
+          sendSse(res, reply('artifact_save', { name: 'deliverable.md', content: '# done\n' }, 'o1'));
         } else {
-          res.writeHead(200, { 'content-type': 'application/json' });
-          res.end(JSON.stringify(reply('submit_result', { summary: '负责人完成', artifacts: ['deliverable.md'] }, 'o2')));
+          sendSse(res, reply('submit_result', { summary: '负责人完成', artifacts: ['deliverable.md'] }, 'o2'));
         }
         return;
       }
@@ -129,8 +118,7 @@ test('负责人完成、协作者仍在等待时：任务终结后协作者收�
       holds += 1;
       void held.then(() => {
         try {
-          res.writeHead(200, { 'content-type': 'application/json' });
-          res.end(JSON.stringify(reply('fs_write', { path: 'late.txt', content: '迟到写入\n' }, 'l1')));
+          sendSse(res, reply('fs_write', { path: 'late.txt', content: '迟到写入\n' }, 'l1'));
         } catch {
           // 已断开
         }

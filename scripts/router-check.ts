@@ -10,7 +10,7 @@ import { createHash } from 'node:crypto';
 import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { loadConfig } from '../src/config.ts';
-import { OpenAICompatibleModel } from '../src/model/openai.ts';
+import { PiModel } from '../src/model/pi.ts';
 import { Router } from '../src/runtime/router.ts';
 import { Runtime } from '../src/runtime/runtime.ts';
 import { Store } from '../src/storage/store.ts';
@@ -43,8 +43,8 @@ const options = {
   reasoningEffort: config.reasoningEffort,
   maxTokens: config.maxTokens,
 };
-const runtime = new Runtime({ store, config, workerModel: new OpenAICompatibleModel(options) });
-const router = new Router(runtime, new OpenAICompatibleModel(options), config, { readOnly: true });
+const runtime = new Runtime({ store, config, workerModel: new PiModel(options, config.modelName) });
+const router = new Router(runtime, new PiModel(options, config.modelName), config, { readOnly: true });
 
 const beforeTurns = store.listRouterTurns(1000).length;
 console.log(`原库：${dbPath}`);

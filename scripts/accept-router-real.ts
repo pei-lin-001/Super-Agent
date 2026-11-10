@@ -11,7 +11,7 @@ import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadConfig } from '../src/config.ts';
-import { OpenAICompatibleModel } from '../src/model/openai.ts';
+import { PiModel } from '../src/model/pi.ts';
 import { Router } from '../src/runtime/router.ts';
 import { Runtime } from '../src/runtime/runtime.ts';
 import { Store } from '../src/storage/store.ts';
@@ -26,14 +26,14 @@ process.env['MODEL_REASONING_EFFORT'] = process.env['ACCEPT_REASONING'] ?? 'low'
 
 const config = loadConfig();
 const store = new Store(config.dbPath);
-const model = new OpenAICompatibleModel({
+const model = new PiModel({
   baseUrl: config.baseUrl,
   apiKey: config.apiKey,
   timeoutMs: config.timeoutMs,
   retry: config.limits.modelRetry,
   reasoningEffort: config.reasoningEffort,
   maxTokens: config.maxTokens,
-});
+}, config.modelName);
 // Worker 不参与这次验收：让它一步就提交，避免把时间花在业务执行上。
 // 空响应会让 Worker 反复重试（这是另一条链路），这里不给它这个机会。
 let submitSeq = 0;

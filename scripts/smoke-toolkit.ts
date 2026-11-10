@@ -8,7 +8,7 @@ import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadConfig } from '../src/config.ts';
-import { OpenAICompatibleModel } from '../src/model/openai.ts';
+import { PiModel } from '../src/model/pi.ts';
 import { Router } from '../src/runtime/router.ts';
 import { Runtime } from '../src/runtime/runtime.ts';
 import { Store } from '../src/storage/store.ts';
@@ -18,14 +18,14 @@ const runId = `toolkit-${new Date().toISOString().replace(/[-:.TZ]/g, '').slice(
 const config = isolateRun(loadConfig(), runId);
 const store = new Store(config.dbPath);
 const model = () =>
-  new OpenAICompatibleModel({
+  new PiModel({
     baseUrl: config.baseUrl,
     apiKey: config.apiKey,
     timeoutMs: config.timeoutMs,
     retry: config.limits.modelRetry,
     reasoningEffort: config.reasoningEffort,
     maxTokens: config.maxTokens,
-  });
+  }, config.modelName);
 const runtime = new Runtime({ store, config, workerModel: model() });
 const router = new Router(runtime, model(), config);
 runtime.attachRouter(router);

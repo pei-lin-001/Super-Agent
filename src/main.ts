@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { ConfigError, loadConfig } from './config.ts';
 import { ModelRegistry } from './model/registry.ts';
-import { OpenAICompatibleModel } from './model/openai.ts';
+import { PiModel } from './model/pi.ts';
 import { DecisionClient } from './model/decision.ts';
 import type { ModelClient } from './model/types.ts';
 import { Router } from './runtime/router.ts';
@@ -82,7 +82,7 @@ async function main(): Promise<void> {
     if (modelClients.has(profile.alias)) continue;
     modelClients.set(
       profile.alias,
-      new OpenAICompatibleModel({
+      new PiModel({
         baseUrl: profile.baseUrl,
         apiKey: profile.apiKey,
         timeoutMs: config.timeoutMs,
@@ -90,8 +90,8 @@ async function main(): Promise<void> {
         // 逐别名的思考强度：pro 模型要 max，便宜的日常模型跑 max 只是白烧 token。
         reasoningEffort: profile.reasoningEffort ?? config.reasoningEffort,
         maxTokens: config.maxTokens,
-        label: `openai-compatible:${profile.alias}@${profile.baseUrl}`,
-      }),
+        label: `pi:${profile.alias}@${profile.baseUrl}`,
+      }, profile.model),
     );
   }
   const chatProfiles = config.models.filter((item) => item.kind === 'chat');

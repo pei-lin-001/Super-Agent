@@ -48,19 +48,26 @@ export const capabilityTools: ToolDefinition[] = [
       }
 
       lines.push('\n# 联网');
-      const searchKey = process.env['SEARCH_API_KEY'] ?? process.env['TAVILY_API_KEY'] ?? '';
+      const searchKey =
+        process.env['SEARCH_API_KEY'] ?? process.env['TAVILY_API_KEY'] ?? process.env['OLLAMA_API_KEY'] ?? '';
       lines.push(`- net_fetch：可用（HTTP/HTTPS，未知地址请勿猜测）`);
       lines.push(
-        `- net_search：${searchKey.trim() === '' ? '不可用（未配置 SEARCH_API_KEY / TAVILY_API_KEY）' : '已配置'}`,
+        `- net_search：${
+          searchKey.trim() === ''
+            ? '不可用（未配置 SEARCH_API_KEY / TAVILY_API_KEY / OLLAMA_API_KEY）'
+            : `已配置（${process.env['SEARCH_PROVIDER'] === 'ollama' ? 'ollama 检索' : 'tavily'}）`
+        }`,
       );
 
       lines.push('\n# 资料读取');
       lines.push(`- PDF 文本：${probe('pdftotext').ok ? '可用（不支持扫描件 OCR）' : '不可用（缺少 pdftotext）'}`);
       lines.push('- Notebook：可用（读取单元格与文本输出）');
-      const vision = process.env['MODEL_VISION'] === '1';
+      // 默认按可用处理：入站图片会随当轮请求以多模态发出，模型支持就能看见。
+      // 显式 MODEL_VISION=0 才标不可用（换到纯文本模型时用）。
+      const vision = process.env['MODEL_VISION'] !== '0';
       lines.push(
-        `- 图片视觉输入：${vision ? '按配置标记为可用' : '不可用'}（当前消息格式只传文本；` +
-          '仅给出图片路径或 base64 不等于模型看到了图像）',
+        `- 图片视觉输入：${vision ? '可用（入站图片随当轮请求发出）' : '按配置标记为不可用'}；` +
+          '你自己读不到图片文件的内容，但用户在消息里发的图你能看到',
       );
 
       lines.push('\n# 执行与隔离边界');
