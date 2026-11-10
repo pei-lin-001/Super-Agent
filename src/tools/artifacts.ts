@@ -1,4 +1,5 @@
 import { argOptionalNumber, argOptionalString, argString, type ToolDefinition, type ToolOutcome } from './types.ts';
+import { beijingTime } from '../domain/ids.ts';
 
 function ok(content: string): ToolOutcome {
   return { type: 'ok', content };
@@ -100,7 +101,7 @@ export const artifactTools: ToolDefinition[] = [
       if (artifacts.length === 0) return ok('(暂无产物)');
       return ok(
         artifacts
-          .map((item) => `${item.id} ${item.name} v${item.version} ${item.bytes}B ${item.createdAt}`)
+          .map((item) => `${item.id} ${item.name} v${item.version} ${item.bytes}B ${beijingTime(item.createdAt)}`)
           .join('\n'),
       );
     },

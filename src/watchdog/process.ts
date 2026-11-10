@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { Config } from '../config.ts';
-import { clockStamp } from '../domain/ids.ts';
+import { beijingTime, clockStamp } from '../domain/ids.ts';
 import { isPidAlive, looksLikeOurProcess, readInstance } from './observer.ts';
 
 export type MainState = 'absent' | 'exited' | 'unverified' | 'alive' | 'unresponsive';
@@ -258,7 +258,7 @@ export async function restartMainWithRollbackPoint(
   let tag: string | null = null;
   try {
     const { execFileSync } = await import('node:child_process');
-    tag = `restart-before-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+    tag = `restart-before-${beijingTime(new Date()).replace(/[: ]/g, '-')}`;
     execFileSync('git', ['tag', '-f', tag], { cwd: process.cwd(), stdio: 'ignore' });
   } catch {
     tag = null;

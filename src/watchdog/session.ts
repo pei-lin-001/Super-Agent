@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { nowIso } from '../domain/ids.ts';
+import { beijingTime, nowIso } from '../domain/ids.ts';
 import { isTerminalTask } from '../domain/state.ts';
 import type { ChatMessage, ModelClient, ToolSchema } from '../model/types.ts';
 import { RecordingModel } from '../model/recorder.ts';
@@ -604,7 +604,7 @@ export class WatchdogSession {
       .join('\n');
     const actions = store
       .listWdActions(6)
-      .map((action) => `- ${action.createdAt} ${action.action}｜${action.reason}｜结果：${action.result}`)
+      .map((action) => `- ${beijingTime(action.createdAt)} ${action.action}｜${action.reason}｜结果：${action.result}`)
       .join('\n');
 
     let acted = false;

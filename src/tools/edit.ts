@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { beijingTime } from '../domain/ids.ts';
 import { readFile, stat, writeFile } from 'node:fs/promises';
 import { existsSync, statSync } from 'node:fs';
 import { extname, resolve } from 'node:path';
@@ -147,7 +148,7 @@ export const editTools: ToolDefinition[] = [
         `${logical}`,
         `类型：${info.isDirectory() ? '目录' : '文件'}`,
         `大小：${info.size} 字节`,
-        `修改时间：${info.mtime.toISOString()}`,
+        `修改时间：${beijingTime(info.mtime)}（北京时间）`,
       ];
       if (info.isFile() && info.size <= MAX_EDIT_BYTES) {
         const digest = createHash('sha256').update(await readFile(absolute)).digest('hex');

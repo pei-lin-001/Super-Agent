@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import { beijingTime } from '../domain/ids.ts';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Config } from '../config.ts';
@@ -154,7 +155,7 @@ export function observe(store: Store, config: Config): Observation {
 
 export function renderObservation(observation: Observation): string {
   const lines: string[] = [];
-  lines.push(`观察时间：${observation.generatedAt}`);
+  lines.push(`观察时间：${beijingTime(observation.generatedAt)}（北京时间）`);
   lines.push(
     `主系统：${observation.mainAlive ? `运行中（pid=${observation.mainInstance?.pid}）` : '未运行或实例文件缺失'}`,
   );

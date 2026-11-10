@@ -1,4 +1,5 @@
 import type { Task, Worker } from '../domain/types.ts';
+import { beijingTime } from '../domain/ids.ts';
 
 export interface CollaboratorView {
   id: string;
@@ -331,7 +332,7 @@ export function renderWorkspaces(items: {
             .join('、')}${item.dormant.length > 4 ? ` 等 ${item.dormant.length} 人` : ''}`,
         );
       }
-      if (item.lastActiveAt) lines.push(`  最近活动：${item.lastActiveAt}`);
+      if (item.lastActiveAt) lines.push(`  最近活动：${beijingTime(item.lastActiveAt)}`);
       if (item.latestResult) lines.push(`  最近交付：${item.latestResult.slice(0, 80)}`);
       if (item.pending > 0) lines.push(`  待处理：${item.pending} 条未回的消息`);
       return lines.join('\n');

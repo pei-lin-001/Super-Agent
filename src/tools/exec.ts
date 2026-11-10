@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs';
+import { beijingTime } from '../domain/ids.ts';
 import { resolve } from 'node:path';
 import { assertInsideRoot, resolveInside, ToolError } from './paths.ts';
 import {
@@ -222,7 +223,7 @@ export const execTools: ToolDefinition[] = [
         jobs
           .map(
             (job) =>
-              `${describeJob(job)}｜退出码 ${job.exitCode ?? '-'}｜${job.startedAt}` +
+              `${describeJob(job)}｜退出码 ${job.exitCode ?? '-'}｜${beijingTime(job.startedAt)}` +
               `${job.error ? `｜${job.error}` : ''}`,
           )
           .join('\n'),
