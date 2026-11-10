@@ -78,3 +78,14 @@ export function isTerminalWorker(status: WorkerStatus): boolean {
 export function isDormantWorker(status: WorkerStatus): boolean {
   return status === 'dormant';
 }
+
+/**
+ * 不该被调度、也不该被"任务结束"顺手收掉的成员。
+ *
+ * 终态和休眠都不是"正在干活"：前者已经结束，后者在等下一次唤醒。
+ * 凡是"把非活跃成员收掉"的路径都该问这个函数，而不是只问 isTerminalWorker——
+ * 后者会把休眠成员当成活的，然后试图把它转成 cancelled，撞上状态机。
+ */
+export function isInactiveWorker(status: WorkerStatus): boolean {
+  return isTerminalWorker(status) || isDormantWorker(status);
+}

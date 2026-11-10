@@ -306,3 +306,31 @@ test('取消任务不销毁同空间里休眠的成员', async () => {
     await harness.cleanup();
   }
 });
+
+test('休眠成员不参与调度，也不会被「任务已结束」收掉', async () => {
+  const harness = await createHarness({ worker: () => mockReply({ text: 'ok' }) });
+  try {
+    const first = harness.runtime.createTask({ ...brief, title: '第一个', goal: 'g' });
+    harness.store.setWorkerStatus(first.owner.id, 'dormant', '任务完成');
+    harness.store.setWorkerCurrentTask(first.owner.id, null);
+
+    // 调度入口不该把它捞起来（醒来时会先转 queued）
+    harness.runtime.enqueue(first.owner.id);
+    assert.equal(
+      harness.store.getWorker(first.owner.id)?.status,
+      'dormant',
+      '休眠成员不能被直接排进调度，否则 dormant→running 是非法迁移',
+    );
+
+    // 恢复流程遇到任务已结束的休眠成员应当跳过，而不是转 cancelled
+    harness.runtime.start();
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(
+      harness.store.getWorker(first.owner.id)?.status,
+      'dormant',
+      '恢复不该把休眠成员当成「任务已结束」收掉',
+    );
+  } finally {
+    await harness.cleanup();
+  }
+});

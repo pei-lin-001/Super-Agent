@@ -16,7 +16,7 @@ import {
   newWorkerId,
   nowIso,
 } from '../domain/ids.ts';
-import { isDormantWorker, isTerminalTask, isTerminalWorker } from '../domain/state.ts';
+import { isDormantWorker, isInactiveWorker, isTerminalTask, isTerminalWorker } from '../domain/state.ts';
 import { Execution, ExecutionRevoked } from './execution.ts';
 import { runWorkerTurn, toStepResult } from './pi-worker.ts';
 import type { AssistantMessage } from '../vendor/pi/types.ts';
@@ -1585,7 +1585,8 @@ note: null,
     if (targetTask && Number(targetTask.maintenance ?? 0) === 1) return;
     if (this.stopped) return;
     const worker = this.store.getWorker(workerId);
-    if (!worker || isTerminalWorker(worker.status)) return;
+    // 休眠成员不参与调度：唤醒流程会先把它转成 queued 再入队。
+    if (!worker || isInactiveWorker(worker.status)) return;
     if (this.running.has(workerId)) {
       this.rerunRequested.add(workerId);
       return;
@@ -1648,7 +1649,7 @@ note: null,
    */
   private async runWorkerBody(workerId: string): Promise<void> {
     let worker = this.store.getWorker(workerId);
-    if (!worker || isTerminalWorker(worker.status)) return;
+    if (!worker || isInactiveWorker(worker.status)) return;
     let task = this.store.getTaskByGroup(worker.groupId);
     if (!task) {
       await this.failWorker(workerId, '任务不存在');
@@ -2428,7 +2429,7 @@ note: null,
    */
   private settleCancelledRun(workerId: string, reason: string): void {
     const worker = this.store.getWorker(workerId);
-    if (!worker || isTerminalWorker(worker.status)) return;
+    if (!worker || isInactiveWorker(worker.status)) return;
     const task = this.store.getTaskByGroup(worker.groupId);
     if (task) this.store.appendEvent(task.id, workerId, 'run.cancelled', reason);
     if (!task || isTerminalTask(task.status)) {
@@ -2598,7 +2599,8 @@ note: null,
     this.store.resumeStaleRouterSessions();
 
     for (const worker of this.store.listWorkers()) {
-      if (isTerminalWorker(worker.status)) continue;
+      // 休眠成员的任务早就结束了，这正是它休眠的原因；恢复流程不该碰它。
+      if (isInactiveWorker(worker.status)) continue;
       const task = this.store.getTaskByGroup(worker.groupId);
       if (!task || isTerminalTask(task.status)) {
         if (worker.status !== 'cancelled') this.store.setWorkerStatus(worker.id, 'cancelled', '任务已结束');
