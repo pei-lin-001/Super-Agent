@@ -84,7 +84,8 @@ async function main(): Promise<void> {
         apiKey: profile.apiKey,
         timeoutMs: config.timeoutMs,
         retry: config.limits.modelRetry,
-        reasoningEffort: config.reasoningEffort,
+        // 逐别名的思考强度：pro 模型要 max，便宜的日常模型跑 max 只是白烧 token。
+        reasoningEffort: profile.reasoningEffort ?? config.reasoningEffort,
         maxTokens: config.maxTokens,
         label: `openai-compatible:${profile.alias}@${profile.baseUrl}`,
       }),
@@ -92,18 +93,16 @@ async function main(): Promise<void> {
   }
   const workerModel = modelClients.get(config.defaultModelAlias)!;
   const models = new ModelRegistry(config.models, modelClients);
-  const routerModel = new OpenAICompatibleModel({
-    baseUrl: config.baseUrl,
-    apiKey: config.apiKey,
-    timeoutMs: config.timeoutMs,
-    retry: config.limits.modelRetry,
-    reasoningEffort: config.reasoningEffort,
-    maxTokens: config.maxTokens,
-    label: `openai-compatible:${config.baseUrl}`,
-  });
+  // Router 走「模型目录」而不是全局端点：ROUTER_MODEL 填别名时用该别名的
+  // 供应商与凭据，填模型名时退回默认别名的连接。否则跨供应商一换就发错地方。
+  const routerProfile = models.has(config.routerModel)
+    ? config.models.find((item) => item.alias === config.routerModel)!
+    : config.models.find((item) => item.alias === config.defaultModelAlias)!;
+  const routerModel = modelClients.get(routerProfile.alias)!;
+  const routerModelName = models.has(config.routerModel) ? routerProfile.model : config.routerModel;
 
   const runtime = new Runtime({ store, config, workerModel, models });
-  const router = new Router(runtime, routerModel, config);
+  const router = new Router(runtime, routerModel, config, { modelName: routerModelName });
   runtime.attachRouter(router);
 
   // 渠道层纳入同一个 daemon 生命周期，复用同一 Runtime 与 SQLite。
@@ -118,7 +117,7 @@ async function main(): Promise<void> {
     [
       `模型提供方：${config.provider}`,
       `端点：${config.baseUrl}`,
-      `Router 模型：${config.routerModel}　Worker 模型：${config.workerModel}　思考强度：${config.reasoningEffort}`,
+      `Router：${routerProfile.alias}=${routerModelName}　Worker 模型：${config.workerModel}　思考强度：${config.reasoningEffort}`,
       `可用模型：${config.models.map((item) => `${item.alias}=${item.model}`).join('　')}`,
       `数据库：${config.dbPath}`,
       `工作目录：${config.workDir}`,

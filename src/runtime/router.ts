@@ -156,6 +156,7 @@ export class Router {
 
   private readonly runtime: Runtime;
   private readonly model: ModelClient;
+  private readonly modelName: string;
   private readonly config: Config;
   /** 话题的确定性操作：新建/列出/切换都由代码做，模型只表达意图。 */
   private readonly conversations: ConversationService;
@@ -177,10 +178,16 @@ export class Router {
     }
   >();
 
-  constructor(runtime: Runtime, model: ModelClient, config: Config, options: { readOnly?: boolean } = {}) {
+  constructor(
+    runtime: Runtime,
+    model: ModelClient,
+    config: Config,
+    options: { readOnly?: boolean; modelName?: string } = {},
+  ) {
     this.runtime = runtime;
     this.model = model;
     this.config = config;
+    this.modelName = options.modelName ?? config.routerModel;
     this.conversations = new ConversationService(runtime.store);
     this.readOnly = options.readOnly ?? false;
   }
@@ -507,7 +514,7 @@ export class Router {
           // Router 固定走默认模型配置；记下来，便于和 Worker 的调用区分核对。
           modelAlias: this.config.defaultModelAlias,
         }).chat({
-        model: this.config.routerModel,
+        model: this.modelName,
         messages,
         tools: this.readOnly ? [] : ROUTER_TOOLS,
           reasoningEffort: this.config.reasoningEffort,

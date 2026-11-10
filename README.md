@@ -938,6 +938,32 @@ pnpm accept:channel         # 进程级验收：本地假平台，真实启动 d
 
 未恢复的部分：进程崩溃时正在进行的工具调用不会重做，也不会假装成功；模型只能看到「中断」提示并自己核对文件与消息。
 
+### 多供应商与模型别名
+
+`MODEL_CATALOG` 里的每个别名都可以有自己的供应商、端点、凭据和思考强度：
+
+```json
+[{"alias":"default","model":"deepseek-v4.1-flash:1017-cloud","note":"日常执行与协作"},
+ {"alias":"pro","provider":"congee","baseUrl":"https://invite.congee.pro/v1",
+  "apiKeyEnv":"PRO_API_KEY","model":"gpt-6.1-sol","reasoningEffort":"max",
+  "note":"规划、检查、疑难判断","costHint":"按 token 计费"}]
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `baseUrl` | 该别名自己的端点；不写则用全局 `MODEL_BASE_URL` |
+| `apiKeyEnv` | **环境变量名**，不是明文。不写则用全局 `MODEL_API_KEY`；写了但变量不存在会在启动时直接报错，不会静默退回全局凭据 |
+| `reasoningEffort` | 逐别名生效；不写则用全局 `MODEL_REASONING_EFFORT` |
+| `note` / `costHint` | 会原样进 Worker 的提示词，让它在 `create_worker` 时能选；是配置说明，不是实测能力 |
+
+别名不绑定职责：同一个模型既能执行也能检查，同一职责也能由不同模型承担。
+`create_worker` 的 `model` 参数选的就是这里列的别名；不填则沿用创建者自己的配置。
+
+`ROUTER_MODEL` 填别名时，Router 会用该别名的端点与凭据；填模型名时退回默认别名的连接。
+
+**一个坑**：`node --env-file` 不覆盖已经存在的环境变量。如果 shell 里已经有同名的
+`XXX_API_KEY`，`.env.local` 里的值会静默失效——用不冲突的名字。
+
 ### Watchdog 的循环与上下文
 
 Watchdog 与 Worker 走同一条路：循环交给 `src/vendor/pi/agent-loop.ts`（见上方「移植自 pi」），

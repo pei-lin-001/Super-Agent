@@ -40,8 +40,8 @@ function twoModels(config: Config): Config {
   return {
     ...config,
     models: [
-      { alias: 'default', provider: 'mock', baseUrl: 'http://a', apiKey: 'k', model: 'mock-worker', note: '日常执行', costHint: '较低' },
-      { alias: 'strong', provider: 'mock', baseUrl: 'http://b', apiKey: 'k', model: 'glm-5.3-flash', note: '复杂推理', costHint: '较高' },
+      { alias: 'default', provider: 'mock', baseUrl: 'http://a', apiKey: 'k', apiKeyEnv: null, model: 'mock-worker', reasoningEffort: null, note: '日常执行', costHint: '较低' },
+      { alias: 'strong', provider: 'mock', baseUrl: 'http://b', apiKey: 'k', apiKeyEnv: null, model: 'glm-5.3-flash', reasoningEffort: 'max', note: '复杂推理', costHint: '较高' },
     ],
     defaultModelAlias: 'default',
   };
@@ -292,5 +292,52 @@ test('多模型：普通任务不会被强制增加专家环节', async () => {
     await runtime.stop();
     store.close();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('多供应商：每个别名用自己的凭据与思考强度', () => {
+  const before = { ...process.env };
+  try {
+    process.env['OLLAMA_BASE_URL'] = 'https://a.example/v1';
+    process.env['OLLAMA_API_KEY'] = 'key-a';
+    process.env['MODEL_NAME'] = 'model-a';
+    process.env['PRO_API_KEY'] = 'key-b';
+    process.env['MODEL_CATALOG'] = JSON.stringify([
+      { alias: 'default', model: 'model-a' },
+      {
+        alias: 'pro',
+        provider: 'other',
+        baseUrl: 'https://b.example/v1',
+        apiKeyEnv: 'PRO_API_KEY',
+        model: 'model-b',
+        reasoningEffort: 'max',
+      },
+    ]);
+    const config = loadConfig();
+    const pro = config.models.find((item) => item.alias === 'pro')!;
+    assert.equal(pro.apiKey, 'key-b', 'pro 必须用自己的 key，不能退回全局凭据');
+    assert.equal(pro.baseUrl, 'https://b.example/v1');
+    assert.equal(pro.reasoningEffort, 'max');
+    const fallback = config.models.find((item) => item.alias === 'default')!;
+    assert.equal(fallback.apiKey, 'key-a');
+    assert.equal(fallback.reasoningEffort, null, '没写就用全局强度');
+  } finally {
+    process.env = before;
+  }
+});
+
+test('多供应商：apiKeyEnv 指向的变量缺失时明确失败，不静默退回全局凭据', () => {
+  const before = { ...process.env };
+  try {
+    process.env['OLLAMA_BASE_URL'] = 'https://a.example/v1';
+    process.env['OLLAMA_API_KEY'] = 'key-a';
+    process.env['MODEL_NAME'] = 'model-a';
+    delete process.env['MISSING_KEY_ENV'];
+    process.env['MODEL_CATALOG'] = JSON.stringify([
+      { alias: 'pro', baseUrl: 'https://b.example/v1', apiKeyEnv: 'MISSING_KEY_ENV', model: 'model-b' },
+    ]);
+    assert.throws(() => loadConfig(), /MISSING_KEY_ENV/, '缺凭据要在启动时失败，不能带病运行');
+  } finally {
+    process.env = before;
   }
 });

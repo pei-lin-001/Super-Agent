@@ -67,8 +67,17 @@ export interface ModelProfile {
   provider: string;
   baseUrl: string;
   apiKey: string;
+  /**
+   * 凭据来自哪个环境变量。
+   *
+   * 目录里只写变量名、不写明文：跨供应商时每个别名要用不同的 key，
+   * 但明文仍然只能出现在 .env.local 里。
+   */
+  apiKeyEnv: string | null;
   /** 真正发给提供方的模型名。 */
   model: string;
+  /** 该别名的思考强度；为空则用全局 MODEL_REASONING_EFFORT。 */
+  reasoningEffort: string | null;
   /** 来自配置的用途说明，不是实测能力。 */
   note: string | null;
   /** 来自配置的相对成本说明，不是实时价格。 */
@@ -173,7 +182,9 @@ function loadModelProfiles(fallback: {
         provider: fallback.provider,
         baseUrl: fallback.baseUrl,
         apiKey: fallback.apiKey,
+        apiKeyEnv: null,
         model: fallback.modelName,
+        reasoningEffort: null,
         note: null,
         costHint: null,
       },
@@ -202,13 +213,20 @@ function loadModelProfiles(fallback: {
     if (model === '') throw new ConfigError(`MODEL_CATALOG[${index}] 缺少 model`);
     if (seen.has(alias)) throw new ConfigError(`模型别名重复：${alias}`);
     seen.add(alias);
+    // 凭据只能来自环境：目录里写 apiKey 明文一律忽略，只认 apiKeyEnv 指向的变量名。
+    const apiKeyEnv = typeof record['apiKeyEnv'] === 'string' ? record['apiKeyEnv'].trim() : '';
+    const scopedKey = apiKeyEnv === '' ? '' : strEnv(apiKeyEnv, '');
+    if (apiKeyEnv !== '' && scopedKey === '') {
+      throw new ConfigError(`模型别名 ${alias} 的 apiKeyEnv=${apiKeyEnv} 没有对应环境变量`);
+    }
     profiles.push({
       alias,
       provider: typeof record['provider'] === 'string' ? record['provider'] : fallback.provider,
       baseUrl: typeof record['baseUrl'] === 'string' ? record['baseUrl'] : fallback.baseUrl,
-      // 凭据只能来自环境；目录里写 key 一律忽略，避免明文进配置。
-      apiKey: fallback.apiKey,
+      apiKey: scopedKey === '' ? fallback.apiKey : scopedKey,
+      apiKeyEnv: apiKeyEnv === '' ? null : apiKeyEnv,
       model,
+      reasoningEffort: typeof record['reasoningEffort'] === 'string' ? record['reasoningEffort'] : null,
       note: typeof record['note'] === 'string' ? record['note'] : null,
       costHint: typeof record['costHint'] === 'string' ? record['costHint'] : null,
     });
