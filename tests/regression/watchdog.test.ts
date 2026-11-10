@@ -262,7 +262,9 @@ test('在线生效：覆盖项真的进入 Worker 的 system prompt，回滚后�
       }
     ).buildWorkerMessages.bind(harness.runtime);
 
-    const before = (await build(owner, task))[0]!.content ?? '';
+    // 覆盖项属于「每轮都会变」的状态，在最后那条 user 消息里；system 只留稳定规则。
+    const all = async (): Promise<string> => (await build(owner, task)).map((m) => m.content ?? '').join('\n');
+    const before = await all();
     assert.ok(!before.includes('维护者调整'), '默认没有覆盖');
 
     harness.store.insertControlCommand({
@@ -271,7 +273,7 @@ test('在线生效：覆盖项真的进入 Worker 的 system prompt，回滚后�
       source: 'watchdog',
     });
     harness.runtime.tick();
-    const after = (await build(owner, task))[0]!.content ?? '';
+    const after = await all();
     assert.match(after, /维护者调整（v1/, '新版本应进入实际请求');
     assert.match(after, /必须修改项与可选建议/);
 
@@ -281,7 +283,7 @@ test('在线生效：覆盖项真的进入 Worker 的 system prompt，回滚后�
       source: 'watchdog',
     });
     harness.runtime.tick();
-    const rolled = (await build(owner, task))[0]!.content ?? '';
+    const rolled = await all();
     assert.match(rolled, /维护者调整（v1/);
   } finally {
     await harness.cleanup();

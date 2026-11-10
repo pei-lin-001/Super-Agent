@@ -123,13 +123,10 @@ const model = createServer((req, res) => {
       .filter((message) => message.role === 'tool')
       .map((message) => message.content ?? '')
       .join('\n');
+    // 任务卡现在在「系统当前状态」块里（拼在最后那条 user 消息上），不再在 system：
+    // system 只放稳定规则，否则提示缓存的前缀每轮都会失效。所以要扫全部消息。
     const taskIdInContext =
-      (parsed.messages ?? [])
-        // 有些适配器把 system 发成 developer，两种都要认。
-        .filter((message) => message.role === 'system' || message.role === 'developer')
-        .map((message) => message.content ?? '')
-        .join('\n')
-        .match(/task_[a-z0-9]{6,}/)?.[0] ?? '';
+      (parsed.messages ?? []).map((message) => message.content ?? '').join('\n').match(/task_[a-z0-9]{6,}/)?.[0] ?? '';
 
     // pi 的适配器强制流式，假模型也必须回 SSE。
     // 一段流只能有一个 [DONE]：中途结尾会让客户端以为流提前结束、拿不到 finish_reason。

@@ -403,6 +403,7 @@ CREATE TABLE IF NOT EXISTS model_call (
   status       TEXT NOT NULL DEFAULT 'running',
   http_attempts INTEGER,
   prompt_tokens INTEGER,
+  cached_tokens INTEGER,
   completion_tokens INTEGER,
   usage_known  INTEGER NOT NULL DEFAULT 0,
   cancelled    INTEGER NOT NULL DEFAULT 0,

@@ -187,13 +187,27 @@ export function systemText(request: ChatRequest): string {
   return request.messages.find((message) => message.role === 'system')?.content ?? '';
 }
 
+/**
+ * 整个请求里的全部文本（system + 历史 + 本轮）。
+ *
+ * 任务卡、待处理消息这些"每轮都会变"的状态已经从 system 挪到最后的 user 消息里，
+ * 目的是让提示缓存能命中稳定的前缀。断言"某段内容在提示里"时用这个，
+ * 断言"这段内容属于规则而非状态"时才用 systemText。
+ */
+export function allText(request: ChatRequest): string {
+  return request.messages
+    .map((message) => (typeof message.content === 'string' ? message.content : ''))
+    .join('\n');
+}
+
+// 身份与职责在「系统当前状态」块里（跟着最后那条 user 消息走），不在 system。
 export function roleOf(request: ChatRequest): string {
-  const match = systemText(request).match(/- 职责：(.+)/);
+  const match = allText(request).match(/- 职责：(.+)/);
   return match?.[1]?.trim() ?? '';
 }
 
 export function workerIdOf(request: ChatRequest): string {
-  const match = systemText(request).match(/- Worker：(\S+)/);
+  const match = allText(request).match(/- Worker：(\S+)/);
   return match?.[1]?.trim() ?? '';
 }
 
@@ -236,6 +250,17 @@ export function toolResult(request: ChatRequest): string | null {
   return tool ? (tool.content ?? '') : null;
 }
 
+/**
+ * 收件箱（历史里的 user 消息）。
+ *
+ * 要排除最后那条「稳定执行上下文」——它现在排在最末尾（为了缓存命中），
+ * 但它不是收件箱内容。以前它排在历史之前，所以直接拼接不会影响顺序；
+ * 挪到末尾后仍然排除掉，语义才一致。
+ */
 export function inboxOf(request: ChatRequest): string {
-  return request.messages.filter((message) => message.role === 'user').map((message) => message.content ?? '').join('\n');
+  return request.messages
+    .filter((message) => message.role === 'user')
+    .map((message) => message.content ?? '')
+    .filter((text) => !text.includes('稳定执行上下文'))
+    .join('\n');
 }

@@ -9,7 +9,7 @@ import type { ChatMessage, ModelClient, ToolSchema } from '../model/types.ts';
 import type { Runtime } from './runtime.ts';
 import { Execution, ExecutionRevoked } from './execution.ts';
 
-import { renderWorkspaces, routerSystemPrompt } from './prompts.ts';
+import { renderWorkspaces, routerStateBlock, routerSystemPrompt } from './prompts.ts';
 import type { DecisionClient } from '../model/decision.ts';
 import type { ImagePart } from '../model/types.ts';
 import { isDormantWorker, isTerminalWorker } from '../domain/state.ts';
@@ -434,17 +434,14 @@ export class Router {
     const history = context.history
       ? boundRouterHistory({ messages: context.history, limits: this.runtime.config.limits })
       : (assembled?.history ?? []);
-    const messages: ChatMessage[] = [
-      {
-        role: 'system',
-        content: routerSystemPrompt({
-          taskCards: this.renderWorkspaces(sessionKey, conversationId),
-          pendingMessages: pending,
-          conversationNote: assembled?.note ?? null,
-        }),
-      },
-      ...history,
-    ];
+    // system 只放不随时间变的东西（角色规则）。每轮都会变的表单与待处理消息
+    // 挪到历史之后——提示缓存按前缀匹配，把易变内容摆在中间会让后面的历史每轮重算。
+    const stateBlock = routerStateBlock({
+      taskCards: this.renderWorkspaces(sessionKey, conversationId),
+      pendingMessages: pending,
+      conversationNote: assembled?.note ?? null,
+    });
+    const messages: ChatMessage[] = [{ role: 'system', content: routerSystemPrompt() }, ...history];
 
     if (assembled?.toSummarize) {
       // 超阈值：先把被挤出去的旧对话压进摘要，再发请求。
@@ -468,9 +465,11 @@ export class Router {
 
     if (userText !== null) {
       // 图片只挂在这一次请求上；落库的历史只有文字，下一轮不会重发 base64。
+      // 状态块拼在本轮消息前面而不是放进 system：它每轮都变，放 system 里会
+      // 让后面的历史全部失去缓存。落库的只有用户原话，不重复存表单。
       messages.push({
         role: 'user',
-        content: userText,
+        content: `${stateBlock}\n\n# 用户这轮说的话\n${userText}`,
         ...(context.images && context.images.length > 0 ? { images: context.images } : {}),
       });
       this.runtime.store.appendRouterTurn({
@@ -482,7 +481,10 @@ export class Router {
         createdAt: nowIso(),
       });
     } else {
-      messages.push({ role: 'user', content: '以上是 Worker 的最新消息，请判断是否需要向用户汇报或采取动作。' });
+      messages.push({
+        role: 'user',
+        content: `${stateBlock}\n\n# 触发本轮的原因\n以上是 Worker 的最新消息，请判断是否需要向用户汇报或采取动作。`,
+      });
     }
 
     this.publish({ type: 'router.start', sessionKey });

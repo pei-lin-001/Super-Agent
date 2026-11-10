@@ -3,7 +3,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createHarness, systemText } from '../helpers.ts';
+import { allText, createHarness, systemText } from '../helpers.ts';
 import { FakeAdapter, eventOf, serviceOf } from '../channel-helpers.ts';
 import { mockReply } from '../../src/model/mock.ts';
 import { sessionKeyOf } from '../../src/channels/types.ts';
@@ -50,7 +50,7 @@ test('会话隔离：A 聊天发起的任务完成后，结果只回 A', async (
       });
     },
     router: (context) => {
-      const prompt = systemText(context.request);
+      const prompt = allText(context.request);
       prompts.push(prompt);
       // 回信内容取决于这一轮看到的材料：用它区分「回信发给了谁」。
       return mockReply({ text: prompt.includes('A 的结论') ? '转述A的结论' : '普通回复' });
@@ -114,7 +114,7 @@ test('会话隔离：待汇报材料按会话分组，不混成一段总结', as
   const harness = await createHarness({
     worker: () => mockReply({ text: '收到' }),
     router: (context) => {
-      seen.push(systemText(context.request));
+      seen.push(allText(context.request));
       return mockReply({ text: '好' });
     },
   });
@@ -319,7 +319,7 @@ test('Worker 报进度会主动叫醒 Router，且 3 分钟内不重复打断用
   const harness = await createHarness({
     worker: () => mockReply({ text: '收到' }),
     router: (context) => {
-      runs.push(systemText(context.request));
+      runs.push(allText(context.request));
       return mockReply({ text: '进展：它读完了三个文件' });
     },
   });

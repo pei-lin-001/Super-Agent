@@ -185,8 +185,15 @@ export function fromPiMessage(message: AssistantMessage): StepResult {
     toolCalls,
     finishReason: message.stopReason,
     model: message.responseModel ?? message.model,
+    // pi 已经把 usage.input 算成「扣掉缓存之后」的量，缓存命中数单独给出。
+    // 两个都要往下传：只留 input 会让账本比真实消耗小一个数量级。
     usage: message.usage
-      ? { promptTokens: message.usage.input, completionTokens: message.usage.output }
+      ? {
+          promptTokens: message.usage.input,
+          completionTokens: message.usage.output,
+          cacheReadTokens: message.usage.cacheRead,
+          cacheWriteTokens: message.usage.cacheWrite,
+        }
       : null,
   };
 }

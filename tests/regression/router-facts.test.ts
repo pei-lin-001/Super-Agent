@@ -8,7 +8,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createHarness, systemText } from '../helpers.ts';
+import { allText, createHarness, systemText } from '../helpers.ts';
 import { mockReply } from '../../src/model/mock.ts';
 import { MockModel } from '../../src/model/mock.ts';
 import { Router } from '../../src/runtime/router.ts';
@@ -21,12 +21,13 @@ const WX_KEY = sessionKeyOf({ channel: 'weixin', accountId: 'wx_1', peerId: 'own
 const ownerBrief = { ownerRole: '执行者', ownerBrief: '把活干完' };
 
 test('任务卡：只看得到当前会话建的任务，CLI 与别的聊天互不串', async () => {
-  const prompts: Record<string, string> = {};
+  // 按调用顺序收集：本轮消息现在与「系统当前状态」拼在同一条 user 消息里，
+  // 不能再拿它的内容当 key。
+  const prompts: string[] = [];
   const harness = await createHarness({
     worker: () => mockReply({ text: '在跑' }),
     router: ({ request }: { request: ChatRequest }) => {
-      const marker = request.messages.at(-1)?.content ?? '';
-      prompts[marker] = systemText(request);
+      prompts.push(allText(request));
       return mockReply({ text: '好的' });
     },
   });
@@ -46,14 +47,15 @@ test('任务卡：只看得到当前会话建的任务，CLI 与别的聊天互�
     await harness.router.handleUserMessage('cli-ask');
     await harness.router.handleUserMessage('wx-ask', { sessionKey: WX_KEY });
 
-    assert.ok(prompts['tg-ask']!.includes(telegram.task.id), 'Telegram 会话必须看到自己建的任务');
-    assert.ok(!prompts['tg-ask']!.includes(cli.task.id), 'Telegram 会话不能看到 CLI 的任务');
+    assert.equal(prompts.length, 3, '三次提问各触发一次 Router');
+    assert.ok(prompts[0]!.includes(telegram.task.id), 'Telegram 会话必须看到自己建的任务');
+    assert.ok(!prompts[0]!.includes(cli.task.id), 'Telegram 会话不能看到 CLI 的任务');
 
-    assert.ok(prompts['cli-ask']!.includes(cli.task.id), 'CLI 会话必须看到 CLI 建的任务');
-    assert.ok(!prompts['cli-ask']!.includes(telegram.task.id), 'CLI 会话不能看到聊天任务');
+    assert.ok(prompts[1]!.includes(cli.task.id), 'CLI 会话必须看到 CLI 建的任务');
+    assert.ok(!prompts[1]!.includes(telegram.task.id), 'CLI 会话不能看到聊天任务');
 
-    assert.ok(!prompts['wx-ask']!.includes(telegram.task.id), '另一个聊天不能看到 Telegram 的任务');
-    assert.ok(!prompts['wx-ask']!.includes(cli.task.id), '另一个聊天不能看到 CLI 的任务');
+    assert.ok(!prompts[2]!.includes(telegram.task.id), '另一个聊天不能看到 Telegram 的任务');
+    assert.ok(!prompts[2]!.includes(cli.task.id), '另一个聊天不能看到 CLI 的任务');
   } finally {
     await harness.cleanup();
   }
@@ -123,7 +125,8 @@ test('决策检查点：崩溃后从已保存的工具结果续接，不重复�
     router: ({ request }) => {
       const lastUser = [...request.messages].reverse().find((message) => message.role === 'user')?.content ?? '';
       // 只有用户那条输入走"建任务 → 崩溃"的剧本；后台汇报走普通回复。
-      if (lastUser !== '建个任务') return mockReply({ text: '收到进展。' });
+      // 本轮 user 消息前面还会拼「系统当前状态」，所以判结尾而不是判相等。
+      if (!lastUser.trimEnd().endsWith('建个任务')) return mockReply({ text: '收到进展。' });
       if (!hasTaskId(request)) {
         return mockReply({
           toolCalls: [
@@ -188,7 +191,7 @@ test('信道规范：IM 回复有 100 词硬约束，且禁报告体', async () 
   const harness = await createHarness({
     worker: () => mockReply({ text: '在跑' }),
     router: ({ request }: { request: ChatRequest }) => {
-      prompt = systemText(request);
+      prompt = allText(request);
       return mockReply({ text: '好' });
     },
   });

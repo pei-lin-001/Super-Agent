@@ -365,6 +365,8 @@ export class Store {
     ensureColumn('model_call', 'instance_id', 'instance_id TEXT');
     ensureColumn('model_call', 'model_alias', 'model_alias TEXT');
     ensureColumn('model_call', 'response_model', 'response_model TEXT');
+    // 旧库补列：缓存命中数之前没记，账本比真实消耗小一个数量级。
+    ensureColumn('model_call', 'cached_tokens', 'cached_tokens INTEGER');
     ensureColumn('worker', 'run_epoch', 'run_epoch INTEGER NOT NULL DEFAULT 0');
     ensureColumn('message', 'dedupe_key', 'dedupe_key TEXT');
     ensureColumn('message', 'broadcast_id', 'broadcast_id TEXT');
@@ -1226,7 +1228,12 @@ export class Store {
   finishModelCall(input: {
     id: string;
     status: 'ok' | 'failed' | 'cancelled' | 'interrupted';
-    usage?: { promptTokens: number; completionTokens: number } | null;
+    usage?: {
+      promptTokens: number;
+      completionTokens: number;
+      cacheReadTokens?: number;
+      cacheWriteTokens?: number;
+    } | null;
     httpAttempts?: number | null;
     error?: string | null;
     /** 提供方实际返回的模型标识，与请求的模型分开保存。 */
@@ -1235,11 +1242,12 @@ export class Store {
     // usage 缺失记为未知（usage_known=0），不填 0；提供方明确返回的 0 会保留。
     const known = input.usage ? 1 : 0;
     this.run(
-      `UPDATE model_call SET status = ?, prompt_tokens = ?, completion_tokens = ?, usage_known = ?,
-         http_attempts = ?, error = ?, response_model = ?, ended_at = ? WHERE id = ?`,
+      `UPDATE model_call SET status = ?, prompt_tokens = ?, completion_tokens = ?, cached_tokens = ?,
+         usage_known = ?, http_attempts = ?, error = ?, response_model = ?, ended_at = ? WHERE id = ?`,
       input.status,
       input.usage?.promptTokens ?? null,
       input.usage?.completionTokens ?? null,
+      input.usage?.cacheReadTokens ?? null,
       known,
       input.httpAttempts ?? null,
       input.error ?? null,

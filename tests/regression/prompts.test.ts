@@ -3,7 +3,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { renderModelCatalog, routerSystemPrompt, workerSystemPrompt } from '../../src/runtime/prompts.ts';
+import { renderModelCatalog, routerStateBlock, routerSystemPrompt, workerSystemPrompt } from '../../src/runtime/prompts.ts';
 
 function prompt(overrides: Partial<Parameters<typeof workerSystemPrompt>[0]> = {}): string {
   return workerSystemPrompt({
@@ -104,7 +104,7 @@ test('多模型提示词：只在真有多个别名时讲分工，并且讲清�
 });
 
 test('Router 提示词：任务描述不能替用户重写要求', () => {
-  const prompt = routerSystemPrompt({ taskCards: '（无）', pendingMessages: '（无）' });
+  const prompt = routerSystemPrompt();
   assert.match(prompt, /不要替用户重写要求/);
   assert.match(prompt, /照抄比概括安全/, '必须给出可操作的判据');
   assert.match(prompt, /必须做到/);
@@ -153,7 +153,7 @@ test('提示词与最新能力对齐：申请重启、不读凭据、指派模�
 });
 
 test('Router 提示词：知道 model 参数，且默认不填', () => {
-  const prompt = routerSystemPrompt({ taskCards: '（无）', pendingMessages: '（无）' });
+  const prompt = routerSystemPrompt();
   assert.match(prompt, /create_task 的 model 参数/);
   assert.match(prompt, /默认不要填/, '不能让 Router 见任务就派强模型');
   assert.match(prompt, /用强模型做这件事/, '用户明确要求时才填');

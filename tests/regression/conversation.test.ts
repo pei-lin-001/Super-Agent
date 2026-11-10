@@ -5,7 +5,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createHarness, systemText } from '../helpers.ts';
+import { allText, createHarness, systemText } from '../helpers.ts';
 import { FakeAdapter, eventOf, serviceOf } from '../channel-helpers.ts';
 import { mockReply } from '../../src/model/mock.ts';
 import { sessionKeyOf } from '../../src/channels/types.ts';
@@ -36,7 +36,7 @@ test('话题隔离：同一聊天里两个话题的历史互不可见', async ()
   const harness = await createHarness({
     worker: () => mockReply({ text: '收到' }),
     router: (context) => {
-      prompts.push(systemText(context.request));
+      prompts.push(allText(context.request));
       return mockReply({ text: '好的' });
     },
   });
@@ -70,7 +70,10 @@ test('话题隔离：同一聊天里两个话题的历史互不可见', async ()
     // 话题二的 Router 请求里不能带上话题一的内容
     const lastPrompt = prompts[prompts.length - 1]!;
     assert.ok(!lastPrompt.includes('话题一说的秘密'), '话题二不能看到话题一的历史');
-    assert.ok(!lastPrompt.includes('这是话题二说的话'), '历史里不该重复当前这条');
+    // 本轮消息现在与「系统当前状态」拼在同一条 user 里，所以它必然出现；
+    // 要验证的是「历史里没有重复一份」——只出现一次才对。
+    const occurrences = lastPrompt.split('这是话题二说的话').length - 1;
+    assert.equal(occurrences, 1, '历史里不该重复当前这条');
   } finally {
     await harness.cleanup();
   }

@@ -68,7 +68,7 @@ import type {
   WaitOptions,
   WaitResult,
 } from '../tools/types.ts';
-import { workerSystemPrompt } from './prompts.ts';
+import { workerStateBlock, workerSystemPrompt } from './prompts.ts';
 import {
   collectArtifactLines,
   estimateTurnsChars,
@@ -2129,6 +2129,9 @@ note: null,
     const reviews = this.store.listReviews(task.id);
     const note = this.store.latestSuccessfulNote(worker.id);
 
+    // system 只放不随时间变的部分（角色边界 + 工作方法）。任务状态、产物、
+    // 协作者、历史这些每轮都变的挪到历史之后——提示缓存按前缀匹配，
+    // 把它们留在 system 里会让后面的整个历史每轮重算。
     const system = workerSystemPrompt({
       task,
       worker,
@@ -2143,13 +2146,30 @@ note: null,
       modelCatalog: { models: this.models.list(), currentAlias: worker.model ?? this.config.defaultModelAlias },
       override: this.currentOverride(),
     });
+    const stateBlock = workerStateBlock({
+      task,
+      worker,
+      collaborators,
+      isOwner,
+      taskFacts: renderTaskFacts({ task, isOwner, latestUpdate: this.latestUpdateFor(task) }),
+      artifactTable: renderArtifactTable({ task, lines: collectArtifactLines(task, artifacts, reviews) }),
+      noteText: note && note.epoch === task.reviewEpoch ? note.content : null,
+      noteStaleEpoch: note && note.epoch !== task.reviewEpoch ? note.epoch : null,
+      noteCoveredSeq: note?.coveredSeq ?? 0,
+      windowSummary: `近期窗口含 ${plan.turns.length} 条，历史共 ${plan.totalTurns} 条（约 ${plan.totalChars} 字符）`,
+      modelCatalog: { models: this.models.list(), currentAlias: worker.model ?? this.config.defaultModelAlias },
+      override: this.currentOverride(),
+    });
     const history = this.buildHistory(worker, plan);
-    // 无论窗口怎么裁，请求里都必须有一条 user 轮次，否则提供方可能返回空结果。
+    // 排布按「变化频率」从低到高：system（规则）→ directive（成员身份）
+    // → 历史 → 状态块（每轮都变）。提示缓存按前缀匹配，只有把每轮都变的
+    // 内容放在最末尾，前面这一大段才能在下一轮继续命中。
     const directive: ChatMessage = {
       role: 'user',
       content: renderExecutionDirective({ task, worker, isOwner, stepCount: worker.stepCount }),
     };
-    return [{ role: 'system', content: system }, directive, ...history];
+    const stateMessage: ChatMessage = { role: 'user', content: stateBlock };
+    return [{ role: 'system', content: system }, directive, ...history, stateMessage];
   }
 
   /**

@@ -83,7 +83,8 @@ async function withHarness<T>(
       const alreadyCreated = request.messages.some(
         (message) => message.role === 'tool' && (message.content ?? '').includes('已创建任务'),
       );
-      if (lastUser !== '建个任务' || alreadyCreated) {
+      // 本轮 user 消息前面拼了「系统当前状态」，判结尾而不是判相等。
+      if (!lastUser.trimEnd().endsWith('建个任务') || alreadyCreated) {
         // 非法别名的失败也要能被观察到，所以这里不吞结果，只按普通回复收尾。
         return mockReply({ text: '收到。' });
       }

@@ -41,8 +41,19 @@ export interface ToolSchema {
 }
 
 export interface StepUsage {
+  /** 这次真正参与计算的输入 token（已扣掉缓存命中部分）。 */
   promptTokens: number;
   completionTokens: number;
+  /**
+   * 命中提示缓存、因而不重新计算的输入 token。
+   *
+   * 必须单独记：提供方的 prompt_tokens 是「总量」，命中部分按折扣计价但**仍然占额度**。
+   * 只记 promptTokens 会让账本看起来只有实际消耗的几分之一（实测同一前缀重复发，
+   * 2373 总量里 2244 命中，账本里只剩 129）。
+   */
+  cacheReadTokens?: number;
+  /** 这次写入缓存的 token（OpenAI 不报，部分兼容实现会）。 */
+  cacheWriteTokens?: number;
 }
 
 export interface StepResult {

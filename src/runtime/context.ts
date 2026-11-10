@@ -118,23 +118,15 @@ export function renderExecutionDirective(input: {
   /** 已执行的步数；不传则不展示。 */
   stepCount?: number;
 }): string {
-  const { task, worker, isOwner } = input;
+  const { worker, isOwner } = input;
+  // 这里只放「一个成员从生到死都不变」的内容，它排在对话历史之前，
+  // 属于提示缓存的前缀。任务标题、要求版本、步数每轮都变，挪去 workerStateBlock。
   const lines = [
     '（稳定执行上下文，每次调用都会重复提供，不是新消息，不需要回应它）',
-    `- 任务：${task.title}`,
     `- 你的职责：${worker.role}`,
     `- 具体工作：${worker.brief}`,
-    `- 当前要求版本：${task.reviewEpoch}`,
     `- 角色：${isOwner ? '负责人' : '协作者'}`,
   ];
-  // 步数对模型可见：不告诉它成本，它就会把预算花在反复勘察上。
-  // 这是信息，不是限制——没有步数上限时也不会中断执行。
-  if (typeof input.stepCount === 'number' && input.stepCount > 0) {
-    lines.push(`- 已执行：${input.stepCount} 步`);
-    if (input.stepCount >= 40) {
-      lines.push('- 提醒：步数已经不少了。若关键事实已经够用，就把结论落成产物并交付；不要重复勘察同一份材料。');
-    }
-  }
   lines.push('请结合下面的历史继续推进当前工作。');
   return lines.join('\n');
 }

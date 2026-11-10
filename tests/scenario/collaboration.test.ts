@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
-import { createHarness, inboxOf, scripted, systemText, toolResult } from '../helpers.ts';
+import { allText, createHarness, inboxOf, scripted, systemText, toolResult } from '../helpers.ts';
 import { mockReply } from '../../src/model/mock.ts';
 import type { MockHandler } from '../../src/model/mock.ts';
 import type { ChatRequest } from '../../src/model/types.ts';
@@ -187,7 +187,8 @@ test('协作：自主创建协作者、直接沟通、检查引发修改、旧�
   const verifierScript = (_step: number, request: ChatRequest) => {
     const index = bStep++;
     if (index === 0) {
-      assert.match(systemText(request), /同组协作者/);
+      // 协作者列表在「系统当前状态」块里，跟着最后那条 user 消息走。
+      assert.match(allText(request), /同组协作者/);
       return mockReply({ toolCalls: [{ name: 'fs_read', arguments: { path: 'materials/a.md' } }] });
     }
     if (index >= 2) return mockReply({ text: '核对已完成并回复负责人。' });

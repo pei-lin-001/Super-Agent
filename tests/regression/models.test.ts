@@ -12,7 +12,7 @@ import { ModelRegistry } from '../../src/model/registry.ts';
 import type { ModelClient } from '../../src/model/types.ts';
 import { Runtime } from '../../src/runtime/runtime.ts';
 import { Store } from '../../src/storage/store.ts';
-import { workerSystemPrompt } from '../../src/runtime/prompts.ts';
+import { workerStateBlock, workerSystemPrompt } from '../../src/runtime/prompts.ts';
 import { testConfig } from '../helpers.ts';
 
 interface Seen {
@@ -241,10 +241,11 @@ test('多模型：模型目录不会把凭据写进提示词或调用记录', as
     for (let i = 0; i < 300 && seen.length === 0; i += 1) await new Promise((r) => setTimeout(r, 10));
     await runtime.waitForIdle(5_000);
 
-    // 提示词来自 system 段，不在 worker_turn 里；直接构造一次核对。
+    // 模型目录在「系统当前状态」块里（跟着历史之后的 user 消息走），不在 system；
+    // 直接构造一次核对。
     const worker = store.getWorker(owner.id)!;
     const task = store.getTaskByGroup(owner.groupId)!;
-    const system = workerSystemPrompt({
+    const prompt = workerStateBlock({
       task,
       worker,
       collaborators: [],
@@ -257,10 +258,10 @@ test('多模型：模型目录不会把凭据写进提示词或调用记录', as
       windowSummary: '',
       modelCatalog: { models: runtime.models.list(), currentAlias: worker.model },
     });
-    assert.match(system, /可用模型/, '提示词里应有可用模型段');
-    assert.match(system, /strong/, '应列出可选择的别名');
-    assert.ok(!system.includes('test-key'), '凭据不能进入提示词');
-    assert.ok(!system.includes('apiKey'), '凭据字段名也不应出现');
+    assert.match(prompt, /可用模型/, '提示词里应有可用模型段');
+    assert.match(prompt, /strong/, '应列出可选择的别名');
+    assert.ok(!prompt.includes('test-key'), '凭据不能进入提示词');
+    assert.ok(!prompt.includes('apiKey'), '凭据字段名也不应出现');
   } finally {
     await runtime.stop();
     store.close();

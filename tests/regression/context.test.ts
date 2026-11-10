@@ -409,7 +409,7 @@ test('三态：未执行与执行结果未知在历史与工作记录输入中�
   }
 });
 
-test('提示词：长任务触发整理后，system 里包含工作记录、产物表和提交门槛', async () => {
+test('提示词：长任务触发整理后，输入里包含工作记录、产物表和提交门槛', async () => {
   const harness = await createHarness({
     limits: { maxConcurrentRuns: 0, contextWindowChars: 700, noteTriggerTurns: 4, noteTriggerChars: 200 },
     worker: scripted(
@@ -431,13 +431,18 @@ test('提示词：长任务触发整理后，system 里包含工作记录、产�
       }
     ).buildWorkerMessages.bind(harness.runtime);
     const messages = await build(owner, task);
+    // 任务状态、产物表、工作记录都在最后那条 user 消息里（system 只留稳定规则，
+    // 否则提示缓存的前缀每轮都会变）。断言"在输入里"而不是"在 system 里"。
+    const whole = messages.map((message) => message.content ?? '').join('\n');
     const system = messages[0]!.content ?? '';
 
-    assert.match(system, /任务状态（程序记录/, '任务状态来自程序');
-    assert.match(system, /当前产物/, '产物表常驻');
-    assert.match(system, /工作记录/, '整理结果进入 system');
-    assert.match(system, /5180/, '工作记录内容真的进了输入');
-    assert.match(system, /提交门槛/);
+    assert.match(whole, /任务状态（程序记录/, '任务状态来自程序');
+    assert.match(whole, /当前产物/, '产物表常驻');
+    assert.match(whole, /工作记录/, '整理结果进入输入');
+    assert.match(whole, /5180/, '工作记录内容真的进了输入');
+    assert.match(whole, /提交门槛/, '提交门槛来自任务事实，跟着状态走');
+    assert.doesNotMatch(system, /任务状态（程序记录/, '易变的状态不能留在 system，否则缓存失效');
+    assert.doesNotMatch(system, /当前产物/, '产物表每轮都变，同样不能留在 system');
     const note = harness.store.latestSuccessfulNote(owner.id);
     assert.ok(note, '整理记录已落库');
     assert.equal(note!.taskId, task.id);

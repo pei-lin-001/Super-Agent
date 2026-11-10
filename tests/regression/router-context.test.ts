@@ -3,7 +3,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createHarness, systemText } from '../helpers.ts';
+import { allText, createHarness, systemText } from '../helpers.ts';
 import { mockReply } from '../../src/model/mock.ts';
 import { sessionKeyOf } from '../../src/channels/types.ts';
 import type { ChatRequest } from '../../src/model/types.ts';
@@ -38,7 +38,7 @@ test('Router：窗口内不压缩，超出才生成摘要', async () => {
     // 下一轮：摘要必须进 system，早期原文不再进上下文
     await harness.router.handleUserMessage('继续', { sessionKey: TG_KEY });
     const last = calls.filter((request) => !isNoteCall(request)).at(-1)!;
-    const system = systemText(last);
+    const system = allText(last);
     assert.match(system, /SUMMARY_MARK/, '摘要要注入 system，否则等于丢了旧对话');
     assert.match(system, /更早对话的累计记录/);
     const userTurns = last.messages.filter((message) => message.role === 'user');
