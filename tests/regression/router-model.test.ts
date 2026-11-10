@@ -128,9 +128,10 @@ for (const alias of ['pro', 'default']) {
 test('Router 指派模型：指定的别名对应客户端真的收到请求', async () => {
   await withHarness('pro', async ({ router, runtime, seen }) => {
     await router.handleUserMessage('建个任务').catch(() => undefined);
-    // Worker 由调度异步启动：等它真的发起一次请求再断言，不能靠 sleep 猜时长。
-    for (let i = 0; i < 300 && seen.length === 0; i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
-    await runtime.waitForIdle(5_000).catch(() => undefined);
+    // Worker 由调度异步启动：一看到请求落到客户端就立刻继续，不白等固定时长。
+    for (let i = 0; i < 400 && seen.length === 0; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
     assert.ok(seen.includes('pro'), `pro 客户端应收到请求（实际 ${JSON.stringify(seen)}）`);
     assert.ok(!seen.includes('default'), `default 客户端不应被这次指派用到（实际 ${JSON.stringify(seen)}）`);
   });
