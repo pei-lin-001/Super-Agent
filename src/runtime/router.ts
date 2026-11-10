@@ -27,6 +27,11 @@ const ROUTER_TOOLS: ToolSchema[] = [
         require_review: { type: 'boolean', description: '是否必须经过同组检查才能交付' },
         owner_role: { type: 'string', description: '负责人职责摘要' },
         owner_brief: { type: 'string', description: '负责人具体要做什么' },
+        model: {
+          type: 'string',
+          description:
+            '负责人使用的模型别名（可选）。不填则沿用默认别名。填了必须是已配置的别名；未配置会明确报错，不会静默回退。',
+        },
       },
       required: ['title', 'goal', 'owner_role', 'owner_brief'],
     },
@@ -141,6 +146,28 @@ function text(value: unknown, field: string): string {
 
 function optional(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() !== '' ? value : undefined;
+}
+
+/**
+ * 建任务时 Router 指的模型别名。
+ *
+ * 三条边界都要硬：
+ * 1) 没填 → undefined，由 createTask 落到默认别名（旧行为不变）；
+ * 2) 填了目录里没有的 → 报错，不做拼写纠正、不回退默认；
+ * 3) 填了非字符串（数字、对象等）→ 也报错。若当成"没填"，一次写错就会悄悄
+ *    退化成默认模型，调用方还以为自己指派了强模型。
+ */
+function modelAliasArg(value: unknown, available: string[]): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'string') {
+    throw new Error(`model 必须是模型别名字符串，收到 ${typeof value}；可用别名：${available.join(', ')}`);
+  }
+  const alias = value.trim();
+  if (alias === '') return undefined;
+  if (!available.includes(alias)) {
+    throw new Error(`未配置的模型别名：${alias}；可用别名：${available.join(', ')}`);
+  }
+  return alias;
 }
 
 export class Router {
@@ -753,6 +780,9 @@ export class Router {
               requireReview: args['require_review'] === true,
               ownerRole: text(args['owner_role'], 'owner_role'),
               ownerBrief: text(args['owner_brief'], 'owner_brief'),
+              // Router 可以指派负责人模型：别名先按目录校验，未配置直接拒绝，
+              // 不静默回退——否则"指定了强模型"会变成一句空话，没人会发现。
+              model: modelAliasArg(args['model'], this.modelAliases()),
               // 来源与建任务同事务写入：崩溃后回信目标不会丢。
               source: this.sourceOfSession(receipt?.sessionKey ?? null, receipt?.scope?.conversationId ?? null),
             },
@@ -1004,6 +1034,11 @@ export class Router {
       sessionKey,
       conversationId,
     };
+  }
+
+  /** 交给工具层做别名校验：模型目录只有一处真相，不在 Router 里另存一份。 */
+  private modelAliases(): string[] {
+    return this.runtime.models.list().map((item) => item.alias);
   }
 
   private renderTaskCards(sessionKey: string | null = null, conversationId: string | null = null): string {
