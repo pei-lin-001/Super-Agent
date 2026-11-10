@@ -126,3 +126,66 @@ test('搜索后端：ollama 走根路径 /api/web_search，复用模型凭据', 
     process.env = saved;
   }
 });
+
+test('看图工具：图片进工具结果，历史只留文字', async () => {
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'sa-img-'));
+  try {
+    const materials = join(dir, 'materials');
+    mkdirSync(materials, { recursive: true });
+    // 4x4 红点 PNG
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAFklEQVR4nGP8z8DwnwEI/jOAEQMDAAAmBAMBr0f0sAAAAABJRU5ErkJggg==',
+      'base64',
+    );
+    writeFileSync(join(materials, 'shot.png'), png);
+    writeFileSync(join(materials, 'note.svg'), '<svg/>');
+
+    const { fileTools } = await import('../../src/tools/files.ts');
+    const view = fileTools.find((tool) => tool.name === 'fs_view_image')!;
+    const ctx = {
+      worker: { id: 'w' }, task: { id: 'task_x' },
+      workDir: join(dir, 'work'), materialsDir: materials,
+      readRoot: dir, signal: null,
+    } as never;
+
+    const outcome = await view.run({ path: 'materials/shot.png' }, ctx);
+    assert.equal(outcome.type, 'ok');
+    assert.equal(outcome.type === 'ok' && outcome.images?.length, 1, '必须把图本身交出去');
+    assert.equal(outcome.type === 'ok' && outcome.images?.[0]?.mimeType, 'image/png');
+    assert.match(outcome.content, /画面内容见随附图片/);
+
+    // 不支持的格式要说清能看什么，而不是让提供方去报解析错误。
+    await assert.rejects(async () => view.run({ path: 'materials/note.svg' }, ctx), /不支持的图片格式/);
+    await assert.rejects(async () => view.run({ path: 'materials/none.png' }, ctx), /图片不存在/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('工具带图：折成 tool 文本 + 一条带图的 user 消息', async () => {
+  const { toLlmMessages } = await import('../../src/runtime/pi-worker.ts');
+  const { system, chat } = toLlmMessages([
+    {
+      role: 'assistant',
+      content: [{ type: 'toolCall', id: 'c1', name: 'fs_view_image', arguments: { path: 'a.png' } }],
+    } as never,
+    {
+      role: 'toolResult',
+      toolCallId: 'c1',
+      toolName: 'fs_view_image',
+      content: [
+        { type: 'text', text: '已加载 a.png（image/png，4KB）。画面内容见随附图片。' },
+        { type: 'image', data: 'AAA', mimeType: 'image/png' },
+      ],
+      isError: false,
+    } as never,
+  ]);
+  assert.equal(system, '');
+  assert.deepEqual(chat.map((m) => m.role), ['assistant', 'tool', 'user']);
+  // tool 角色只能装文本，图必须另起一条 user 消息（协议不允许 tool 带图）。
+  assert.equal(chat[1]!.images, undefined);
+  assert.deepEqual(chat[2]!.images, [{ mimeType: 'image/png', data: 'AAA' }]);
+});

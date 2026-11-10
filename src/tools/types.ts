@@ -165,7 +165,18 @@ export interface ToolContext {
 }
 
 export type ToolOutcome =
-  | { type: 'ok'; content: string }
+  | {
+      type: 'ok';
+      content: string;
+      /**
+       * 这一轮要交给模型看的图。
+       *
+       * 只有 user 消息能带图（工具的 wire 格式是纯文本），所以协议层会把它们
+       * 折成紧随其后的一条 user 消息。不进历史：落库的是 content 里的文字，
+       * 下一轮不会重发 base64。
+       */
+      images?: { mimeType: string; data: string }[];
+    }
   | {
       type: 'wait';
       content: string;

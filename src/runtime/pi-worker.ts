@@ -194,6 +194,15 @@ export function toLlmMessages(messages: AgentMessage[]): { system: string; chat:
       toolCallId: message.toolCallId,
       ...(message.isError ? { isError: true } : {}),
     });
+    // 工具返回的图片（fs_view_image）不能挂在 tool 消息上——协议的 tool 角色只有文本。
+    // 折成紧随其后的一条 user 消息，正是 pi 的适配器对 toolResult 里图片块的处理方式。
+    const images =
+      typeof message.content === 'string'
+        ? []
+        : message.content
+            .filter((block): block is { type: 'image'; data: string; mimeType: string } => block.type === 'image')
+            .map((block) => ({ mimeType: block.mimeType, data: block.data }));
+    if (images.length > 0) chat.push({ role: 'user', content: '（上面工具返回的图片）', images });
   }
   return { system: systemParts.join('\n\n'), chat };
 }
@@ -380,6 +389,7 @@ export async function runWorkerTurn(input: WorkerTurnInput): Promise<WorkerTurnR
         toolCall,
         executed.outcome.content,
         executed.outcome.type === 'failed',
+        executed.outcome.type === 'ok' ? executed.outcome.images : undefined,
       );
     },
     finishTurn: async (turn) => {
@@ -437,12 +447,22 @@ function toolResultMessage(
   call: PiToolCall,
   text: string,
   isError: boolean,
+  images?: { mimeType: string; data: string }[],
 ): ToolResultMessage {
   return {
     role: 'toolResult',
     toolCallId: call.id,
     toolName: call.name,
-    content: [{ type: 'text', text }],
+    // 图片块放在工具结果里：pi 的适配器会把它拆成「tool 文本 + 一条带 image_url 的
+    // user 消息」，正是协议允许的形状。历史里只落 content 里的文字。
+    content: [
+      { type: 'text', text },
+      ...(images ?? []).map((image) => ({
+        type: 'image' as const,
+        data: image.data,
+        mimeType: image.mimeType,
+      })),
+    ],
     isError,
     timestamp: Date.now(),
   };

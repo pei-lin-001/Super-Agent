@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs';
 import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, resolve } from 'node:path';
-import { assertInsideRoot, normalizeRelativePath, resolveInside } from './paths.ts';
+import { assertInsideRoot, normalizeRelativePath, resolveInside, ToolError } from './paths.ts';
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateHead } from '../vendor/pi/truncate.ts';
 import {
   argOptionalNumber,
@@ -77,6 +77,32 @@ function ok(content: string): ToolOutcome {
   return { type: 'ok', content };
 }
 
+/** 图片只接受这几种：提供方对 svg/bmp 之类支持不一，给过去只会得到解析错误。 */
+const IMAGE_MIME: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+};
+
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+
+async function readImageFile(absolute: string, size: number): Promise<{ mimeType: string; data: string }> {
+  const ext = absolute.slice(absolute.lastIndexOf('.')).toLowerCase();
+  const mimeType = IMAGE_MIME[ext];
+  if (!mimeType) {
+    throw new ToolError(
+      `不支持的图片格式 ${ext || '(无扩展名)'}：只能看 ${Object.keys(IMAGE_MIME).join(' / ')}。` + '其他格式请先转换。',
+    );
+  }
+  if (size > MAX_IMAGE_BYTES) {
+    throw new ToolError(`图片 ${formatSize(size)} 超过 ${formatSize(MAX_IMAGE_BYTES)} 上限，请先缩小。`);
+  }
+  const bytes = await readFile(absolute);
+  return { mimeType, data: bytes.toString('base64') };
+}
+
 export const fileTools: ToolDefinition[] = [
   {
     name: 'fs_list',
@@ -142,6 +168,33 @@ export const fileTools: ToolDefinition[] = [
         }
         return ok(parts.join(''));
       },
+  },
+  {
+    name: 'fs_view_image',
+    description:
+      '看图片（截图、照片、图表、设计稿）。返回图片本身，你能真的看到画面内容——' +
+      '和 fs_read 不同，它读不了二进制。支持 png/jpeg/gif/webp；' +
+      '路径规则与 fs_read 相同（任务目录相对 / materials/ 开头 / 仓库相对 / 绝对）。' +
+      '一次一张；每张都计入当轮上下文，不要为了"确认一下"反复看同一张。',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '图片路径（任务目录相对 / materials/ 开头 / 仓库相对 / 绝对）' },
+      },
+      required: ['path'],
+    },
+    async run(args, context) {
+      const logical = argString(args, 'path');
+      const absolute = resolveReadPath(context, logical);
+      const info = await stat(absolute).catch(() => null);
+      if (!info || !info.isFile()) throw new ToolError(`图片不存在：${logical}`);
+      const view = await readImageFile(absolute, info.size);
+      return {
+        type: 'ok',
+        content: `已加载 ${logical}（${view.mimeType}，${formatSize(info.size)}）。画面内容见随附图片。`,
+        images: [{ mimeType: view.mimeType, data: view.data }],
+      };
+    },
   },
   {
     name: 'fs_write',

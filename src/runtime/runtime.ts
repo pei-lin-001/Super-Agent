@@ -2193,6 +2193,8 @@ note: null,
       role: 'user',
       content:
         '请开始你的工作。材料在 materials/ 目录；读代码或文本用 fs_read（支持任务目录、materials/、仓库相对与绝对路径，超长会提示 offset 续读）。' +
+        'materials/ 里若有图片（png/jpeg/gif/webp），用 fs_view_image 打开——它会把图片本身交给你，' +
+        '你能看到画面内容；fs_read 读不了二进制，别拿它试。' +
         '产物写到任务目录（相对路径即可），完成后按规则交付。',
       toolCalls: null,
       toolCallId: null,
