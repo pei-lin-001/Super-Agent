@@ -232,3 +232,48 @@ test('图片预算：超量的图从最老的开始丢，原位留占位', async
     await new Promise<void>((resolve) => srv.close(() => resolve()));
   }
 });
+
+test('doc_pdf 落盘：转换一次，之后用文件工具检索', async () => {
+  const { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { execFileSync } = await import('node:child_process');
+  // 没有 pdftotext 就跳过：这条测的是落盘，不是 PDF 解析。
+  try {
+    execFileSync('pdftotext', ['-v'], { stdio: 'ignore' });
+  } catch {
+    return;
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'sa-pdf-'));
+  try {
+    // taskDir 是 workDir/<taskId>，和 fs_write 的位置一致。
+    const taskRoot = join(dir, 'task_x');
+    const materials = join(dir, 'materials');
+    mkdirSync(taskRoot, { recursive: true });
+    mkdirSync(materials, { recursive: true });
+    // 用系统自带 PDF 造一份：先生成文本再转 PDF 不可靠，改用 python 写最小 PDF。
+    const pdf =
+      '%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n' +
+      '2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n' +
+      '3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj\n' +
+      '4 0 obj<</Length 44>>stream\nBT /F1 12 Tf 20 100 Td (unmix abundance) Tj ET\nendstream endobj\n' +
+      '5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\n' +
+      'trailer<</Root 1 0 R>>\n%%EOF\n';
+    writeFileSync(join(materials, 'p.pdf'), pdf);
+
+    const { docTools } = await import('../../src/tools/docs.ts');
+    const pdfTool = docTools.find((tool) => tool.name === 'doc_pdf')!;
+    const ctx = {
+      worker: { id: 'w' }, task: { id: 'task_x' },
+      workDir: dir, materialsDir: materials, readRoot: dir, signal: null,
+    } as never;
+
+    const outcome = await pdfTool.run({ path: 'materials/p.pdf', save_to: 'pdf/p.txt' }, ctx);
+    assert.equal(outcome.type, 'ok');
+    assert.match(outcome.content, /已存为 pdf\/p\.txt/, '要给回路径');
+    assert.doesNotMatch(outcome.content, /unmix/, '落盘模式不把正文塞进上下文');
+    assert.match(readFileSync(join(taskRoot, 'pdf', 'p.txt'), 'utf8'), /unmix|abundance/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

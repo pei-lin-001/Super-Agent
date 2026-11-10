@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { assertInsideRoot, resolveInside, ToolError } from './paths.ts';
 import {
   argNumber,
@@ -13,6 +14,14 @@ import {
 import { taskDir } from './files.ts';
 
 const MAX_TEXT = 8_000;
+
+/** 把转换后的全文写进任务目录，并做与 fs_write 相同的越界检查。 */
+function saveText(context: ToolContext, relative: string, text: string): string {
+  const target = resolveInside(taskDir(context), relative);
+  mkdirSync(dirname(target), { recursive: true });
+  writeFileSync(target, text, 'utf8');
+  return relative;
+}
 
 function ok(content: string): ToolOutcome {
   return { type: 'ok', content };
@@ -58,6 +67,13 @@ export const docTools: ToolDefinition[] = [
         from_page: { type: 'number', description: '起始页，从 1 开始' },
         to_page: { type: 'number', description: '结束页（含）' },
         limit: { type: 'number', description: '返回字符上限，默认 8000' },
+        save_to: {
+          type: 'string',
+          description:
+            '把全文另存为任务目录下的文本文件（如 pdf/paper.txt），返回路径而不返回正文。' +
+            '要在文档里反复检索时用它：转换一次，之后用 fs_search / fs_read / proc_run 直接处理，' +
+            '不必每次调用都重新解析 PDF。',
+        },
       },
       required: ['path'],
     },
@@ -86,6 +102,23 @@ export const docTools: ToolDefinition[] = [
         throw new ToolError(`PDF 文本提取失败：${(error as Error).message}`);
       }
       const pages = text.split('\f');
+
+      // 落盘模式：转换一次，之后用 fs_search / fs_read 反复检索。
+      // 每次调用都重新解析一个 9.5MB 的 PDF 是纯浪费，而且模型为了按关键词定位
+      // 只能自己 proc_run pdftotext，等于绕开所有文件工具。
+      const saveTo = argOptionalString(args, 'save_to');
+      if (saveTo !== null) {
+        if (text.trim() === '') {
+          return ok(`${logical}：没有提取到文字。可能是扫描件（图片型 PDF），需要 OCR。`);
+        }
+        const target = saveText(context, saveTo, text);
+        const lines = text.split('\n').length;
+        return ok(
+          `${logical}｜共 ${pages.filter((page) => page.trim() !== '').length} 页有文字，已存为 ${target}（${lines} 行，${text.length} 字符）。\n` +
+            '后续用 fs_search 定位关键词、fs_read 按行读；不要再用 proc_run 重新解析 PDF。',
+        );
+      }
+
       const shown: string[] = [];
       let used = 0;
       for (let index = 0; index < pages.length; index += 1) {

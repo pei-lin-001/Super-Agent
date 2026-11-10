@@ -334,7 +334,7 @@ Router：`create_task` `send_to_worker` `stop_task` `list_tasks` `read_task` `se
 |---|---|---|
 | `net_fetch` | 抓取已知 URL：状态码、最终 URL、内容类型、正文；HTML 提正文，二进制落盘 | 无 |
 | `net_search` | 联网搜索，返回标题/URL/摘要 | `SEARCH_API_KEY`（Tavily）或 `SEARCH_PROVIDER=ollama` 复用模型凭据 |
-| `doc_pdf` | PDF 按页提取文字 | 系统 `pdftotext` |
+| `doc_pdf` | PDF 按页提取文字；`save_to` 可落成任务目录里的 .txt 供反复检索 | 系统 `pdftotext` |
 | `doc_notebook` | 读 .ipynb 的单元格与文本输出 | 无 |
 | `env_capabilities` | 报告当前可用能力（不输出密钥） | 无 |
 

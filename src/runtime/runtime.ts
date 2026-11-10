@@ -1688,6 +1688,8 @@ note: null,
     }
 
     let nudges = 0;
+    // 只提醒一次「先落草稿」：每步都提醒会变成噪音。
+    let artifactNagged = false;
     const resolved = this.models.resolve(worker.model ?? this.config.defaultModelAlias);
 
     const result = await runWorkerTurn({
@@ -1735,6 +1737,20 @@ note: null,
         this.store.bumpWorkerStep(workerId);
         const current = this.store.getWorker(workerId);
         if (current) this.recordAssistantTurn(current, stepResult);
+        // 调研型长任务会把一切攒到最后：实测有任务跑到 105 步才第一次 artifact_save，
+        // 前 17 分钟的推理全在上下文里。进程一崩就全没了。这里只提醒一次，
+        // 不强制——有些任务本来就该先查后写。
+        if (!artifactNagged && task && task.ownerWorkerId === workerId && Number(current?.stepCount ?? 0) >= 30) {
+          artifactNagged = true;
+          if (this.store.listArtifacts(task.id).length === 0) {
+            this.store.appendEvent(task.id, workerId, 'worker.no_artifact', '30 步仍无产物，已提醒先落草稿');
+            this.pushSystemNotice(
+              workerId,
+              '你已经执行了 30 步，还没有保存任何产物。如果调研已经过半，先用 artifact_save 落一份草稿（哪怕不完整）——' +
+                '上下文里的推理不会持久，进程中途退出就全丢了。之后可以继续完善，用同一个文件名覆盖即可。',
+            );
+          }
+        }
         if (stepResult.toolCalls.length === 0 && task && task.ownerWorkerId === workerId) {
           nudges += 1;
           if (nudges === this.config.limits.maxNudges + 1) {
