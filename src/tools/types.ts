@@ -88,6 +88,18 @@ export interface ToolHost {
   submitResult(worker: Worker, summary: string, artifactNames: string[]): Promise<SubmitResult>;
   report(worker: Worker, kind: 'progress' | 'fail' | 'question', body: string, refs?: MessageRefs): ReportResult;
   /**
+   * 叫醒一个休眠成员，接到当前任务上。
+   *
+   * 它记得上次在这个空间里读到什么、试过什么；但旧任务的结论作废，
+   * 由 Runtime 在唤醒通知里写清楚。
+   */
+  wakeWorker(input: {
+    worker: Worker;
+    workerId: string;
+    taskId: string;
+    brief: string;
+  }): { ok: boolean; reason?: string };
+  /**
    * 向 Watchdog 提维护申请（目前只有 restart：让改动真正生效）。
    *
    * 与 report 分开：report 给 Router 是给用户看的话，这个是给独立进程的申请，

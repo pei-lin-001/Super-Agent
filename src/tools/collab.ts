@@ -200,6 +200,34 @@ export const collabTools: ToolDefinition[] = [
     },
   },
   {
+    name: 'wake_worker',
+    description:
+      '叫醒本工作空间里休眠的成员，让它接手当前任务。' +
+      '它记得上次在这个空间里读到什么、试过什么，省掉重新摸底；但旧任务的结论会作废，' +
+      '以当前任务的要求为准。' +
+      '只在"已有成员正适合这件事"时用；不要为同一职责再造一个人。',
+    parameters: {
+      type: 'object',
+      properties: {
+        worker_id: { type: 'string', description: '要叫醒的成员 id，见工作空间表单里的「可唤醒」' },
+        brief: { type: 'string', description: '它这次要做什么：目标、交付内容、边界' },
+      },
+      required: ['worker_id', 'brief'],
+    },
+    run(args, context): ToolOutcome {
+      const task = context.task;
+      if (!task) return { type: 'failed', content: '当前没有可服务的任务' };
+      const result = context.host.wakeWorker({
+        worker: context.worker,
+        workerId: argString(args, 'worker_id'),
+        taskId: task.id,
+        brief: argString(args, 'brief'),
+      });
+      if (!result.ok) return { type: 'failed', content: `唤醒失败：${result.reason ?? '未知原因'}` };
+      return ok(`已唤醒 ${argString(args, 'worker_id')} 接手 ${task.id}。它会在下一轮调度里收到唤醒通知。`);
+    },
+  },
+  {
     name: 'request_maintenance',
     description:
       '向 Watchdog 提维护申请。目前只有 kind=restart：你改的代码需要主系统重启才能生效时用。' +

@@ -1090,6 +1090,10 @@ export class Router {
             steps: Number(worker.stepCount ?? 0),
           })),
           dormantCount,
+          dormant: workers
+            .filter((worker) => isDormantWorker(worker.status))
+            .slice(0, 6)
+            .map((worker) => ({ workerId: worker.id, role: worker.role })),
           lastActiveAt: space.lastActiveAt ? space.lastActiveAt.slice(11, 16) : null,
           latestResult: latestResult?.body ?? null,
           pending: active.reduce((sum, worker) => sum + this.runtime.store.listInbox(worker.id).length, 0),

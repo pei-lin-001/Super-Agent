@@ -133,6 +133,8 @@ ${collabLines}
 # 执行与协作
 - 围绕当前目标和完成条件推进，结论对应具体材料或工具结果；区分已确认事实、推测和未验证部分。缺少关键输入时明确指出，不编造。
 - 简单工作直接完成；有明确分工价值或需要独立核对时，先看已有协作者是否合适，再用 create_worker 创建同组协作者，说明子目标、必要材料、交付内容和边界。创建关系只记录来源，任何 Worker 均可按需创建协作者。
+- **先看能不能叫醒，再决定造不造。** 工作空间表单里「可唤醒」列的是休眠成员——它们在这个空间里干过活，记得仓库结构、工具脾气、上次踩过的坑。让它们接手同类工作，比新建一个从头摸底便宜得多。
+- 同职责已有成员时不要新建：create_worker 会被拒绝，改用 wake_worker 或直接 message_send。
 - 通过 message_send 直接与同组协作。请求用 kind=request，说明问题、预期结果和引用；回复原请求者用 kind=reply，并带 reply_to。只有负责人可以发 update/stop。
 - 普通求助用 intent=help；正式检查用 intent=review，指定具体检查者，并在 refs 中列出要检查的产物 id。发送成功只代表消息已投递，不代表对方已完成。
 - 等待依赖结果时用 wait_for，并尽可能指定 reply_to 或 from；有独立工作可先推进。不要反复轮询或重复催问。依赖工具结果的后续动作，在收到结果后再决定。
@@ -243,6 +245,8 @@ export function renderWorkspaces(items: {
   currentTask: { id: string; title: string; status: string } | null;
   active: { workerId: string; role: string; status: string; doing: string | null; steps: number }[];
   dormantCount: number;
+  /** 休眠成员的 id 与职责：Router 要知道叫醒谁，光知道"有几个人"没用。 */
+  dormant: { workerId: string; role: string }[];
   lastActiveAt: string | null;
   latestResult: string | null;
   pending: number;
@@ -264,6 +268,14 @@ export function renderWorkspaces(items: {
         lines.push(`  - ${member.workerId}（${member.role}）${member.status}｜第 ${member.steps} 步${doing}`);
       }
       if (item.active.length > 4) lines.push(`  - 还有 ${item.active.length - 4} 名活跃成员`);
+      if (item.dormant.length > 0) {
+        lines.push(
+          `  可唤醒：${item.dormant
+            .slice(0, 4)
+            .map((member) => `${member.workerId}（${member.role}）`)
+            .join('、')}${item.dormant.length > 4 ? ` 等 ${item.dormant.length} 人` : ''}`,
+        );
+      }
       if (item.lastActiveAt) lines.push(`  最近活动：${item.lastActiveAt}`);
       if (item.latestResult) lines.push(`  最近交付：${item.latestResult.slice(0, 80)}`);
       if (item.pending > 0) lines.push(`  待处理：${item.pending} 条未回的消息`);

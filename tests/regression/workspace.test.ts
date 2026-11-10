@@ -214,3 +214,50 @@ test('唤醒：同空间限制——不同空间的成员不能接这个任务',
     await harness.cleanup();
   }
 });
+
+test('唤醒工具：worker 能叫醒同空间的休眠成员，跨空间被拒', async () => {
+  const harness = await createHarness({ worker: () => mockReply({ text: 'ok' }) });
+  try {
+    const first = harness.runtime.createTask({ ...brief, title: '第一个', goal: 'g' });
+    const spaceId = first.task.groupId;
+    const sleeper = first.owner;
+    harness.store.setWorkerStatus(sleeper.id, 'dormant', '任务完成');
+    harness.store.setWorkerCurrentTask(sleeper.id, null);
+
+    const second = harness.runtime.createTask({ ...brief, title: '第二个', goal: 'g', workspaceId: spaceId });
+    // 用第二个任务的负责人作为调用者
+    const caller = harness.store.getWorker(second.owner.id)!;
+    const ok = harness.runtime.wakeWorkerFor({
+      worker: caller, workerId: sleeper.id, taskId: second.task.id, brief: '接着做同类工作',
+    });
+    assert.equal(ok.ok, true, ok.reason);
+    assert.equal(harness.store.getWorker(sleeper.id)?.status, 'queued');
+    assert.equal(harness.store.getWorker(sleeper.id)?.currentTaskId, second.task.id);
+
+    // 跨空间：另一个工作空间的成员不能被叫
+    const other = harness.runtime.createTask({ ...brief, title: '别的空间', goal: 'g' });
+    const cross = harness.runtime.wakeWorkerFor({
+      worker: harness.store.getWorker(other.owner.id)!, workerId: sleeper.id, taskId: other.task.id, brief: 'x',
+    });
+    assert.equal(cross.ok, false);
+    assert.match(cross.reason ?? '', /本工作空间/);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('工作空间表单：休眠成员带 id，Router 才知道叫醒谁', async () => {
+  const harness = await createHarness({ worker: () => mockReply({ text: 'ok' }) });
+  try {
+    const { owner } = harness.runtime.createTask({ ...brief, title: 't', goal: 'g' });
+    harness.store.setWorkerStatus(owner.id, 'dormant', '完成');
+    harness.store.setWorkerCurrentTask(owner.id, null);
+
+    const form = (harness.router as unknown as { renderWorkspaces: (s: string | null, c: string | null) => string })
+      .renderWorkspaces(null, null);
+    assert.match(form, /可唤醒/, '休眠成员要能被看见');
+    assert.match(form, new RegExp(owner.id), '要给出成员 id，否则没法唤醒');
+  } finally {
+    await harness.cleanup();
+  }
+});

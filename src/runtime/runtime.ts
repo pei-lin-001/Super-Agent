@@ -1275,6 +1275,24 @@ note: null,
     return { ok: true, artifactIds };
   }
 
+  /** 工具层的唤醒入口：只允许在本任务所在的空间里叫醒成员。 */
+  wakeWorkerFor(input: { worker: Worker; workerId: string; taskId: string; brief: string }): {
+    ok: boolean;
+    reason?: string;
+  } {
+    const target = this.store.getWorker(input.workerId);
+    if (!target) return { ok: false, reason: `找不到成员 ${input.workerId}` };
+    if (target.workspaceId !== input.worker.workspaceId) {
+      return { ok: false, reason: '只能叫醒本工作空间的成员' };
+    }
+    const result = this.wakeWorker({ workerId: input.workerId, taskId: input.taskId, brief: input.brief });
+    if (result.ok) {
+      this.pushSystemNotice(input.worker.id, `已唤醒 ${input.workerId}（${target.role}）接手任务 ${input.taskId}。`);
+      return { ok: true };
+    }
+    return result;
+  }
+
   /**
    * 给 Watchdog 的维护申请。
    *
