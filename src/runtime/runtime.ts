@@ -1558,6 +1558,28 @@ note: null,
     return { ok: true };
   }
 
+  /**
+   * 负责人跑了很多步却还没有任何产物时，提醒先落一份草稿。
+   *
+   * 跨轮去重靠事件表：`artifactNagged` 只在本次 runWorker 内有效，换一轮就会再来一次。
+   * 实测一个任务被提醒了 3 次，第三次之后才落草稿，前两次是纯噪音。
+   * 返回是否真的发了提醒。
+   */
+  nudgeMissingArtifact(workerId: string, taskId: string): boolean {
+    const already = this.store
+      .listEvents(taskId, 2000)
+      .some((event) => event.type === 'worker.no_artifact' && event.workerId === workerId);
+    if (already) return false;
+    if (this.store.listArtifacts(taskId).length > 0) return false;
+    this.store.appendEvent(taskId, workerId, 'worker.no_artifact', '30 步仍无产物，已提醒先落草稿');
+    this.pushSystemNotice(
+      workerId,
+      '你已经执行了 30 步，还没有保存任何产物。如果调研已经过半，先用 artifact_save 落一份草稿（哪怕不完整）——' +
+        '上下文里的推理不会持久，进程中途退出就全丢了。之后可以继续完善，用同一个文件名覆盖即可。',
+    );
+    return true;
+  }
+
   private closeGroup(groupId: string, reason: string, exceptWorkerId?: string): void {
     for (const worker of this.store.listGroupWorkers(groupId)) {
       if (worker.id === exceptWorkerId) continue;
@@ -1746,14 +1768,7 @@ note: null,
         // 不强制——有些任务本来就该先查后写。
         if (!artifactNagged && task && task.ownerWorkerId === workerId && Number(current?.stepCount ?? 0) >= 30) {
           artifactNagged = true;
-          if (this.store.listArtifacts(task.id).length === 0) {
-            this.store.appendEvent(task.id, workerId, 'worker.no_artifact', '30 步仍无产物，已提醒先落草稿');
-            this.pushSystemNotice(
-              workerId,
-              '你已经执行了 30 步，还没有保存任何产物。如果调研已经过半，先用 artifact_save 落一份草稿（哪怕不完整）——' +
-                '上下文里的推理不会持久，进程中途退出就全丢了。之后可以继续完善，用同一个文件名覆盖即可。',
-            );
-          }
+          this.nudgeMissingArtifact(workerId, task.id);
         }
         if (stepResult.toolCalls.length === 0 && task && task.ownerWorkerId === workerId) {
           nudges += 1;

@@ -334,3 +334,21 @@ test('休眠成员不参与调度，也不会被「任务已结束」收掉', as
     await harness.cleanup();
   }
 });
+
+test('「先落草稿」的提醒跨轮只发一次', async () => {
+  const harness = await createHarness({ worker: () => mockReply({ text: 'ok' }) });
+  try {
+    const { task, owner } = harness.runtime.createTask({ ...brief, title: '长任务', goal: 'g' });
+    const first = harness.runtime.nudgeMissingArtifact(owner.id, task.id);
+    const second = harness.runtime.nudgeMissingArtifact(owner.id, task.id);
+    assert.equal(first, true, '第一次该提醒');
+    assert.equal(second, false, '换一轮不该再提醒');
+
+    const nudges = harness.store
+      .listEvents(task.id, 2000)
+      .filter((event) => event.type === 'worker.no_artifact');
+    assert.equal(nudges.length, 1, '同一成员只该被提醒一次，换轮不能重复');
+  } finally {
+    await harness.cleanup();
+  }
+});
