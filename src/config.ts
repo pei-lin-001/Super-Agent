@@ -78,6 +78,13 @@ export interface ModelProfile {
   model: string;
   /** 该别名的思考强度；为空则用全局 MODEL_REASONING_EFFORT。 */
   reasoningEffort: string | null;
+  /**
+   * 这个别名是决策模型（只做分类），不是 chat 模型。
+   *
+   * clef:27b 这类模型走 /v1/systemone，用 chat 接口会直接报错，
+   * 所以选路线时不能只看模型名，要看这个标记。
+   */
+  kind: 'chat' | 'decision';
   /** 来自配置的用途说明，不是实测能力。 */
   note: string | null;
   /** 来自配置的相对成本说明，不是实时价格。 */
@@ -185,6 +192,7 @@ function loadModelProfiles(fallback: {
         apiKeyEnv: null,
         model: fallback.modelName,
         reasoningEffort: null,
+        kind: 'chat',
         note: null,
         costHint: null,
       },
@@ -227,6 +235,7 @@ function loadModelProfiles(fallback: {
       apiKeyEnv: apiKeyEnv === '' ? null : apiKeyEnv,
       model,
       reasoningEffort: typeof record['reasoningEffort'] === 'string' ? record['reasoningEffort'] : null,
+      kind: record['kind'] === 'decision' ? 'decision' : 'chat',
       note: typeof record['note'] === 'string' ? record['note'] : null,
       costHint: typeof record['costHint'] === 'string' ? record['costHint'] : null,
     });

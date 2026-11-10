@@ -10,6 +10,7 @@ import type { Runtime } from './runtime.ts';
 import { Execution, ExecutionRevoked } from './execution.ts';
 
 import { renderWorkspaces, routerSystemPrompt } from './prompts.ts';
+import type { DecisionClient } from '../model/decision.ts';
 import { isDormantWorker, isTerminalWorker } from '../domain/state.ts';
 import { boundRouterHistory, planRouterContext, runRouterNote } from './router-context.ts';
 
@@ -185,6 +186,7 @@ export class Router {
   private readonly runtime: Runtime;
   private readonly model: ModelClient;
   private readonly modelName: string;
+  private readonly classifier: { client: DecisionClient; model: string } | null;
   private readonly config: Config;
   /** 话题的确定性操作：新建/列出/切换都由代码做，模型只表达意图。 */
   private readonly conversations: ConversationService;
@@ -210,7 +212,12 @@ export class Router {
     runtime: Runtime,
     model: ModelClient,
     config: Config,
-    options: { readOnly?: boolean; modelName?: string } = {},
+    options: {
+      readOnly?: boolean;
+      modelName?: string;
+      /** 决策模型：工作空间多到看不完时，用它来选，而不是把全部塞进上下文。 */
+      classifier?: { client: DecisionClient; model: string } | null;
+    } = {},
   ) {
     this.runtime = runtime;
     this.model = model;
@@ -218,6 +225,7 @@ export class Router {
     this.modelName = options.modelName ?? config.routerModel;
     this.conversations = new ConversationService(runtime.store);
     this.readOnly = options.readOnly ?? false;
+    this.classifier = options.classifier ?? null;
   }
 
   /** 把一个执行请求排进所在会话的串行队列；返回这次执行的真实结果。 */
@@ -784,6 +792,13 @@ export class Router {
               // Router 可以指派负责人模型：别名先按目录校验，未配置直接拒绝，
               // 不静默回退——否则"指定了强模型"会变成一句空话，没人会发现。
               model: modelAliasArg(args['model'], this.modelAliases()),
+              // 分类只决定「归到哪个空间」，失败不拦建任务——Router 自己看得见表单。
+              workspaceId: await this.pickWorkspace({
+                title: text(args['title'], 'title'),
+                goal: text(args['goal'], 'goal'),
+                sessionKey: receipt?.sessionKey ?? null,
+                conversationId: receipt?.scope?.conversationId ?? null,
+              }),
               // 来源与建任务同事务写入：崩溃后回信目标不会丢。
               source: this.sourceOfSession(receipt?.sessionKey ?? null, receipt?.scope?.conversationId ?? null),
             },
@@ -1081,6 +1096,41 @@ export class Router {
         };
       }),
     );
+  }
+
+  /**
+   * 这个任务该归到哪个工作空间。
+   *
+   * 空间少的时候不值得多一次调用，直接把名字给 Router 自己看（它本来就有表单）；
+   * 多了才用决策模型——它只吃名字列表，不占 Router 的上下文，而且返回概率，
+   * 不确定时可以退回新建。
+   */
+  async pickWorkspace(input: {
+    title: string;
+    goal: string;
+    sessionKey: string | null;
+    conversationId: string | null;
+  }): Promise<string | null> {
+    const spaces = this.runtime.store.listWorkspacesForConversation(input.sessionKey, input.conversationId);
+    if (!this.classifier || spaces.length < 4) return null;
+    const criteria: Record<string, string> = {};
+    for (const space of spaces.slice(0, 12)) criteria[space.id] = `${space.title}：${space.brief}`.slice(0, 160);
+    criteria['new'] = '以上都不像，新建一个工作空间';
+    try {
+      const picked = await this.classifier.client.choose({
+        model: this.classifier.model,
+        state: `任务标题：${input.title}\n任务目标：${input.goal}\n\n它应该归入哪个工作空间？`,
+        instructions:
+          '判断这个新任务与哪个工作空间的主题最接近。只按主题判断，不要因为"最近用过"就选它；' +
+          '确实都不像就选 new。',
+        criteria,
+      });
+      if (picked.choice === 'new' || !spaces.some((item) => item.id === picked.choice)) return null;
+      return picked.confidence >= 0.6 ? picked.choice : null;
+    } catch {
+      // 分类器不可用不该拦住建任务：退回让 Router 自己选（它看得见表单）。
+      return null;
+    }
   }
 
   /** 成员此刻在做什么：最后一条 assistant 的自然语言，截短。 */

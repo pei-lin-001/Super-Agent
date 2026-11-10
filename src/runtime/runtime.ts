@@ -202,6 +202,7 @@ export class Runtime implements ToolHost {
             apiKeyEnv: null,
             model: options.config.workerModel,
             reasoningEffort: null,
+kind: 'chat',
 note: null,
             costHint: null,
           },
@@ -1499,6 +1500,39 @@ note: null,
       this.store.setWorkerCurrentTask(worker.id, null);
       this.emit({ type: 'worker.status', workerId: worker.id, status: 'dormant' });
     }
+  }
+
+  /**
+   * 把一个休眠成员叫醒，接到新任务上。
+   *
+   * 只唤醒不新建：它保留着上次在这个空间里读到什么、试过什么。但旧任务的结论
+   * 一律不作数——旧目标、旧完成条件、旧检查都在唤醒通知里被明确作废，
+   * 它只带着"环境知识"进入新任务。
+   */
+  wakeWorker(input: { workerId: string; taskId: string; brief: string }): { ok: boolean; reason?: string } {
+    const worker = this.store.getWorker(input.workerId);
+    if (!worker) return { ok: false, reason: '成员不存在' };
+    if (!isDormantWorker(worker.status)) {
+      return { ok: false, reason: `成员当前是 ${worker.status}，只有休眠的成员可以唤醒` };
+    }
+    const task = this.store.getTask(input.taskId);
+    if (!task) return { ok: false, reason: '任务不存在' };
+    if (isTerminalTask(task.status)) return { ok: false, reason: `任务已处于 ${task.status}，不能再派` };
+    if (worker.workspaceId !== task.workspaceId) {
+      return { ok: false, reason: '成员与新任务不在同一个工作空间' };
+    }
+    this.store.setWorkerCurrentTask(worker.id, task.id);
+    this.store.setWorkerStatus(worker.id, 'queued');
+    this.store.updateWorkerBrief(worker.id, input.brief);
+    this.pushSystemNotice(
+      worker.id,
+      `你被重新唤醒，接手任务 ${task.id}（${task.title}）。\n` +
+        '上一个任务的目标、完成条件、检查结论一律作废，不要沿用它的判断。\n' +
+        '可以复用的是环境知识：仓库结构、工具行为、上次踩过的坑。以当前任务的要求为准重新核对。',
+    );
+    this.store.appendEvent(task.id, worker.id, 'worker.woken', input.brief.slice(0, 120));
+    this.enqueue(worker.id);
+    return { ok: true };
   }
 
   private closeGroup(groupId: string, reason: string, exceptWorkerId?: string): void {

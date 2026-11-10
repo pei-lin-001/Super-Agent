@@ -617,6 +617,10 @@ export class Store {
     return { ...worker, status, updatedAt: nowIso(), lastError: error === undefined ? worker.lastError : error };
   }
 
+  updateWorkerBrief(id: string, brief: string): void {
+    this.run('UPDATE worker SET brief = ?, updated_at = ? WHERE id = ?', brief, nowIso(), id);
+  }
+
   /** 成员在为哪个任务干活；null 表示休眠。 */
   setWorkerCurrentTask(id: string, taskId: string | null): void {
     this.run('UPDATE worker SET current_task_id = ?, updated_at = ? WHERE id = ?', taskId, nowIso(), id);

@@ -127,3 +127,90 @@ test('成员限制：达到空间上限后拒绝创建，提示用现有成员',
     await harness.cleanup();
   }
 });
+
+test('分类：空间少时不调决策模型，多时才用，且低置信度退回新建', async () => {
+  const harness = await createHarness({ worker: () => mockReply({ text: 'ok' }) });
+  try {
+    // 少于 4 个空间：不该调分类器
+    let calls = 0;
+    const fake = {
+      client: {
+        choose: async () => {
+          calls += 1;
+          return { choice: 'x', confidence: 0.99, probabilities: {}, usage: null };
+        },
+      } as never,
+      model: 'clef',
+    };
+    const { Router } = await import('../../src/runtime/router.ts');
+    const router = new Router(harness.runtime, harness.routerModel, harness.config, { classifier: fake });
+    harness.runtime.createTask({ ...brief, title: 't', goal: 'g' });
+    const picked = await router.pickWorkspace({ title: 'x', goal: 'y', sessionKey: null, conversationId: null });
+    assert.equal(picked, null, '空间太少时不该调分类器');
+    assert.equal(calls, 0, '一次调用都不该发');
+
+    // 造够 4 个空间后再试：低置信度应当退回 null（新建）
+    for (let index = 0; index < 4; index += 1) {
+      harness.runtime.createTask({ ...brief, title: `空间 ${index}`, goal: 'g' });
+    }
+    const low = {
+      client: { choose: async () => ({ choice: 'whatever', confidence: 0.2, probabilities: {}, usage: null }) } as never,
+      model: 'clef',
+    };
+    const router2 = new Router(harness.runtime, harness.routerModel, harness.config, { classifier: low });
+    const unsure = await router2.pickWorkspace({ title: 'x', goal: 'y', sessionKey: null, conversationId: null });
+    assert.equal(unsure, null, '置信度不足时不要硬选一个空间');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('唤醒：休眠成员接到新任务，旧结论作废但环境知识保留', async () => {
+  const harness = await createHarness({ worker: () => mockReply({ text: 'ok' }) });
+  try {
+    const first = harness.runtime.createTask({ ...brief, title: '第一个任务', goal: 'g1' });
+    const spaceId = first.task.groupId;
+    // 第一个任务结束后成员休眠
+    harness.store.setWorkerStatus(first.owner.id, 'dormant', '任务已完成');
+    harness.store.setWorkerCurrentTask(first.owner.id, null);
+
+    const second = harness.runtime.createTask({
+      ...brief, title: '第二个任务', goal: 'g2', workspaceId: spaceId,
+    });
+    const wake = harness.runtime.wakeWorker({
+      workerId: first.owner.id,
+      taskId: second.task.id,
+      brief: '接手第二个任务',
+    });
+    assert.equal(wake.ok, true, wake.reason);
+
+    const after = harness.store.getWorker(first.owner.id)!;
+    assert.equal(after.status, 'queued', '唤醒后要重新排进调度');
+    assert.equal(after.currentTaskId, second.task.id, '要指向新任务');
+    assert.match(after.brief, /接手第二个任务/, '职责说明要换成新的');
+
+    // 旧结论作废这条必须写进它能看到的地方
+    const inbox = harness.store.listInbox(first.owner.id);
+    const notice = inbox.find((message) => message.body.includes('一律作废'));
+    assert.ok(notice, '唤醒通知必须写明旧任务结论不作废');
+    assert.match(notice!.body, /环境知识/, '同时要说清什么可以复用');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('唤醒：同空间限制——不同空间的成员不能接这个任务', async () => {
+  const harness = await createHarness({ worker: () => mockReply({ text: 'ok' }) });
+  try {
+    const a = harness.runtime.createTask({ ...brief, title: 'A', goal: 'g' });
+    const b = harness.runtime.createTask({ ...brief, title: 'B', goal: 'g' });
+    harness.store.setWorkerStatus(a.owner.id, 'dormant', '完成');
+    const wake = harness.runtime.wakeWorker({
+      workerId: a.owner.id, taskId: b.task.id, brief: 'x',
+    });
+    assert.equal(wake.ok, false);
+    assert.match(wake.reason ?? '', /不在同一个工作空间/);
+  } finally {
+    await harness.cleanup();
+  }
+});

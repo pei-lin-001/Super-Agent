@@ -40,8 +40,8 @@ function twoModels(config: Config): Config {
   return {
     ...config,
     models: [
-      { alias: 'default', provider: 'mock', baseUrl: 'http://a', apiKey: 'k', apiKeyEnv: null, model: 'mock-worker', reasoningEffort: null, note: '日常执行', costHint: '较低' },
-      { alias: 'strong', provider: 'mock', baseUrl: 'http://b', apiKey: 'k', apiKeyEnv: null, model: 'glm-5.3-flash', reasoningEffort: 'max', note: '复杂推理', costHint: '较高' },
+      { alias: 'default', provider: 'mock', baseUrl: 'http://a', apiKey: 'k', apiKeyEnv: null, model: 'mock-worker', reasoningEffort: null, kind: 'chat', note: '日常执行', costHint: '较低' },
+      { alias: 'strong', provider: 'mock', baseUrl: 'http://b', apiKey: 'k', apiKeyEnv: null, model: 'glm-5.3-flash', reasoningEffort: 'max', kind: 'chat', note: '复杂推理', costHint: '较高' },
     ],
     defaultModelAlias: 'default',
   };
@@ -311,6 +311,7 @@ test('多供应商：每个别名用自己的凭据与思考强度', () => {
         apiKeyEnv: 'PRO_API_KEY',
         model: 'model-b',
         reasoningEffort: 'max',
+      kind: 'chat',
       },
     ]);
     const config = loadConfig();

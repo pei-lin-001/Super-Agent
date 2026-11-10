@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { ConfigError, loadConfig } from './config.ts';
 import { ModelRegistry } from './model/registry.ts';
 import { OpenAICompatibleModel } from './model/openai.ts';
+import { DecisionClient } from './model/decision.ts';
 import type { ModelClient } from './model/types.ts';
 import { Router } from './runtime/router.ts';
 import { Runtime } from './runtime/runtime.ts';
@@ -74,8 +75,10 @@ async function main(): Promise<void> {
   heartbeatTimer.unref?.();
   process.on('exit', () => writeInstance(true));
   // 目录里每个别名一个客户端；同一个别名复用同一个实例，避免重复建连接。
+  // 决策模型不是 chat 模型，不在这里建——它们的接口完全不同（见 DecisionClient）。
   const modelClients = new Map<string, ModelClient>();
   for (const profile of config.models) {
+    if (profile.kind === 'decision') continue;
     if (modelClients.has(profile.alias)) continue;
     modelClients.set(
       profile.alias,
@@ -91,18 +94,41 @@ async function main(): Promise<void> {
       }),
     );
   }
-  const workerModel = modelClients.get(config.defaultModelAlias)!;
+  const chatProfiles = config.models.filter((item) => item.kind === 'chat');
+  if (chatProfiles.length === 0) throw new Error('模型目录里没有 chat 模型，只有决策模型时无法启动');
+  const defaultProfile = config.models.find((item) => item.alias === config.defaultModelAlias);
+  const workerModel = modelClients.get((defaultProfile?.kind === 'chat' ? defaultProfile.alias : chatProfiles[0]!.alias))!;
   const models = new ModelRegistry(config.models, modelClients);
   // Router 走「模型目录」而不是全局端点：ROUTER_MODEL 填别名时用该别名的
   // 供应商与凭据，填模型名时退回默认别名的连接。否则跨供应商一换就发错地方。
-  const routerProfile = models.has(config.routerModel)
+  const wanted = models.has(config.routerModel)
     ? config.models.find((item) => item.alias === config.routerModel)!
+    : undefined;
+  const routerProfile = wanted?.kind === 'chat'
+    ? wanted
     : config.models.find((item) => item.alias === config.defaultModelAlias)!;
-  const routerModel = modelClients.get(routerProfile.alias)!;
+  const routerModel = modelClients.get(routerProfile.alias) ?? modelClients.get(chatProfiles[0]!.alias)!;
   const routerModelName = models.has(config.routerModel) ? routerProfile.model : config.routerModel;
 
+  // 决策模型（clef 这类）只做「这个任务该归到哪个工作空间」。
+  // 工作空间少的时候不值得多一次调用，交给 Router 自己看表单选；多了再启用。
+  const decisionProfile = config.models.find((item) => item.kind === 'decision');
+  const classifier = decisionProfile
+    ? new DecisionClient({
+        baseUrl: decisionProfile.baseUrl,
+        apiKey: decisionProfile.apiKey,
+        timeoutMs: config.timeoutMs,
+        label: `decision:${decisionProfile.alias}`,
+      })
+    : null;
+  if (decisionProfile && !decisionProfile.apiKey) {
+    console.error(`决策模型 ${decisionProfile.alias} 没有可用凭据，本次不启用分类`);
+  }
   const runtime = new Runtime({ store, config, workerModel, models });
-  const router = new Router(runtime, routerModel, config, { modelName: routerModelName });
+  const router = new Router(runtime, routerModel, config, {
+    modelName: routerModelName,
+    classifier: classifier && decisionProfile?.apiKey ? { client: classifier, model: decisionProfile.model } : null,
+  });
   runtime.attachRouter(router);
 
   // 渠道层纳入同一个 daemon 生命周期，复用同一 Runtime 与 SQLite。
