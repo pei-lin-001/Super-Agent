@@ -235,7 +235,7 @@ test('独立进程：Watchdog 作为分离进程启动，主系统不在也能�
     const { DatabaseSync } = await import('node:sqlite');
     const db = new DatabaseSync(dbPath, { readOnly: true });
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'wd_%'").all() as { name: string }[];
-    assert.deepEqual(tables.map((t) => t.name).sort(), ['wd_action', 'wd_issue', 'wd_note', 'wd_question', 'wd_turn']);
+    assert.deepEqual(tables.map((t) => t.name).sort(), ['wd_action', 'wd_issue', 'wd_note', 'wd_question', 'wd_request', 'wd_turn']);
     db.close();
   } finally {
     child.kill('SIGTERM');

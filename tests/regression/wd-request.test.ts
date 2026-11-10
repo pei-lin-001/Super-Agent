@@ -46,7 +46,7 @@ test('维护申请：终态任务提申请要被拒', async () => {
     const { task, owner } = harness.runtime.createTask({
       title: 't', goal: 'g', ownerRole: '执行者', ownerBrief: 'b',
     });
-    harness.store.setTaskStatus(task.id, 'cancelled', '测试取消');
+    harness.store.setTaskStatus(task.id, 'cancelled', { reason: '测试取消' });
     const result = harness.runtime.requestMaintenance({
       worker: owner, kind: 'restart', reason: 'x', refs: ['a'],
     });
