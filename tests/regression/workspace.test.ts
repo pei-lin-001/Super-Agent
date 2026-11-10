@@ -281,3 +281,28 @@ test('图片：当轮进 Router 上下文，下一轮不重发 base64', async ()
     await harness.cleanup();
   }
 });
+
+test('取消任务不销毁同空间里休眠的成员', async () => {
+  const harness = await createHarness({ worker: () => mockReply({ text: 'ok' }) });
+  try {
+    const first = harness.runtime.createTask({ ...brief, title: '第一个', goal: 'g' });
+    const spaceId = first.task.groupId;
+    // 第一个任务做完，成员休眠
+    harness.store.setWorkerStatus(first.owner.id, 'dormant', '任务完成');
+    harness.store.setWorkerCurrentTask(first.owner.id, null);
+
+    // 第二个任务被取消
+    const second = harness.runtime.createTask({ ...brief, title: '第二个', goal: 'g', workspaceId: spaceId });
+    harness.runtime.stopTask(second.task.id, "测试取消");
+
+    assert.equal(
+      harness.store.getWorker(first.owner.id)?.status,
+      'dormant',
+      '取消一个任务不该把上一个任务留下的待命成员一起销毁',
+    );
+    // 正在跑的成员由它自己在下一个检查点退出，这里只验证休眠的没被殃及。
+    assert.equal(harness.store.getTask(second.task.id)?.status, 'cancelled');
+  } finally {
+    await harness.cleanup();
+  }
+});

@@ -1562,6 +1562,9 @@ note: null,
     for (const worker of this.store.listGroupWorkers(groupId)) {
       if (worker.id === exceptWorkerId) continue;
       if (isTerminalWorker(worker.status)) continue;
+      // 休眠成员不属于这个任务正在进行的工作：工作空间跨任务存在之后，
+      // 一次任务失败不该把上一个任务留下的待命成员一起销毁。
+      if (isDormantWorker(worker.status)) continue;
       this.store.clearWaitsForWorker(worker.id);
       // 正在运行的 Worker 会在下一个检查点自行退出，这里只处理空闲/等待中的。
       if (worker.status === 'running') continue;
