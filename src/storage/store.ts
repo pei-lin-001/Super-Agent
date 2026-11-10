@@ -1280,6 +1280,67 @@ export class Store {
     return true;
   }
 
+  /** Worker 提的维护申请。refs 是 JSON 数组：commit、文件、命令，供维护者自行核对。 */
+  insertWdRequest(input: {
+    id: string;
+    kind: string;
+    taskId: string | null;
+    workerId: string | null;
+    reason: string;
+    refs: string[];
+  }): void {
+    const now = nowIso();
+    this.run(
+      `INSERT INTO wd_request (id, kind, task_id, worker_id, reason, refs, status, result, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?)`,
+      input.id, input.kind, input.taskId, input.workerId, input.reason,
+      JSON.stringify(input.refs), now, now,
+    );
+  }
+
+  listPendingWdRequests(limit = 10): {
+    id: string;
+    kind: string;
+    taskId: string | null;
+    workerId: string | null;
+    reason: string;
+    refs: string[];
+    createdAt: string;
+  }[] {
+    return this.all(
+      "SELECT * FROM wd_request WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?",
+      limit,
+    ).map((row) => {
+      let refs: string[] = [];
+      const raw = strOrNull(row['refs']);
+      if (raw) {
+        try {
+          const parsed = JSON.parse(raw) as unknown;
+          if (Array.isArray(parsed)) refs = parsed.filter((item): item is string => typeof item === 'string');
+        } catch {
+          // 格式坏掉不该让维护者看不到这条申请；保留空 refs，正文里还有 reason。
+        }
+      }
+      return {
+        id: str(row['id']),
+        kind: str(row['kind']),
+        taskId: strOrNull(row['task_id']),
+        workerId: strOrNull(row['worker_id']),
+        reason: str(row['reason']),
+        refs,
+        createdAt: str(row['created_at']),
+      };
+    });
+  }
+
+  /** 申请只允许从 pending 转一次，重复处理会被这里挡住。 */
+  resolveWdRequest(id: string, status: 'accepted' | 'rejected' | 'done' | 'failed', result: string): boolean {
+    const current = this.get('SELECT status FROM wd_request WHERE id = ?', id) as { status?: unknown } | null;
+    if (!current || str(current.status) !== 'pending') return false;
+    this.run('UPDATE wd_request SET status = ?, result = ?, updated_at = ? WHERE id = ?', status, result, nowIso(), id);
+    return true;
+  }
+
   insertControlCommand(input: { id: string; command: string; payload: string | null; source: string }): void {
     const now = nowIso();
     this.run(

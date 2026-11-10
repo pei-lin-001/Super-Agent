@@ -199,4 +199,47 @@ export const collabTools: ToolDefinition[] = [
       return ok(`已向 Router 发送 ${kind}（${result.messageId}）`);
     },
   },
+  {
+    name: 'request_maintenance',
+    description:
+      '向 Watchdog 提维护申请。目前只有 kind=restart：你改的代码需要主系统重启才能生效时用。' +
+      'Watchdog 是独立进程，会自己核对 git 状态、跑测试，再决定做不做——你说的只是线索，不是结论。' +
+      '调用前必须先 artifact_save 落盘：重启会中断你，成果不能只存在上下文里。' +
+      '只给可核对的东西：commit、改了哪些文件、跑过什么命令，不要写"已完成""测试通过"这类结论。',
+    parameters: {
+      type: 'object',
+      properties: {
+        kind: { type: 'string', enum: ['restart'], description: '申请类型，目前只有 restart' },
+        reason: { type: 'string', description: '一句话说明要重启的原因' },
+        refs: {
+          type: 'array',
+          items: { type: 'string' },
+          description: '可核对的引用：commit 哈希、文件路径、跑过的命令。不要放结论。',
+        },
+      },
+      required: ['kind', 'reason', 'refs'],
+    },
+    run(args, context): ToolOutcome {
+      const kind = argString(args, 'kind');
+      if (kind !== 'restart') return { type: 'failed', content: `未知申请类型：${kind}（目前只支持 restart）` };
+      const refs = argStringArray(args, 'refs');
+      if (refs.length === 0) {
+        return {
+          type: 'failed',
+          content: 'refs 不能为空：维护者要据此核对，至少给出 commit 或改动文件路径',
+        };
+      }
+      const result = context.host.requestMaintenance({
+        worker: context.worker,
+        kind,
+        reason: argString(args, 'reason'),
+        refs,
+      });
+      if (!result.ok) return { type: 'failed', content: `申请失败：${result.reason ?? '未知原因'}` };
+      return ok(
+        `已提交维护申请 ${result.id}。Watchdog 会自己核对后决定；` +
+          '本轮请正常结束，不要反复提交，也不要自行杀进程。',
+      );
+    },
+  },
 ];

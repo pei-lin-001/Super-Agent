@@ -87,6 +87,18 @@ export interface ToolHost {
   registerWait(worker: Worker, options: WaitOptions): WaitResult;
   submitResult(worker: Worker, summary: string, artifactNames: string[]): Promise<SubmitResult>;
   report(worker: Worker, kind: 'progress' | 'fail' | 'question', body: string, refs?: MessageRefs): ReportResult;
+  /**
+   * 向 Watchdog 提维护申请（目前只有 restart：让改动真正生效）。
+   *
+   * 与 report 分开：report 给 Router 是给用户看的话，这个是给独立进程的申请，
+   * 由维护者自己核对 git/测试后决定做不做。执行者说的只是线索，不是结论。
+   */
+  requestMaintenance(input: {
+    worker: Worker;
+    kind: 'restart';
+    reason: string;
+    refs: string[];
+  }): { ok: boolean; id: string; reason?: string };
   saveArtifact(worker: Worker, name: string, content: string): { artifact: Artifact; reused: boolean };
   listArtifacts(taskId: string): Artifact[];
   getArtifact(id: string): Artifact | null;

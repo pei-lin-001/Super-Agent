@@ -340,6 +340,23 @@ CREATE TABLE IF NOT EXISTS wd_note (
   created_at   TEXT NOT NULL
 );
 
+-- Worker 向 Watchdog 提的维护申请。
+-- 与 control_command 分表：那个是「维护者下命令」，这个是「执行者提申请」，
+-- 方向相反，混在一起以后分不清谁在指挥谁。
+CREATE TABLE IF NOT EXISTS wd_request (
+  id         TEXT PRIMARY KEY,
+  kind       TEXT NOT NULL,
+  task_id    TEXT,
+  worker_id  TEXT,
+  reason     TEXT NOT NULL,
+  refs       TEXT,
+  status     TEXT NOT NULL DEFAULT 'pending',
+  result     TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wd_request_status ON wd_request(status, created_at);
+
 CREATE TABLE IF NOT EXISTS wd_issue (
   id          TEXT PRIMARY KEY,
   task_id     TEXT,

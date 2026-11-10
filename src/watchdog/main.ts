@@ -14,7 +14,7 @@ import { OpenAICompatibleModel } from '../model/openai.ts';
 import { Store } from '../storage/store.ts';
 import { mkdirSync as mkdir, writeFileSync as writeJson } from 'node:fs';
 import { identifyProcess, instancePath, isPidAlive, looksLikeOurProcess, readInstance } from './observer.ts';
-import { mainHealth, spawnMain } from './process.ts';
+import { mainHealth, restartMainWithRollbackPoint, spawnMain } from './process.ts';
 import { ProcessService } from '../runtime/process.ts';
 import { WatchdogSession } from './session.ts';
 
@@ -35,13 +35,18 @@ const model = new OpenAICompatibleModel({
 const stopFile = join(config.workDir, '.runtime', 'watchdog.stop');
 const pidFile = join(config.workDir, '.runtime', 'watchdog.json');
 
-/** 拉起主系统。只在确认它确实退出、或 PID 属于无关进程时进行。 */
+/**
+ * 重启主系统。
+ *
+ * 两件事都做：留下回滚点、把活着的进程停掉再拉起。原来是"只拉起已退出的"，
+ * 所以 Worker 改完代码没有任何办法让它生效——杀了自己就没人拉。
+ */
 async function restartMain(): Promise<{ ok: boolean; message: string }> {
   // 停机标记必须在动作执行前重新检查：维护者明确停机时不能被自动拉起。
   if (existsSync(stopFile)) {
     return { ok: false, message: '存在停机标记，不执行自动拉起；需要维护者显式恢复自动维护' };
   }
-  const result = spawnMain(config, { cooldownMs: 120_000 });
+  const result = await restartMainWithRollbackPoint(config, { cooldownMs: 0 });
   return { ok: result.ok, message: result.message };
 }
 
@@ -319,6 +324,50 @@ function dueForReview(): { run: boolean; reason: string } {
   return { run: false, reason: '没有到期事件，也没有新的活跃任务' };
 }
 
+/**
+ * Worker 提的维护申请。
+ *
+ * 申请只是线索，不是结论：Worker 说的「测试通过」不采信，让它自己跑一遍。
+ * 判断权在模型，进程操作在 restart_main 那个程序函数里——两边都不越界。
+ */
+async function runMaintenanceRequests(): Promise<void> {
+  const pending = store.listPendingWdRequests(3);
+  if (pending.length === 0) return;
+  for (const request of pending) {
+    if (existsSync(stopFile)) {
+      store.resolveWdRequest(request.id, 'rejected', '存在停机标记，不执行重启');
+      log(`拒绝维护申请 ${request.id}：存在停机标记`);
+      continue;
+    }
+    const question = [
+      `# Worker 提了一个维护申请：${request.id}`,
+      `类型：${request.kind}｜任务：${request.taskId ?? '-'}｜Worker：${request.workerId ?? '-'}`,
+      `它给的理由：${request.reason}`,
+      `它给的引用：${request.refs.length > 0 ? request.refs.join('、') : '（没有给）'}`,
+      '',
+      '这只是申请，不是结论。它可能判断错，也可能改的代码根本跑不起来。请自己核对后再决定：',
+      '- run_command 看 git status / git diff --stat / git log，确认改动范围与提交',
+      '- 亲自跑它声称跑过的检查（例如 pnpm typecheck），不要采信"测试通过"这句话',
+      '- inspect_task 看任务进度与产物，判断现在重启会不会把半成品打断',
+      '',
+      '决定：',
+      '- 值得 → maintain(action="restart_main", reason="...")。它会先打回滚点、停主系统、拉起、等心跳，然后把结果给你。',
+      '- 不值得 → record 记一个事件说明理由，不要重启。',
+      '- 重启失败（心跳没起来）→ 先 run_command 看 work/.runtime/main.log，再决定重试、回滚（git reset --hard <tag>）还是上报。',
+      '',
+      '结束时写清：你核对了什么、看到什么、做了什么决定、为什么。',
+    ].join('\n');
+    try {
+      const answer = await session.ask(question);
+      store.resolveWdRequest(request.id, 'done', answer.slice(0, 800));
+      log(`维护申请 ${request.id} 已处理：${answer.split('\n')[0]?.slice(0, 140) ?? ''}`);
+    } catch (error) {
+      store.resolveWdRequest(request.id, 'failed', (error as Error).message.slice(0, 400));
+      log(`维护申请 ${request.id} 处理失败：${(error as Error).message}`);
+    }
+  }
+}
+
 async function tick(): Promise<void> {
   if (running) return;
   running = true;
@@ -326,6 +375,9 @@ async function tick(): Promise<void> {
     // 提问与巡检串行：同一时刻只有一个维护会话在动。
     // 提问优先于停机标记：停机只表示"不要自动拉起主系统"，不影响回答人的问题。
     await runQuestionWorker();
+    // 维护申请排在巡检之前：它有时效性（Worker 正卡在那里等），而巡检是周期性的。
+    // 停机标记由 runMaintenanceRequests 内部检查，命中时把申请标成 rejected 而不是丢掉。
+    await runMaintenanceRequests();
     if (existsSync(stopFile)) {
       log('发现停机标记，等待恢复维护（不会自动重启主系统）');
       return;

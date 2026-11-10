@@ -1228,6 +1228,41 @@ note: null,
     return { ok: true, artifactIds };
   }
 
+  /**
+   * 给 Watchdog 的维护申请。
+   *
+   * 只落库，不做任何进程操作——执行者在主系统里，杀进程等于杀自己。
+   * 真正的重启由独立进程（watchdog）核对后执行。
+   */
+  requestMaintenance(input: {
+    worker: Worker;
+    kind: 'restart';
+    reason: string;
+    refs: string[];
+  }): { ok: boolean; id: string; reason?: string } {
+    const task = this.store.getTaskByGroup(input.worker.groupId);
+    if (!task) return { ok: false, id: '', reason: '任务不存在' };
+    if (isTerminalTask(task.status)) {
+      return { ok: false, id: '', reason: `任务已是终态（${task.status}），不需要重启生效` };
+    }
+    const id = `wdr_${newMessageId().replace(/^msg_/, '')}`;
+    this.store.insertWdRequest({
+      id,
+      kind: input.kind,
+      taskId: task.id,
+      workerId: input.worker.id,
+      reason: input.reason,
+      refs: input.refs,
+    });
+    // 申请本身也是阶段变化：让维护者和其他成员知道有人要求过重启。
+    this.pushSystemNotice(
+      input.worker.id,
+      `已提交维护申请 ${id}（${input.kind}）。Watchdog 会核对后决定；` +
+        '不要自行杀进程，也不要反复提交。',
+    );
+    return { ok: true, id };
+  }
+
   report(worker: Worker, kind: 'progress' | 'fail' | 'question', body: string, refs?: MessageRefs): ReportResult {
     const task = this.store.getTaskByGroup(worker.groupId);
     if (!task) return { ok: false, reason: '任务不存在' };

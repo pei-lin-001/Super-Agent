@@ -773,7 +773,7 @@ test('补材料：负责人被通知、要求版本推进；终态任务拒绝�
 });
 
 test('凭据文件：fs_* 一律拒绝读取 .env*', async () => {
-  const harness = await createHarness({});
+  const harness = await createHarness({ worker: () => mockReply({ text: 'ok' }) });
   try {
     const { owner } = harness.runtime.createTask({ title: 't', goal: 'g', ownerRole: 'r', ownerBrief: 'b' });
     const context = {
