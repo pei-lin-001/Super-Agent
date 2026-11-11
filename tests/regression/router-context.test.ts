@@ -70,3 +70,30 @@ test('Router：续接路径与正常轮受同一预算约束', async () => {
     await harness.cleanup();
   }
 });
+
+
+test('Router 请求：状态在历史后且不会写入持久对话', async () => {
+  const calls: ChatRequest[] = [];
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    router: ({ request }) => { calls.push(request); return mockReply({ text: '好的' }); },
+  });
+  try {
+    await harness.router.handleUserMessage('第一句话', { sessionKey: TG_KEY });
+    harness.runtime.createTask({ title: '状态变化标记', goal: 'g', ownerRole: '负责人', ownerBrief: 'b',
+      source: { channel: 'telegram', accountId: 'bot_1', peerId: 'owner-1', sessionKey: TG_KEY, conversationId: harness.store.currentConversationId(TG_KEY) } });
+    await harness.router.handleUserMessage('第二句话', { sessionKey: TG_KEY });
+    const first = calls[0]!.messages;
+    const second = calls[1]!.messages;
+    assert.equal(second[0]!.content, first[0]!.content);
+    const historyIndex = second.findIndex((message) => message.content === '第一句话');
+    const stateIndex = second.findIndex((message) => (message.content ?? '').includes('系统当前状态'));
+    assert.ok(historyIndex > 0 && stateIndex > historyIndex);
+    assert.match(second[stateIndex]!.content ?? '', /状态变化标记/);
+    const stored = harness.store.listRouterTurns(100, TG_KEY);
+    assert.ok(stored.some((turn) => turn.content === '第一句话'));
+    assert.ok(stored.every((turn) => !(turn.content ?? '').includes('系统当前状态')));
+  } finally {
+    await harness.cleanup();
+  }
+});

@@ -25,8 +25,8 @@ const ROUTER_TOOLS: ToolSchema[] = [
       properties: {
         title: { type: 'string', description: '任务标题，一句话' },
         goal: { type: 'string', description: '给全组看的共同目标' },
-        brief: { type: 'string', description: '背景材料、约束、输入位置' },
-        done_criteria: { type: 'string', description: '可验证的完成条件' },
+        brief: { type: 'string', description: '背景材料、用户约束和输入位置；可调整的方法不要写成用户要求' },
+        done_criteria: { type: 'string', description: '用户要求的结果与验收条件，不额外添加方法性门槛' },
         require_review: { type: 'boolean', description: '是否必须经过同组检查才能交付' },
         owner_role: { type: 'string', description: '负责人职责摘要' },
         owner_brief: { type: 'string', description: '负责人具体要做什么' },

@@ -3,7 +3,7 @@ import test from 'node:test';
 import { createHarness, isNoteRequest, scripted, systemText } from '../helpers.ts';
 import { mockReply } from '../../src/model/mock.ts';
 import { collectFileOps } from '../../src/runtime/note.ts';
-import { decideNote, renderTurnsForNote, runNote } from '../../src/runtime/note.ts';
+import { buildNotePrompt, decideNote, renderTurnsForNote, runNote } from '../../src/runtime/note.ts';
 import { planHistory, groupTurns } from '../../src/runtime/context.ts';
 import type { ChatRequest } from '../../src/model/types.ts';
 import { nowIso } from '../../src/domain/ids.ts';
@@ -678,7 +678,7 @@ test('整理失败：连续失败达到上限后不再反复调用', async () =>
   }
 });
 
-test('工作记录：摘要提示里带上程序提取的文件清单，不让模型凭印象写', async () => {
+test('工作记录：从调用中提取涉及的路径', async () => {
   const harness = await staticHarness({ contextWindowChars: 600, noteTriggerTurns: 2, noteTriggerChars: 100 });
   try {
     const { owner, task } = harness.runtime.createTask({
@@ -701,10 +701,79 @@ test('工作记录：摘要提示里带上程序提取的文件清单，不让�
 
     const turns = harness.store.listWorkerTurns(owner.id, 10);
     const ops = collectFileOps(turns);
-    assert.deepEqual(ops.read, ['materials/a.md'], '已读文件要从工具调用里提取');
-    assert.deepEqual(ops.written, ['out.md'], '已写文件同理');
+    assert.deepEqual(ops.read, ['materials/a.md'], '读取类操作路径从调用里提取，不代表成功');
+    assert.deepEqual(ops.written, ['out.md'], '写入类操作路径同理');
     void task;
   } finally {
     await harness.cleanup();
   }
+});
+
+
+test('整理输入：截断可查回，结果按调用编号关联且路径不是成功证据', async () => {
+  const harness = await staticHarness();
+  try {
+    const { owner, task } = harness.runtime.createTask({ title: '片段', goal: 'g', ownerRole: '负责人', ownerBrief: 'b' });
+    const base = { workerId: owner.id, createdAt: nowIso() };
+    const turns: WorkerTurn[] = [
+      { ...base, id: 'a', seq: 1, role: 'assistant', content: null, toolCallId: null,
+        toolCalls: [{ id: 'read-1', name: 'fs_read', arguments: JSON.stringify({ path: 'a.md', offset: 30, limit: 40, content: '不应泄露的正文' }) }] },
+      { ...base, id: 'b', seq: 2, role: 'tool', content: 'x'.repeat(601), toolCalls: null, toolCallId: 'read-1' },
+      { ...base, id: 'c', seq: 3, role: 'user', content: 'y'.repeat(801), toolCalls: null, toolCallId: null },
+    ];
+    const rendered = renderTurnsForNote(turns);
+    assert.match(rendered, /调用 read-1.*fs_read.*path="a.md".*offset=30.*limit=40/);
+    assert.match(rendered, /结果 read-1/);
+    assert.equal((rendered.match(/本次整理输入截断/g) ?? []).length, 2);
+    assert.doesNotMatch(rendered, /不应泄露的正文/);
+    const decision = { action: 'compact' as const, reason: '', fromSeq: 1, toSeq: 3, turns, chars: 0, coveredSeq: 0, previous: null };
+    const input = buildNotePrompt({ task, worker: owner, decision, limits: harness.config.limits })[1]!.content ?? '';
+    assert.match(input, /不代表操作成功/);
+    assert.match(input, /不能据此推断/);
+    assert.match(input, /执行结果未知/);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('Worker 请求：变更状态时缓存前缀稳定，状态不进入持久历史', async () => {
+  const harness = await staticHarness();
+  try {
+    const { owner, task } = harness.runtime.createTask({ title: '缓存契约', goal: 'g', ownerRole: '负责人', ownerBrief: 'b' });
+    seedTurns(harness.store, owner.id, 2, { chars: 40 });
+    const build = (harness.runtime as unknown as { buildWorkerMessages: (worker: unknown, task: unknown) => Promise<{ role: string; content: string | null }[]> }).buildWorkerMessages.bind(harness.runtime);
+    const before = await build(owner, task);
+    harness.runtime.saveArtifact(owner, '缓存产物.md', '内容');
+    const after = await build({ ...owner, stepCount: owner.stepCount + 1 }, task);
+    assert.deepEqual(after.slice(0, -1), before.slice(0, -1));
+    assert.match(after.at(-1)!.content ?? '', /缓存产物.md/);
+    assert.doesNotMatch(before.at(-1)!.content ?? '', /缓存产物.md/);
+    assert.ok(harness.store.listWorkerTurns(owner.id, 100).every((turn) => !(turn.content ?? '').includes('系统当前状态')));
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+
+test('整理输入：同名调用按编号关联逆序结果并标明缺失结果', () => {
+  const base = { workerId: 'w', createdAt: nowIso() };
+  const longPath = 'a'.repeat(201);
+  const turns: WorkerTurn[] = [
+    { ...base, id: 'a', seq: 1, role: 'assistant', content: null, toolCallId: null,
+      toolCalls: [
+        { id: 'c1', name: 'fs_read', arguments: JSON.stringify({ path: 'first.md' }) },
+        { id: 'c2', name: 'fs_read', arguments: JSON.stringify({ path: 'second.md' }) },
+        { id: 'c3', name: 'fs_read', arguments: JSON.stringify({ path: longPath, content: '不应进入整理输入的正文' }) },
+      ] },
+    { ...base, id: 'b', seq: 2, role: 'tool', content: 'second-result', toolCalls: null, toolCallId: 'c2' },
+    { ...base, id: 'c', seq: 3, role: 'tool', content: 'first-result', toolCalls: null, toolCallId: 'c1' },
+  ];
+  const rendered = renderTurnsForNote(turns);
+  assert.match(rendered, /调用 c1.*first\.md/);
+  assert.match(rendered, /调用 c2.*second\.md/);
+  assert.match(rendered, /结果 c2.*second-result/);
+  assert.match(rendered, /结果 c1.*first-result/);
+  assert.ok(rendered.includes(`path=${JSON.stringify(longPath)}`), '长路径应完整保留');
+  assert.doesNotMatch(rendered, /不应进入整理输入的正文/);
+  assert.match(rendered, /执行结果未知 c3.*fs_read/);
 });

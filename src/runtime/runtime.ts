@@ -1574,8 +1574,8 @@ note: null,
     this.store.appendEvent(taskId, workerId, 'worker.no_artifact', '30 步仍无产物，已提醒先落草稿');
     this.pushSystemNotice(
       workerId,
-      '你已经执行了 30 步，还没有保存任何产物。如果调研已经过半，先用 artifact_save 落一份草稿（哪怕不完整）——' +
-        '上下文里的推理不会持久，进程中途退出就全丢了。之后可以继续完善，用同一个文件名覆盖即可。',
+      '你已经执行了 30 步，还没有保存任何产物。请结合任务判断是否已有值得保存的阶段成果；' +
+        '需要保存时可用 artifact_save，之后继续完善。历史已持久化，可按需查回。',
     );
     return true;
   }
@@ -1764,7 +1764,7 @@ note: null,
         const current = this.store.getWorker(workerId);
         if (current) this.recordAssistantTurn(current, stepResult);
         // 调研型长任务会把一切攒到最后：实测有任务跑到 105 步才第一次 artifact_save，
-        // 前 17 分钟的推理全在上下文里。进程一崩就全没了。这里只提醒一次，
+        // 工作历史已持久化；这里只提醒一次，
         // 不强制——有些任务本来就该先查后写。
         if (!artifactNagged && task && task.ownerWorkerId === workerId && Number(current?.stepCount ?? 0) >= 30) {
           artifactNagged = true;

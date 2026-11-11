@@ -92,6 +92,37 @@ const callNameOf = (turn: WorkerTurn): string => {
   return turn.toolCalls.map((call) => call.name).join('、');
 };
 
+/** 只展示可追溯的位置参数，避免把文件内容或消息正文复制进摘要输入。 */
+function callLocator(name: string, raw: string): string {
+  const fields: Record<string, string[]> = {
+    fs_read: ['path', 'offset', 'limit'],
+    artifact_read: ['name', 'version', 'offset', 'limit'],
+    history_read: ['from_seq', 'to_seq', 'offset', 'limit'],
+    message_read: ['message_id', 'offset', 'limit'],
+  };
+  const keys = fields[name];
+  if (!keys) return '';
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return '';
+    const values = parsed as Record<string, unknown>;
+    return keys.flatMap((key) => {
+      const value = values[key];
+      if (typeof value === 'number' && Number.isFinite(value)) return [`${key}=${value}`];
+      if (typeof value === 'string') return [`${key}=${JSON.stringify(value)}`];
+      return [];
+    }).join(' ');
+  } catch {
+    return '';
+  }
+}
+
+/** 渲染历史片段，显式标注整理输入的截断，不改变原始历史。 */
+function noteExcerpt(content: string | null, limit: number): string {
+  const text = content ?? '';
+  return text.length > limit ? `${text.slice(0, limit)}…（本次整理输入截断；按 turn 编号查回原文）` : text;
+}
+
 /** 渲染历史片段，保留「未执行」与「执行结果未知」的区别。 */
 export function renderTurnsForNote(turns: WorkerTurn[]): string {
   const lines: string[] = [];
@@ -106,25 +137,29 @@ export function renderTurnsForNote(turns: WorkerTurn[]): string {
         cursor += 1;
       }
       const seen = new Set(following.map((item) => item.toolCallId));
-      const head = turn.content?.trim() ? `：${turn.content.trim().slice(0, 400)}` : '';
-      lines.push(`turn#${turn.seq} [助手] 调用 ${calls.map((call) => call.name).join('、')}${head}`);
+      const head = turn.content?.trim() ? `：${noteExcerpt(turn.content.trim(), 400)}` : '';
+      lines.push(`turn#${turn.seq} [助手]${head}`);
+      for (const call of calls) {
+        const locator = callLocator(call.name, call.arguments);
+        lines.push(`turn#${turn.seq} [调用 ${call.id}] ${call.name}${locator ? ` ${locator}` : ''}`);
+      }
       for (const item of following) {
-        lines.push(`turn#${item.seq} [结果] ${(item.content ?? '').slice(0, 600)}`);
+        lines.push(`turn#${item.seq} [结果 ${item.toolCallId ?? '未知调用'}] ${noteExcerpt(item.content, 600)}`);
       }
       for (const call of calls) {
         if (!seen.has(call.id)) {
-          lines.push(`turn#${turn.seq} [执行结果未知] ${call.name}：历史没有记录结果，不能当作已执行或未执行`);
+          lines.push(`turn#${turn.seq} [执行结果未知 ${call.id}] ${call.name}：历史没有记录结果，不能当作已执行或未执行`);
         }
       }
       index = cursor - 1;
       continue;
     }
     if (turn.role === 'tool') {
-      lines.push(`turn#${turn.seq} [结果] ${(turn.content ?? '').slice(0, 600)}`);
+      lines.push(`turn#${turn.seq} [结果 ${turn.toolCallId ?? '未知调用'}] ${noteExcerpt(turn.content, 600)}`);
       continue;
     }
     const label = turn.role === 'user' ? '收到' : '说明';
-    lines.push(`turn#${turn.seq} [${label}] ${(turn.content ?? '').slice(0, 800)}`);
+    lines.push(`turn#${turn.seq} [${label}] ${noteExcerpt(turn.content, 800)}`);
   }
   return lines.join('\n');
 }
@@ -173,12 +208,12 @@ export function buildNotePrompt(input: {
     ? decision.previous.content
     : '（这是第一次整理，之前没有工作记录）';
   const system = `你是 Super-Agent 的工作记录整理器，为同一个 Worker 维护一份累计工作记录。
-你的输出会成为该 Worker 后续唯一的过程记忆，必须准确、可追溯，不能编造。`;
+你的输出帮助该 Worker 延续工作；原始历史、消息和产物仍可查回。记录必须准确、可追溯，不能编造。`;
 
   const ops = collectFileOps(decision.turns);
   const opsBlock = [
-    ops.read.length > 0 ? `- 已读：${ops.read.slice(0, 40).join('、')}` : '',
-    ops.written.length > 0 ? `- 已写：${ops.written.slice(0, 40).join('、')}` : '',
+    ops.read.length > 0 ? `- 读取类操作涉及：${ops.read.slice(0, 40).join('、')}` : '',
+    ops.written.length > 0 ? `- 写入类操作涉及：${ops.written.slice(0, 40).join('、')}` : '',
   ]
     .filter(Boolean)
     .join('\n');
@@ -196,20 +231,14 @@ ${previousText}
 # 本次新增历史（turn#${decision.fromSeq} 至 turn#${decision.toSeq}，共 ${decision.turns.length} 条）
 ${renderTurnsForNote(decision.turns)}
 
-# 本次涉及的文件（程序从工具调用里提取，可直接引用）
-${opsBlock || '（本次没有文件操作）'}
+# 操作路径线索（从工具调用提取，不代表操作成功）
+${opsBlock || '（本次没有提取到路径）'}
 
 # 输出要求
-1. 输出一份累计记录：保留上一份里仍然有效的事实、决定、失败原因和来源引用，再加入本次新增内容。
-2. 与当前要求冲突的旧计划，写成「已失效：<原因>」，不要继续当作当前计划。
-3. 每条事实都带来源：turn#N、msg_xxx、art_xxx 或文件名。
-4. 不得写「检查已通过」「可以交付」这类结论——检查状态由程序提供，你写了也不作数。
-5. 工具结果缺失时写「执行结果未知（turn#N）」；程序明确标注的「未执行」保留原样。两者不能混为一谈。
-6. 全文不超过 ${limits.noteMaxChars} 字符。放不下的细节只保留引用，不要堆砌原文。
-7. 只输出记录正文，不要前言、不要代码块围栏。
-
-建议小节：## 已完成 / ## 已确认事实 / ## 已作出的决定 / ## 已尝试但失败 / ## 已读文件 / ## 已写文件 / ## 未解决与等待中 / ## 下一步
-8. 文件清单以程序给出的为准；不要凭印象添加没出现过的文件名。`;
+维护一份支持下一步判断的记录：保留用户要求、当前理解和暂定结论及成立条件、关键证据与来源、已排除路径及原因、影响结果的未知、执行状态、故障、待接依赖和最有价值的下一步。根据新证据更新过时的判断与待办，而不是累加所有经过；低优先级细节只留可检索引用。
+区分事实、推断与未知，不编造动机或推理。调用路径只是线索，结合对应结果判断操作是否成功；结果缺失写「执行结果未知（turn#N）」，程序明确标注的「未执行」保留原样。检查和提交状态以程序记录为准，不用工作记录代替。
+本次历史中标明截断的内容只是整理输入未展示的部分，不能据此推断原文没有相关信息或执行者没有读过；应保留 turn 编号供 Worker 按需查回原文。保留关键来源（turn#N、msg_xxx、art_xxx 或文件名）。
+全文不超过 ${limits.noteMaxChars} 字符，只输出记录正文。`;
 
   return [
     { role: 'system', content: system },

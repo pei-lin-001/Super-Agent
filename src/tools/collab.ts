@@ -23,10 +23,10 @@ export const collabTools: ToolDefinition[] = [
       type: 'object',
       properties: {
         role: { type: 'string', description: '一句话职责，例如「数据核对」' },
-        brief: { type: 'string', description: '具体工作说明：要做什么、交付什么、边界在哪' },
+        brief: { type: 'string', description: '具体工作、交付内容、边界，以及结果如何支持当前目标' },
         model: {
           type: 'string',
-          description: '可选：协作者使用的模型别名，见系统提示里的可用模型；不填则沿用你自己的模型配置',
+          description: '可选：协作者使用的模型别名，见当前可用模型目录；不填则沿用你自己的模型配置',
         },
       },
       required: ['role', 'brief'],
@@ -45,7 +45,7 @@ export const collabTools: ToolDefinition[] = [
     description:
       '给同组 Worker 发消息。kind=request 用于求助/核对/检查；kind=reply 回复某条请求，必须带 reply_to；update/stop 仅任务负责人可用。'
       + '当 intent=review 时表示正式检查：必须给出 refs 里的产物，回复时用 outcome 给出 approved / changes_required / inconclusive 结论。'
-      + '普通求助用 intent=help，不会产生检查记录。',
+      + '每条请求只能回复一次；普通求助用 intent=help，不会产生检查记录。',
     parameters: {
       type: 'object',
       properties: {
@@ -203,8 +203,7 @@ export const collabTools: ToolDefinition[] = [
     name: 'wake_worker',
     description:
       '叫醒本工作空间里休眠的成员，让它接手当前任务。' +
-      '它记得上次在这个空间里读到什么、试过什么，省掉重新摸底；但旧任务的结论会作废，' +
-      '以当前任务的要求为准。' +
+      '可按需查回既有记录，判断其是否适用于当前任务；旧任务结论不能直接沿用。' +
       '只在"已有成员正适合这件事"时用；不要为同一职责再造一个人。',
     parameters: {
       type: 'object',
