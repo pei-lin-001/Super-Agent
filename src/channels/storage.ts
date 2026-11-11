@@ -83,8 +83,9 @@ export function stageMaterials(input: {
   workDir: string;
   taskId: string;
   attachments: StoredAttachment[];
+  directory?: string;
 }): { name: string; path: string; bytes: number; sha256: string; source: string }[] {
-  const destRel = [input.taskId, 'materials'].join('/');
+  const destRel = [input.taskId, input.directory ?? 'materials'].join('/');
   const destAbs = resolve(input.workDir, destRel);
   mkdirSync(destAbs, { recursive: true });
   const staged: { name: string; path: string; bytes: number; sha256: string; source: string }[] = [];

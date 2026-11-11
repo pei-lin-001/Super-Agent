@@ -213,6 +213,9 @@ export const fileTools: ToolDefinition[] = [
       if (normalized === 'materials' || normalized.startsWith('materials/')) {
         throw new Error('materials 目录只读');
       }
+      if (normalized === 'inputs' || normalized.startsWith('inputs/')) {
+        throw new Error('inputs 目录只读');
+      }
       if (normalized === 'artifacts' || normalized.startsWith('artifacts/')) {
         throw new Error('产物目录由 artifact_save 管理，不能用 fs_write 直接覆盖已登记的版本');
       }

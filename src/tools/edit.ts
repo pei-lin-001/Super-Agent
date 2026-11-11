@@ -27,7 +27,9 @@ function ok(content: string): ToolOutcome {
 
 function writablePath(context: ToolContext, logical: string): string {
   const root = taskDir(context);
-  const absolute = resolveInside(root, normalizeRelativePath(logical));
+  const normalized = normalizeRelativePath(logical);
+  if (normalized === 'inputs' || normalized.startsWith('inputs/')) throw new Error('inputs 目录只读');
+  const absolute = resolveInside(root, normalized);
   assertInsideRoot(root, absolute);
   return absolute;
 }

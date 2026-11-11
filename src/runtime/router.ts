@@ -30,6 +30,7 @@ const ROUTER_TOOLS: ToolSchema[] = [
         require_review: { type: 'boolean', description: '是否必须经过同组检查才能交付' },
         owner_role: { type: 'string', description: '负责人职责摘要' },
         owner_brief: { type: 'string', description: '负责人具体要做什么' },
+        input_artifact_ids: { type: 'array', items: { type: 'string' }, description: '需作为输入的本会话既有产物 ID；用 read_task 查看具体版本，快照不继承检查结论' },
         model: {
           type: 'string',
           description:
@@ -796,6 +797,20 @@ export class Router {
     try {
       switch (name) {
         case 'create_task': {
+          const rawInputs = args['input_artifact_ids'];
+          if (rawInputs !== undefined && (!Array.isArray(rawInputs) || rawInputs.some((id) => typeof id !== 'string' || !id.trim()))) {
+            throw new Error('input_artifact_ids 必须是产物 ID 字符串数组');
+          }
+          const inputArtifacts = (rawInputs as string[] | undefined ?? []).map((id) => {
+            const artifact = this.runtime.getArtifact(id);
+            if (!artifact) throw new Error(`产物不存在：${id}`);
+            const sourceTask = this.runtime.store.getTask(artifact.taskId);
+            if (!sourceTask || (sourceTask.sourceSessionKey ?? null) !== (receipt?.sessionKey ?? null) ||
+                (sourceTask.sourceConversationId ?? null) !== (receipt?.scope?.conversationId ?? null)) {
+              throw new Error(`产物 ${id} 不属于当前会话和话题`);
+            }
+            return artifact;
+          });
           // 业务变更与操作回执同一个事务：要么都生效，要么都不生效。
           // 这样"任务建好了、回执还没写"的崩溃点就不存在了。
           let recorded: string | null = null;
@@ -811,6 +826,7 @@ export class Router {
               // Router 可以指派负责人模型：别名先按目录校验，未配置直接拒绝，
               // 不静默回退——否则"指定了强模型"会变成一句空话，没人会发现。
               model: modelAliasArg(args['model'], this.modelAliases()),
+              inputArtifacts,
               // 分类只决定「归到哪个空间」，失败不拦建任务——Router 自己看得见表单。
               workspaceId: await this.pickWorkspace({
                 title: text(args['title'], 'title'),
@@ -970,6 +986,8 @@ export class Router {
             `目标：${task.goal}`,
             `完成条件：${task.doneCriteria || '（未设置）'}`,
             `要求检查：${task.requireReview ? '是' : '否'}`,
+            `已登记产物：`,
+            ...this.runtime.store.listArtifacts(task.id).map((artifact) => `  - ${artifact.id}｜${artifact.name}｜v${artifact.version}｜sha256 ${artifact.sha256}`),
             `Worker：`,
             ...workers.map((worker) => `  - ${worker.id}｜${worker.role}｜${worker.status}｜步数 ${worker.stepCount}`),
             `最近消息：`,

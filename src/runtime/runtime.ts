@@ -29,7 +29,7 @@ import type { AssistantMessage } from '../vendor/pi/types.ts';
  */
 const PROGRESS_NOTIFY_INTERVAL_MS = 3 * 60 * 1000;
 import { ModelRegistry } from '../model/registry.ts';
-import { stageMaterials, type StoredAttachment } from '../channels/storage.ts';
+import { resolveArtifactPath, stageMaterials, type StoredAttachment } from '../channels/storage.ts';
 import { identifyProcess } from '../watchdog/observer.ts';
 import type {
   Artifact,
@@ -90,6 +90,7 @@ export interface CreateTaskInput {
   ownerRole: string;
   ownerBrief: string;
   model?: string | null;
+  inputArtifacts?: Artifact[];
   /** 复用已有的工作空间；不填则用这次任务的 groupId 新建一个。 */
   workspaceId?: string | null;
   /** 新建空间时的标题；不填用任务标题。 */
@@ -341,6 +342,23 @@ note: null,
     const staged = input.source
       ? this.prepareSessionMaterials(taskId, input.source.sessionKey, input.source.conversationId ?? null)
       : { files: [], inboundIds: [], cleanup: (): void => {} };
+    const copiedInputs: { path: string; bytes: number; sha256: string }[] = [];
+    try {
+      for (const artifact of input.inputArtifacts ?? []) {
+        if (!resolveArtifactPath(this.config.workDir, artifact.path)) throw new Error(`产物文件缺失或路径无效：${artifact.id}`);
+        const [file] = stageMaterials({ workDir: this.config.workDir, taskId, directory: 'inputs', attachments: [{
+          kind: 'file', name: artifact.name, mime: null, bytes: artifact.bytes, path: artifact.path, sha256: artifact.sha256,
+        }] });
+        if (!file) throw new Error(`产物文件缺失：${artifact.id}`);
+        copiedInputs.push(file);
+        if (file.bytes !== artifact.bytes || file.sha256 !== artifact.sha256) throw new Error(`产物内容与登记不一致：${artifact.id}`);
+        task.brief += `\n前次产物输入：inputs/${file.name}（来源任务 ${artifact.taskId}，产物 ${artifact.id}，v${artifact.version}，sha256 ${artifact.sha256}）；这是待核对的快照，不继承检查结论。`;
+      }
+    } catch (error) {
+      for (const file of copiedInputs) rmSync(resolve(this.config.workDir, file.path), { force: true });
+      staged.cleanup();
+      throw error;
+    }
     if (staged.files.length > 0) {
       task.brief = [
         task.brief,
@@ -383,6 +401,7 @@ note: null,
     } catch (error) {
       // 事务失败则清掉本次复制出来的孤立副本，任务目录里不留半份材料。
       staged.cleanup();
+      for (const file of copiedInputs) rmSync(resolve(this.config.workDir, file.path), { force: true });
       throw error;
     }
     const created = this.store.getTask(taskId)!;
