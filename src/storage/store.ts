@@ -254,6 +254,8 @@ export interface IntercomMessage {
   topicId: string | null;
   replyTo: string | null;
   sessionKey: string | null;
+  conversationId: string | null;
+  routeKnown: boolean;
   taskId: string | null;
   body: string;
   refs: string[] | null;
@@ -292,6 +294,8 @@ export class Store {
       }
     };
     ensureColumn('task', 'review_epoch', 'review_epoch INTEGER NOT NULL DEFAULT 0');
+    ensureColumn('intercom', 'conversation_id', 'conversation_id TEXT');
+    ensureColumn('intercom', 'route_known', 'route_known INTEGER NOT NULL DEFAULT 0');
     ensureColumn('task', 'maintenance', 'maintenance INTEGER NOT NULL DEFAULT 0');
     ensureColumn('task', 'source_channel', 'source_channel TEXT');
     ensureColumn('task', 'source_account_id', 'source_account_id TEXT');
@@ -1073,6 +1077,8 @@ export class Store {
     topicId?: string | null;
     replyTo?: string | null;
     sessionKey?: string | null;
+    conversationId?: string | null;
+    routeKnown?: boolean;
     taskId?: string | null;
     refs?: string[] | null;
     hops?: number;
@@ -1080,9 +1086,9 @@ export class Store {
   }): void {
     const now = Date.now();
     this.run(
-      `INSERT INTO intercom (id, from_layer, to_layer, kind, topic_id, reply_to, session_key, task_id,
+      `INSERT INTO intercom (id, from_layer, to_layer, kind, topic_id, reply_to, session_key, conversation_id, route_known, task_id,
                              body, refs, status, hops, expires_at, created_at, consumed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, NULL)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, NULL)`,
       input.id,
       input.fromLayer,
       input.fromLayer === 'router' ? 'watchdog' : 'router',
@@ -1090,6 +1096,8 @@ export class Store {
       input.topicId ?? null,
       input.replyTo ?? null,
       input.sessionKey ?? null,
+      input.conversationId ?? null,
+      input.routeKnown ? 1 : 0,
       input.taskId ?? null,
       input.body,
       input.refs && input.refs.length > 0 ? JSON.stringify(input.refs) : null,
@@ -1117,6 +1125,48 @@ export class Store {
     ).map((row) => this.toIntercom(row));
   }
 
+  /** 待答问题保持可查；定向消息先按会话和话题过滤，再限制数量。 */
+  listIntercomForRouter(sessionKey: string | null, conversationId: string | null, limit = 6): IntercomMessage[] {
+    return this.all(
+      `SELECT * FROM intercom WHERE to_layer = 'router' AND route_known = 1
+       AND session_key IS ? AND conversation_id IS ?
+       AND (status = 'pending' OR (status = 'delivered' AND kind IN ('question','request')))
+       AND (expires_at IS NULL OR expires_at > ?) ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, created_at ASC LIMIT ?`,
+      sessionKey, conversationId, nowIso(), limit,
+    ).map((row) => this.toIntercom(row));
+  }
+
+  intercomRouterTargets(): { sessionKey: string; conversationId: string | null }[] {
+    return this.all(
+      `SELECT DISTINCT session_key, conversation_id FROM intercom
+       WHERE to_layer = 'router' AND route_known = 1 AND session_key IS NOT NULL
+       AND status = 'pending' AND (expires_at IS NULL OR expires_at > ?)`, nowIso(),
+    ).map((row) => ({ sessionKey: str(row['session_key']), conversationId: strOrNull(row['conversation_id']) }));
+  }
+
+  listOpenIntercom(toLayer: 'router' | 'watchdog', limit = 10, unassignedOnly = false): IntercomMessage[] {
+    return this.all(
+      `SELECT * FROM intercom WHERE to_layer = ?
+       AND (status = 'pending' OR (status = 'delivered' AND kind IN ('question','request')))
+       AND (expires_at IS NULL OR expires_at > ?) AND (? = 0 OR route_known = 0)
+       ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, created_at ASC LIMIT ?`,
+      toLayer, nowIso(), unassignedOnly ? 1 : 0, limit,
+    ).map((row) => this.toIntercom(row));
+  }
+
+  replyIntercom(original: IntercomMessage, id: string, body: string): boolean {
+    return this.tx(() => {
+      const current = this.getIntercom(original.id);
+      if (!current || !['pending', 'delivered'].includes(current.status) || !['question', 'request'].includes(current.kind) ||
+          (current.expiresAt !== null && current.expiresAt <= nowIso())) return false;
+      this.insertIntercom({ id, fromLayer: current.toLayer, kind: 'reply', body,
+        topicId: current.topicId ?? current.id, replyTo: current.id, sessionKey: current.sessionKey,
+        conversationId: current.conversationId, routeKnown: current.routeKnown, hops: current.hops + 1 });
+      this.consumeIntercom(current.id);
+      return true;
+    });
+  }
+
   /**
    * 注入上下文时调用。
    *
@@ -1125,7 +1175,7 @@ export class Store {
    */
   markIntercomDelivered(id: string): void {
     const row = this.get('SELECT kind FROM intercom WHERE id = ?', id);
-    const terminal = row && str(row['kind']) === 'notice';
+    const terminal = row && ['notice', 'reply'].includes(str(row['kind']));
     this.run(
       `UPDATE intercom SET status = ?, consumed_at = ? WHERE id = ? AND status = 'pending'`,
       terminal ? 'consumed' : 'delivered',
@@ -1174,6 +1224,8 @@ export class Store {
       topicId: strOrNull(row['topic_id']),
       replyTo: strOrNull(row['reply_to']),
       sessionKey: strOrNull(row['session_key']),
+      conversationId: strOrNull(row['conversation_id']),
+      routeKnown: num(row['route_known']) === 1,
       taskId: strOrNull(row['task_id']),
       body: str(row['body']),
       refs,

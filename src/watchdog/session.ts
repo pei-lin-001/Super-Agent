@@ -117,7 +117,7 @@ const WD_TOOLS: ToolSchema[] = [
   {
     name: 'notify_router',
     description:
-      '给 Router 留一条通报，它下一次被唤醒时能看到。' +
+      '保存一条无会话归属的维护通报，供管理入口查看。' +
       '适合：你刚重启过主系统、你挂起/恢复了某个任务、你发现某个 Worker 在原地打转。' +
       '用户看不到你，所有面向用户的表达都必须经过 Router——不要试图直接找用户。',
     parameters: {
@@ -132,8 +132,7 @@ const WD_TOOLS: ToolSchema[] = [
   {
     name: 'ask_router',
     description:
-      '问 Router 一件只有它知道的事（用户最近抱怨什么、某次对话里用户说了什么要求）。' +
-      '异步：发出后本轮结束，回答到达后你会被下一次巡检唤醒。不要在同一轮里等。',
+      '问 Router 一件只有它知道的事。没有明确会话归属时，问题留在管理入口等待查看，不会发送到任意聊天。',
     parameters: {
       type: 'object',
       properties: { question: { type: 'string', description: '具体问题，一次一件' } },
@@ -177,12 +176,11 @@ const WD_TOOLS: ToolSchema[] = [
  * 上下文会被这些"已经处理过的旧话"撑满。
  */
 function renderRouterMessages(store: Store): string {
-  const pending = store.listPendingIntercom('watchdog', 8);
+  const pending = store.listOpenIntercom('watchdog', 8);
   if (pending.length === 0) return '';
   const lines = pending.map((message) => {
     const kind = message.kind === 'question' ? '提问（需要回复）' : message.kind === 'request' ? '请求（需要判断）' : '通报';
-    store.markIntercomDelivered(message.id);
-    return `- [${message.id}] ${kind}｜${message.body}`;
+    return `- [${message.id}] ${kind}｜${message.body}${message.replyTo ? `｜回复：${message.replyTo}` : ''}${message.refs?.length ? `｜引用：${message.refs.join('、')}` : ''}`;
   });
   lines.push('');
   lines.push('提问和请求请用 reply_intercom 回复（带上消息 id）；通报不需要回复。');
@@ -447,14 +445,14 @@ export class WatchdogSession {
         kind: 'notice',
         body: body.slice(0, 2000),
       });
-      return `已通报 Router（${id}）。用户看不到你，面向用户的表达必须经它转述。`;
+      return `已保存通报（${id}），无会话归属，等待管理入口查看。`;
     }
     if (name === 'ask_router') {
       const question = str('question').trim();
       if (question === '') return '问题不能为空';
       const id = `ic_${randomBytes(4).toString('hex')}`;
       store.insertIntercom({ id, fromLayer: 'watchdog', kind: 'question', body: question.slice(0, 2000), topicId: id });
-      return `问题已发给 Router（${id}）。异步：本轮先结束，回答到达后你会在下一次巡检看到。`;
+      return `问题已保存（${id}），无会话归属，等待管理入口查看并回复。`;
     }
     if (name === 'reply_intercom') {
       const target = str('message_id').trim();
@@ -464,23 +462,8 @@ export class WatchdogSession {
       const original = store.getIntercom(target);
       if (!original) return `找不到消息 ${target}`;
       if (original.toLayer !== 'watchdog') return `${target} 不是发给维护者的消息`;
-      if (original.status === 'answered') return `${target} 已经回复过了，不要重复回复`;
-      // reply 不能再 reply：否则两边会互相唤醒到天亮。
-      if (original.hops >= (this.deps.config.limits.maxRequestHops ?? 4)) {
-        return `这条消息已经来回 ${original.hops} 次，超过上限，请直接给出结论`;
-      }
-      store.insertIntercom({
-        id: `ic_${randomBytes(4).toString('hex')}`,
-        fromLayer: 'watchdog',
-        kind: 'reply',
-        body: body.slice(0, 2000),
-        topicId: original.topicId ?? original.id,
-        replyTo: original.id,
-        sessionKey: original.sessionKey,
-        hops: original.hops + 1,
-      });
-      store.consumeIntercom(original.id);
-      return `已回复 ${target}。`;
+      return store.replyIntercom(original, `ic_${randomBytes(4).toString('hex')}`, body.slice(0, 2000))
+        ? `已回复 ${target}。` : `${target} 已回复或不需要回复`;
     }
     if (name === 'check_main') {
       const health = this.deps.health?.();
@@ -714,6 +697,15 @@ export class WatchdogSession {
 
     let acted = false;
     const context = await this.contextForTurn();
+    const routerMessages = renderRouterMessages(store);
+    const newMessages = store.listPendingIntercom('watchdog', 8);
+    if (newMessages.length > 0) {
+      store.tx(() => {
+        const content = newMessages.map((message) => `[${message.id}] ${message.kind}｜${message.body}${message.refs?.length ? `｜引用：${message.refs.join('、')}` : ''}`).join('\n');
+        store.appendWdTurn({ id: `wdt_${randomBytes(4).toString('hex')}`, role: 'user', content });
+        for (const message of newMessages) store.markIntercomDelivered(message.id);
+      });
+    }
     const result = await runWorkerTurn({
       model: modelName,
       modelClient: new RecordingModel(model, store, 'watchdog', { sessionId: null }),
@@ -738,7 +730,7 @@ export class WatchdogSession {
             lastActions: actions,
             now: nowIso(),
             intervalMinutes,
-            routerMessages: renderRouterMessages(store),
+            routerMessages,
           }),
         },
       ],

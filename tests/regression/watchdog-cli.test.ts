@@ -13,6 +13,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { Store } from '../../src/storage/store.ts';
 
 const root = process.cwd();
 
@@ -108,6 +109,35 @@ async function waitFor(check: () => boolean, timeoutMs: number): Promise<boolean
   }
   return false;
 }
+
+test('唤醒标记处理启动前和忙碌时的消息，巡检保持串行', async () => {
+  const ctx = await makeEnv(60_000);
+  const store = new Store(ctx.dbPath);
+  let resident: ChildProcess | null = null;
+  try {
+    store.insertIntercom({ id: 'ic_wake_first', fromLayer: 'router', kind: 'question', body: '启动前的问题' });
+    const wakeFile = join(ctx.workDir, '.runtime', 'maintainer.wake');
+    writeFileSync(wakeFile, 'before');
+    resident = spawn(process.execPath, ['src/watchdog/main.ts'], {
+      cwd: root, env: { ...ctx.env, WATCHDOG_NO_TICK: '1' }, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.ok(await waitFor(() => ctx.stats().count >= 1, 10_000), '启动前的标记应触发模型');
+    store.insertIntercom({ id: 'ic_wake_second', fromLayer: 'router', kind: 'question', body: '忙碌期间的问题' });
+    writeFileSync(wakeFile, 'during');
+    writeFileSync(wakeFile, 'during again');
+    assert.ok(await waitFor(() => store.getIntercom('ic_wake_second')?.status === 'delivered', 10_000), '忙碌期间的新问题应送达');
+    assert.equal(store.getIntercom('ic_wake_first')?.status, 'delivered');
+    assert.equal(ctx.stats().maxActive, 1);
+  } finally {
+    if (resident && resident.exitCode === null) {
+      const exited = new Promise<void>((resolve) => resident!.once('exit', () => resolve()));
+      resident.kill('SIGTERM');
+      await exited;
+    }
+    store.close();
+    await ctx.close();
+  }
+});
 
 test('已有常驻维护者时，另一个进程提交问题并被处理，随后可查询', async () => {
   const ctx = await makeEnv();

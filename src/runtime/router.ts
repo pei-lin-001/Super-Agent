@@ -2,6 +2,7 @@ import type { Config } from '../config.ts';
 import { parseSessionKey } from '../channels/types.ts';
 import { ConversationService } from '../channels/conversations.ts';
 import { randomBytes } from 'node:crypto';
+import type { Store } from '../storage/store.ts';
 import { beijingTime, nowIso } from '../domain/ids.ts';
 import { RecordingModel } from '../model/recorder.ts';
 import type { OutboundArtifact, RuntimeEvent, Task } from '../domain/types.ts';
@@ -148,6 +149,13 @@ const ROUTER_TOOLS: ToolSchema[] = [
       },
       required: ['question'],
     },
+  },
+  {
+    name: 'reply_intercom',
+    description: '回复维护者的问题或请求；只能回复当前会话和话题收到的消息。',
+    parameters: { type: 'object', properties: {
+      message_id: { type: 'string' }, body: { type: 'string' },
+    }, required: ['message_id', 'body'] },
   },
   {
     name: 'read_maintainer_status',
@@ -365,11 +373,9 @@ export class Router {
       // 按来源会话+话题分组汇报：多条聊天交错时，不能把别人的材料混进一次总结。
       const targets = [...this.runtime.store.routerInboxTargets()];
       // 维护者的通报同样需要一次 Router 轮次：没有 Worker 汇报时也得跑。
-      for (const message of this.runtime.store.listPendingIntercom('router', 6)) {
-        const key = message.sessionKey;
-        if (key === null) continue;
-        if (targets.some((target) => target.sessionKey === key)) continue;
-        targets.push({ sessionKey: key, conversationId: this.runtime.store.currentConversationId(key) });
+      for (const target of this.runtime.store.intercomRouterTargets()) {
+        if (targets.some((item) => item.sessionKey === target.sessionKey && item.conversationId === target.conversationId)) continue;
+        targets.push(target);
       }
       if (targets.length === 0) return;
       const outcome = await Promise.all(
@@ -391,19 +397,13 @@ export class Router {
    * 维护者转来的消息。注入即标记已投递——不标记的话每轮都会重复出现，
    * 上下文会被"已经处理过的旧话"撑满。
    *
-   * CLI 会话（sessionKey 为空）也收：维护者的通报对谁都该看得到。
+   * 消息按真实来源会话和话题筛选，无归属消息由管理入口单独查看。
    */
-  private renderMaintainerMessages(sessionKey: string | null): string {
-    const store = this.runtime.store;
-    const pending = store.listPendingIntercom('router', 6);
-    if (pending.length === 0) return '';
+  private renderMaintainerMessages(pending: ReturnType<Store['listIntercomForRouter']>): string {
     const lines: string[] = [];
     for (const message of pending) {
-      // 有会话归属的只给那个会话看，别把别人聊天里的事串进来。
-      if (message.sessionKey !== null && sessionKey !== null && message.sessionKey !== sessionKey) continue;
       const kind = message.kind === 'question' ? '提问（需要回复）' : message.kind === 'request' ? '请求（需要判断）' : '通报';
-      lines.push(`- [${message.id}] ${kind}｜${message.body}`);
-      store.markIntercomDelivered(message.id);
+      lines.push(`- [${message.id}] ${kind}｜${message.body}${message.replyTo ? `｜回复：${message.replyTo}` : ''}${message.refs?.length ? `｜引用：${message.refs.join('、')}` : ''}`);
     }
     return lines.join('\n');
   }
@@ -478,9 +478,8 @@ export class Router {
     const inbox = this.runtime.store.listRouterInbox(sessionKey, conversationId);
     // 维护者的消息也要能单独撑起一轮：没有用户输入、也没有 Worker 汇报时，
     // 以前这里直接返回，导致「维护者发了消息但 Router 永远不跑」。
-    const hasMaintainerMessage = this.runtime.store
-      .listPendingIntercom('router', 6)
-      .some((message) => message.sessionKey === null || message.sessionKey === sessionKey);
+    const maintainerMessages = this.runtime.store.listIntercomForRouter(sessionKey, conversationId);
+    const hasMaintainerMessage = maintainerMessages.some((message) => message.status === 'pending');
     if (userText === null && inbox.length === 0 && !hasMaintainerMessage) return 'done';
 
     const pending = inbox
@@ -509,7 +508,7 @@ export class Router {
       taskCards: this.renderWorkspaces(sessionKey, conversationId),
       pendingMessages: pending,
       conversationNote: assembled?.note ?? null,
-      maintainerMessages: this.renderMaintainerMessages(sessionKey),
+      maintainerMessages: this.renderMaintainerMessages(maintainerMessages),
     });
     const messages: ChatMessage[] = [{ role: 'system', content: routerSystemPrompt() }, ...history];
 
@@ -566,15 +565,17 @@ export class Router {
     // 登记本次运行的会话上下文：失败时用它把会话收回"待续接"。
     this.liveContexts.set(context.chainKey ?? '', { sessionId, sessionKey, conversationId, messages, scope });
     // 会话在第一次模型请求前就落库：额度耗尽或失败时，续接入口始终存在。
-    this.runtime.store.saveRouterSession({
-      id: sessionId,
-      sessionKey,
-      conversationId,
-      taskId: null,
-      messages: messages.filter((message) => message.role !== 'system'),
-      reason: '进行中',
-      // 运行中不能算"待续接"：定时恢复会看到它并再跑一遍，用户就收到重复回复。
-      status: 'running',
+    this.runtime.store.tx(() => {
+      this.runtime.store.saveRouterSession({
+        id: sessionId,
+        sessionKey,
+        conversationId,
+        taskId: null,
+        messages: messages.filter((message) => message.role !== 'system'),
+        reason: '进行中',
+        status: 'running',
+      });
+      for (const message of maintainerMessages) this.runtime.store.markIntercomDelivered(message.id);
     });
     // 用户输入此刻已经持久化：渠道层据此把入站记录标成"已交接"。
     // 之后再崩溃，走的是续接原会话，不会把同一条消息重新派一次工。
@@ -1022,6 +1023,8 @@ export class Router {
             body: notice.slice(0, 2000),
             refs,
             sessionKey: receipt?.sessionKey ?? null,
+            conversationId: receipt?.scope?.conversationId ?? null,
+            routeKnown: true,
           });
           // 立刻叫醒维护者：它下一次巡检本来可能在半小时后。
           this.runtime.wakeMaintainer();
@@ -1038,9 +1041,28 @@ export class Router {
             body: question.slice(0, 2000),
             topicId: id,
             sessionKey: receipt?.sessionKey ?? null,
+            conversationId: receipt?.scope?.conversationId ?? null,
+            routeKnown: true,
           });
           this.runtime.wakeMaintainer();
           return `问题已发给维护者（${id}）。这是异步的：先告诉用户你在核实，回答到达后你会被重新唤醒。`;
+        }
+        case 'reply_intercom': {
+          const id = text(args['message_id'], 'message_id');
+          const body = text(args['body'], 'body').trim();
+          if (!body) return '回复内容不能为空。';
+          const original = this.runtime.store.getIntercom(id);
+          const sessionKey = receipt?.sessionKey ?? null;
+          const conversationId = receipt?.scope?.conversationId ?? null;
+          if (!original || original.toLayer !== 'router' ||
+              (original.routeKnown ? original.sessionKey !== sessionKey || original.conversationId !== conversationId : sessionKey !== null)) {
+            return '找不到当前会话可回复的维护消息。';
+          }
+          if (!this.runtime.store.replyIntercom(original, `ic_${randomBytes(4).toString('hex')}`, body.slice(0, 2000))) {
+            return '该消息已回复或不需要回复。';
+          }
+          this.runtime.wakeMaintainer();
+          return '已回复维护者。';
         }
         case 'read_maintainer_status': {
           const status = this.runtime.store.maintainerStatus();
@@ -1054,6 +1076,8 @@ export class Router {
             ...status.recentCommands.map(
               (command) => `- ${beijingTime(command.createdAt)} ${command.command} → ${command.status}｜${command.result ?? ''}`,
             ),
+            ...(receipt?.sessionKey == null ? this.runtime.store.listOpenIntercom('router', 50, true)
+              .map((message) => `- 未指定会话 ${message.id}｜${message.kind}｜${message.body}`) : []),
           ];
           return lines.join('\n');
         }

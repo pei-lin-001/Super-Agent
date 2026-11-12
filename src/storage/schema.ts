@@ -426,6 +426,8 @@ CREATE TABLE IF NOT EXISTS intercom (
   topic_id    TEXT,
   reply_to    TEXT,
   session_key TEXT,
+  conversation_id TEXT,
+  route_known INTEGER NOT NULL DEFAULT 0,
   task_id     TEXT,
   body        TEXT NOT NULL,
   refs        TEXT,

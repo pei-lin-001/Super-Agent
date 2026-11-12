@@ -89,3 +89,136 @@ test('维护者状态：只给可核对的事实，不给推测', () => {
     assert.ok(Array.isArray(status.recentCommands));
   });
 });
+
+test('通信：路由筛选先于批次限制，定向消息保留话题且不能被 CLI 窃取', async () => {
+  const { createHarness, allText } = await import('../helpers.ts');
+  const { mockReply } = await import('../../src/model/mock.ts');
+  const { ConversationService } = await import('../../src/channels/conversations.ts');
+  const seen: string[] = [];
+  const events: { type: string; sessionKey?: string | null; conversationId?: string | null; text?: string }[] = [];
+  const h = await createHarness({ worker: () => mockReply({ text: 'x' }), router: (ctx) => {
+    const text = allText(ctx.request); seen.push(text);
+    return mockReply({ text: text.includes('原话题答复') ? '原话题答复' : '普通回复' });
+  } });
+  h.runtime.on((event) => events.push(event));
+  try {
+    const key = 'telegram|bot|owner';
+    const conversations = new ConversationService(h.store);
+    const first = conversations.ensureCurrent(key, '一');
+    const second = conversations.create(key, '二');
+    for (let i = 0; i < 6; i++) h.store.insertIntercom({ id: `ic_global_${i}`, fromLayer: 'watchdog', kind: 'notice', body: '全局' });
+    h.store.insertIntercom({ id: 'ic_target', fromLayer: 'watchdog', kind: 'reply', body: '原话题答复', sessionKey: key, conversationId: first.id, routeKnown: true });
+    await h.router.handleUserMessage('CLI');
+    assert.ok(!seen.at(-1)!.includes('原话题答复'));
+    await h.router.handleUserMessage('另一个用户', { sessionKey: 'telegram|bot|other', conversationId: second.id });
+    assert.ok(!seen.at(-1)!.includes('原话题答复'));
+    await h.router.notify();
+    const out = events.find((event) => event.type === 'channel.outbound' && event.text === '原话题答复');
+    assert.equal(out?.sessionKey, key);
+    assert.equal(out?.conversationId, first.id);
+    assert.equal(h.store.getIntercom('ic_target')?.status, 'consumed');
+  } finally { await h.cleanup(); }
+});
+
+test('通信：维护者未答问题保持可见，回复只产生一次且保留原话题', async () => {
+  const { createHarness } = await import('../helpers.ts');
+  const { MockModel, mockReply } = await import('../../src/model/mock.ts');
+  const { WatchdogSession } = await import('../../src/watchdog/session.ts');
+  const h = await createHarness({ worker: () => mockReply({ text: 'x' }) });
+  const inputs: string[] = [];
+  try {
+    h.store.insertIntercom({ id: 'ic_q', fromLayer: 'router', kind: 'question', body: '查明原因', sessionKey: 'peer', conversationId: 'topic', routeKnown: true });
+    const session = new WatchdogSession({ store: h.store, config: h.config, modelName: 'mock', model: new MockModel((ctx) => {
+      inputs.push(JSON.stringify(ctx.request.messages)); return mockReply({ text: '暂未查明' });
+    }) });
+    await session.runOnce(1);
+    await session.runOnce(1);
+    assert.ok(inputs[0]!.includes('查明原因'));
+    assert.ok(inputs[1]!.includes('查明原因'));
+    assert.equal(h.store.getIntercom('ic_q')?.status, 'delivered');
+    const question = h.store.getIntercom('ic_q')!;
+    assert.equal(h.store.replyIntercom(question, 'ic_reply', '已查明'), true);
+    assert.equal(h.store.replyIntercom(question, 'ic_duplicate', '重复'), false);
+    assert.equal(h.store.getIntercom('ic_duplicate'), null);
+    assert.equal(h.store.getIntercom('ic_q')?.status, 'answered');
+    assert.equal(h.store.getIntercom('ic_reply')?.conversationId, 'topic');
+  } finally { await h.cleanup(); }
+});
+
+test('通信：维护者提问可从管理入口回复，重复回复不生成第二条', async () => {
+  const { createHarness, allText } = await import('../helpers.ts');
+  const { MockModel, mockReply } = await import('../../src/model/mock.ts');
+  const { WatchdogSession } = await import('../../src/watchdog/session.ts');
+  let step = 0;
+  const h = await createHarness({ worker: () => mockReply({ text: 'x' }), router: (ctx) => {
+    const prompt = allText(ctx.request);
+    if (step++ === 0) return mockReply({ toolCalls: [{ name: 'read_maintainer_status', arguments: {} }] });
+    if (step === 2) {
+      const id = prompt.match(/ic_[a-f0-9]{8}/)?.[0];
+      assert.ok(id);
+      return mockReply({ toolCalls: [{ name: 'reply_intercom', arguments: { message_id: id, body: '用户反馈是卡住' } }] });
+    }
+    return mockReply({ text: '已回复' });
+  } });
+  try {
+    let wdStep = 0;
+    const session = new WatchdogSession({ store: h.store, config: h.config, modelName: 'mock', model: new MockModel(() =>
+      wdStep++ === 0 ? mockReply({ toolCalls: [{ name: 'ask_router', arguments: { question: '用户反馈是什么' } }] }) : mockReply({ text: '等回复' })) });
+    await session.runOnce(1);
+    const question = h.store.listOpenIntercom('router')[0]!;
+    assert.equal(question.kind, 'question');
+    await h.router.handleUserMessage('查看维护消息');
+    assert.equal(h.store.getIntercom(question.id)?.status, 'answered');
+    const replies = h.store.listPendingIntercom('watchdog').filter((m) => m.replyTo === question.id);
+    assert.equal(replies.length, 1);
+    const result = await (h.router as any).executeTool('reply_intercom', JSON.stringify({ message_id: question.id, body: '重复' }));
+    assert.match(result, /已回复/);
+    assert.equal(h.store.listPendingIntercom('watchdog').filter((m) => m.replyTo === question.id).length, 1);
+  } finally { await h.cleanup(); }
+});
+
+test('通信：Router 首次模型失败后续接仍收到原维护答复', async () => {
+  const { createHarness, allText } = await import('../helpers.ts');
+  const { mockReply } = await import('../../src/model/mock.ts');
+  let attempts = 0; const seen: string[] = [];
+  const h = await createHarness({ worker: () => mockReply({ text: 'x' }), router: (ctx) => {
+    seen.push(allText(ctx.request));
+    if (++attempts === 1) throw new Error('模拟失败');
+    return mockReply({ text: '已恢复' });
+  } });
+  try {
+    h.store.insertIntercom({ id: 'ic_recover', fromLayer: 'watchdog', kind: 'reply', body: '需要恢复的答复', routeKnown: true, sessionKey: 'telegram|bot|peer', conversationId: 'topic' });
+    await h.router.notify();
+    assert.equal(h.store.getIntercom('ic_recover')?.status, 'consumed');
+    assert.ok(h.store.pendingRouterSession('telegram|bot|peer', 'topic'));
+    await h.router.resume();
+    assert.ok(seen[1]!.includes('需要恢复的答复'));
+  } finally { await h.cleanup(); }
+});
+
+test('通信：维护者模型失败后重新启动仍能看到未答问题', async () => {
+  const { createHarness } = await import('../helpers.ts');
+  const { MockModel, mockReply } = await import('../../src/model/mock.ts');
+  const { WatchdogSession } = await import('../../src/watchdog/session.ts');
+  const h = await createHarness({ worker: () => mockReply({ text: 'x' }) });
+  try {
+    h.store.insertIntercom({ id: 'ic_failure', fromLayer: 'router', kind: 'question', body: '失败后恢复的问题' });
+    const failed = new WatchdogSession({ store: h.store, config: h.config, modelName: 'mock', model: new MockModel(() => { throw new Error('模拟失败'); }) });
+    await failed.runOnce(1);
+    let seen = '';
+    const restarted = new WatchdogSession({ store: h.store, config: h.config, modelName: 'mock', model: new MockModel((ctx) => { seen = JSON.stringify(ctx.request.messages); return mockReply({ text: '恢复' }); }) });
+    await restarted.runOnce(1);
+    assert.match(seen, /失败后恢复的问题/);
+    assert.equal(h.store.getIntercom('ic_failure')?.status, 'delivered');
+  } finally { await h.cleanup(); }
+});
+
+test('通信：回复事务失败不留下半条答复或错误确认', () => {
+  withStore((store) => {
+    store.insertIntercom({ id: 'ic_original', fromLayer: 'router', kind: 'question', body: '问题' });
+    store.insertIntercom({ id: 'ic_duplicate', fromLayer: 'watchdog', kind: 'notice', body: '已有消息' });
+    assert.throws(() => store.replyIntercom(store.getIntercom('ic_original')!, 'ic_duplicate', '答复'));
+    assert.equal(store.getIntercom('ic_original')?.status, 'pending');
+    assert.equal(store.getIntercom('ic_duplicate')?.body, '已有消息');
+  });
+});

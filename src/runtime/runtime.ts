@@ -1778,7 +1778,7 @@ note: null,
         if (fresh.length === 0) return [];
         this.recordInboxTurn(workerId, fresh);
         for (const message of fresh) this.markConsumed(message.id);
-        return fresh.map((message) => ({ role: 'user' as const, content: message.body }));
+        return [{ role: 'user' as const, content: this.renderInbox(fresh) }];
       },
       onTerminate: (rest, reason) => {
         const current = this.store.getWorker(workerId);
@@ -1913,9 +1913,7 @@ note: null,
     // 不节流的话维护者每写一条都会触发一轮 Router，两边会互相抽起来。
     // 没有会话归属的消息（CLI、或维护者不知道发给谁）不唤醒 Router：
     // 唤醒了也没有收件对象，只会每 60 秒空转一次。
-    const pendingFromMaintainer = this.store
-      .listPendingIntercom('router', 6)
-      .some((message) => message.sessionKey !== null);
+    const pendingFromMaintainer = this.store.intercomRouterTargets().length > 0;
     if (pendingFromMaintainer && Date.now() - this.lastMaintainerPumpAt >= 60_000) {
       this.lastMaintainerPumpAt = Date.now();
       void this.router?.notify?.();
@@ -2602,8 +2600,8 @@ note: null,
       const file = join(this.config.workDir, '.runtime', 'maintainer.wake');
       mkdirSync(dirname(file), { recursive: true });
       writeFileSync(file, nowIso(), 'utf8');
-    } catch {
-      // 叫不醒不该拖垮业务路径：维护者的定时巡检照样能看到这条消息。
+    } catch (error) {
+      console.warn(`写入维护唤醒标记失败，消息仍会等待定时巡检：${(error as Error).message}`);
     }
   }
 

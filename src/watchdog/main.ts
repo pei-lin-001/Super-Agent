@@ -7,7 +7,7 @@
  */
 import { randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, watch, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { loadConfig } from '../config.ts';
 import { clockStamp } from '../domain/ids.ts';
@@ -307,6 +307,7 @@ log('主系统状态：' + (readInstance(config) ? `实例文件存在（pid=${r
 
 let running = false;
 let lastModelReview = 0;
+const wakeFile = join(config.workDir, '.runtime', 'maintainer.wake');
 
 /**
  * 是否现在需要模型审视：
@@ -408,6 +409,17 @@ async function tick(): Promise<void> {
     });
   } finally {
     running = false;
+    if (process.env['WATCHDOG_ONCE'] !== '1') checkWake();
+  }
+}
+
+function checkWake(): void {
+  if (running || !existsSync(wakeFile)) return;
+  try {
+    rmSync(wakeFile, { force: true });
+    void tick();
+  } catch (error) {
+    log(`读取维护唤醒标记失败，将由定时巡检继续处理：${(error as Error).message}`);
   }
 }
 
@@ -418,7 +430,18 @@ if (process.env['WATCHDOG_ONCE'] === '1') {
   store.close();
   process.exit(0);
 }
-if (process.env['WATCHDOG_NO_TICK'] !== '1') void tick();
+// 唤醒标记由主进程写入；运行中保留标记，当前巡检结束后再处理。
+let wakeWatcher: ReturnType<typeof watch> | null = null;
+try {
+  wakeWatcher = watch(dirname(wakeFile), (_event, name) => {
+    if (!name || name.toString() === 'maintainer.wake') checkWake();
+  });
+  wakeWatcher.on('error', (error) => log(`维护唤醒监听失败，将由定时巡检继续处理：${error.message}`));
+} catch (error) {
+  log(`无法监听维护唤醒标记，将由定时巡检继续处理：${(error as Error).message}`);
+}
+if (existsSync(wakeFile)) checkWake();
+else if (process.env['WATCHDOG_NO_TICK'] !== '1') void tick();
 let timer = setInterval(() => void tick(), intervalMs);
 // 每轮都重新读一次间隔，在线调整不需要重启进程。
 setInterval(() => {
@@ -433,6 +456,7 @@ setInterval(() => {
 
 const shutdown = (): void => {
   log('Watchdog 退出');
+  wakeWatcher?.close();
   disposeJobs();
   store.close();
   process.exit(0);

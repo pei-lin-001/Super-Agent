@@ -37,7 +37,7 @@ export const collabTools: ToolDefinition[] = [
       const model = argOptionalString(args, 'model');
       const result = context.host.createCollaborator(context.worker, role, brief, model ? { model } : {});
       if (!result.ok) return { type: 'failed', content: `创建协作者失败：${result.reason ?? '未知原因'}` };
-      return ok(`已创建协作者 ${result.workerId}｜职责=${role}｜群组=${context.worker.groupId}`);
+      return ok(`已创建协作者 ${result.workerId}｜职责=${role}｜群组=${context.worker.groupId}｜状态 idle；发送消息后开始工作。`);
     },
   },
   {

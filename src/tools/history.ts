@@ -91,7 +91,8 @@ export const historyTools: ToolDefinition[] = [
           const tool = Array.isArray(turn.toolCalls)
             ? `｜调用 ${turn.toolCalls.map((call: { name: string }) => call.name).join('、')}`
             : '';
-          return `--- turn#${turn.seq}｜${turn.role}${tool} ---\n${turn.content ?? ''}`;
+          const calls = Array.isArray(turn.toolCalls) ? `\n工具调用参数：${JSON.stringify(turn.toolCalls)}` : '';
+          return `--- turn#${turn.seq}｜${turn.role}${tool} ---\n${turn.content ?? ''}${calls}`;
         })
         .join('\n\n');
       const { body, next } = slice(text, offset, limit);
@@ -123,6 +124,7 @@ export const historyTools: ToolDefinition[] = [
         `消息 ${message.id}｜kind=${message.kind}｜${message.fromId} → ${message.toId}｜状态 ${message.status}`,
         message.replyTo ? `回复：${message.replyTo}` : '',
         message.payload ? `附加：${JSON.stringify(message.payload)}` : '',
+        message.refs ? `引用：${JSON.stringify(message.refs)}` : '',
         '',
       ]
         .filter(Boolean)

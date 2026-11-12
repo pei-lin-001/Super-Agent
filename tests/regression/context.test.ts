@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createHarness, isNoteRequest, scripted, systemText } from '../helpers.ts';
+import { allText, createHarness, isNoteRequest, roleOf, scripted, systemText } from '../helpers.ts';
 import { mockReply } from '../../src/model/mock.ts';
 import { collectFileOps } from '../../src/runtime/note.ts';
 import { buildNotePrompt, decideNote, renderTurnsForNote, runNote } from '../../src/runtime/note.ts';
@@ -776,4 +776,55 @@ test('整理输入：同名调用按编号关联逆序结果并标明缺失结�
   assert.ok(rendered.includes(`path=${JSON.stringify(longPath)}`), '长路径应完整保留');
   assert.doesNotMatch(rendered, /不应进入整理输入的正文/);
   assert.match(rendered, /执行结果未知 c3.*fs_read/);
+});
+
+test('检索：调用参数和消息引用可按自己的历史分页查回', async () => {
+  const harness = await staticHarness();
+  try {
+    const { owner, task } = harness.runtime.createTask({ title: '证据', goal: 'g', ownerRole: '负责人', ownerBrief: 'b' });
+    const helper = harness.runtime.createCollaborator(owner, '协作者', 'b');
+    const message = harness.runtime.sendMessage({ from: owner, to: helper.workerId!, kind: 'request', intent: 'help', body: '请看', refs: { files: ['materials/evidence.txt'] } });
+    harness.store.appendWorkerTurn({ id: 'turn_args_test', workerId: owner.id, seq: 1, role: 'assistant', content: null,
+      toolCalls: [{ id: 'call_args', name: 'fs_search', arguments: JSON.stringify({ path: 'materials', query: '独特关键词' }) }], toolCallId: null, createdAt: new Date().toISOString() });
+    const { historyTools } = await import('../../src/tools/history.ts');
+    const context = { host: harness.runtime, worker: owner, task, workDir: harness.config.workDir, materialsDir: harness.config.materialsDir, readRoot: harness.config.readRoot };
+    const read = historyTools.find((tool) => tool.name === 'history_read')!;
+    const first = await read.run({ from_seq: 1, limit: 30 }, context);
+    const offset = Number(/offset=(\d+)/.exec(first.content)![1]);
+    const second = await read.run({ from_seq: 1, offset, limit: 2000 }, context);
+    assert.match(second.content, /独特关键词/);
+    const messageRead = await historyTools.find((tool) => tool.name === 'message_read')!.run({ message_id: message.messageId! }, context);
+    assert.match(messageRead.content, /materials\/evidence\.txt/);
+  } finally { await harness.cleanup(); }
+});
+
+test('协作：运行中收到请求时立即看到身份、请求编号与引用并可回复', async () => {
+  let release!: () => void;
+  let started!: () => void;
+  const startedPromise = new Promise<void>((resolve) => { started = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let calls = 0; let seen = '';
+  const harness = await createHarness({ worker: async ({ request }) => {
+    if (roleOf(request) !== '协作者') return mockReply({ text: '等待协作者' });
+    calls += 1;
+    if (calls === 1) { started(); await gate; return mockReply({ toolCalls: [{ name: 'fs_list', arguments: { path: '.' } }] }); }
+    seen = allText(request);
+    return mockReply({ text: '收到' });
+  } });
+  try {
+    const { owner } = harness.runtime.createTask({ title: '运行中', goal: 'g', ownerRole: '负责人', ownerBrief: 'b' });
+    const helper = harness.runtime.createCollaborator(owner, '协作者', 'b');
+    const worker = harness.store.getWorker(helper.workerId!)!;
+    harness.runtime.enqueue(worker.id);
+    await startedPromise;
+    const msg = harness.runtime.sendMessage({ from: owner, to: worker.id, kind: 'request', intent: 'help', body: '请调查', refs: { files: ['materials/evidence.txt'] } });
+    release();
+    for (let i = 0; i < 100 && calls < 2; i++) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.match(seen, new RegExp(msg.messageId!));
+    assert.match(seen, new RegExp(owner.id));
+    assert.match(seen, /intent: help/);
+    assert.match(seen, /materials\/evidence\.txt/);
+    const reply = harness.runtime.sendMessage({ from: worker, to: owner.id, kind: 'reply', replyTo: msg.messageId!, body: '已核查' });
+    assert.equal(reply.ok, true);
+  } finally { release(); await harness.cleanup(); }
 });
