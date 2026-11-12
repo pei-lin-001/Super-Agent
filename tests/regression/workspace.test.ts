@@ -269,7 +269,10 @@ test('图片：当轮进 Router 上下文，下一轮不重发 base64', async ()
     await harness.router.handleUserMessage('这张图是什么', { images: [png] });
 
     const first = harness.routerModel.calls.at(-1)!;
-    const userTurn = first.messages.filter((m) => m.role === 'user').at(-1)!;
+    const userMessages = first.messages.filter((m) => m.role === 'user');
+    assert.match(userMessages.at(-1)?.content ?? '', /系统当前状态/);
+    const userTurn = userMessages.at(-2)!;
+    assert.equal(userTurn.content, '这张图是什么');
     assert.deepEqual(userTurn.images, [png], '当轮要带上图');
 
     // 再问一句（不带图）：历史里的那条不能再拖着 base64。

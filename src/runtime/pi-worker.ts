@@ -8,21 +8,25 @@
  * 4. 把 pi 的事件流折成「这一步有没有结果」的信号
  */
 import type { ChatMessage, ModelClient, ToolSchema } from '../model/types.ts';
+import { validPiAssistant } from '../model/pi.ts';
+import { compile } from '@earendil-works/pi-schema';
+import { formats } from '@earendil-works/pi-schema/formats';
 import type { ToolOutcome } from '../tools/types.ts';
-import { runAgentLoop, type AgentLoopConfig, type StreamFn } from '../vendor/pi/agent-loop.ts';
+import { runAgentLoop, type AgentLoopConfig, type AgentContext, type AgentMessage, type StreamFn } from '@earendil-works/pi-agent-core';
 import { compactionTrigger } from './window.ts';
-import { EventStream } from '../vendor/pi/event-stream.ts';
-import type {
-  AgentMessage,
-  AssistantMessage,
-  AssistantMessageEvent,
-  Context,
-  Message,
-  StopReason,
-  ToolCall as PiToolCall,
-  ToolDeclaration,
-  ToolResultMessage,
-} from '../vendor/pi/types.ts';
+import { createAssistantMessageEventStream, type AssistantMessage, type Message, type StopReason, type ToolCall as PiToolCall, type ToolResultMessage } from '@earendil-works/pi-ai';
+
+const emptyUsage = () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } });
+
+/** 工具执行前严格校验原始值，避免官方默认类型转换改变业务语义。 */
+export function strictToolArguments(tool: ToolSchema): (args: unknown) => Record<string, unknown> {
+  const validator = compile(tool.parameters, { formats, unresolvedRefs: 'reject' });
+  return (args) => {
+    const result = validator.validate(args);
+    if (!result.ok) throw new Error(`工具 ${tool.name} 参数校验失败：${result.errors.map((error) => `${error.path || '/'} ${error.message}`).join('；')}`);
+    return args as Record<string, unknown>;
+  };
+}
 
 export type TurnStop = 'wait' | 'finish' | 'steps' | 'cancelled' | 'error';
 
@@ -41,6 +45,8 @@ export interface WorkerTurnInput {
   prompts: ChatMessage[];
   /** 之前的历史。 */
   history: ChatMessage[];
+  /** 初始对话中需要在轮内裁剪时保留的消息位置。 */
+  protectedMessageIndexes?: number[];
   tools: ToolSchema[];
   /** 单轮调度最多几步。 */
   maxSteps: number;
@@ -112,6 +118,7 @@ export function toAgentMessages(messages: ChatMessage[]): AgentMessage[] {
       continue;
     }
     if (message.role === 'assistant') {
+      if (validPiAssistant(message.piMessage)) { out.push(message.piMessage); continue; }
       const content: AssistantMessage['content'] = [];
       if (message.content) content.push({ type: 'text', text: message.content });
       for (const call of message.toolCalls ?? []) {
@@ -125,8 +132,9 @@ export function toAgentMessages(messages: ChatMessage[]): AgentMessage[] {
       out.push({
         role: 'assistant',
         content,
+        api: 'openai-completions', provider: 'super-agent',
         model: '',
-        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        usage: emptyUsage(),
         stopReason: message.toolCalls && message.toolCalls.length > 0 ? 'toolUse' : 'stop',
         timestamp: Date.now(),
       });
@@ -138,7 +146,7 @@ export function toAgentMessages(messages: ChatMessage[]): AgentMessage[] {
       toolCallId: message.toolCallId ?? '',
       // pi 用 toolName 做事件标注，本地历史只存 toolCallId；留空不影响配对。
       toolName: '',
-      content: [{ type: 'text', text: message.content ?? '' }],
+      content: [{ type: 'text', text: message.content ?? '' }, ...(message.images ?? []).map((image) => ({ type: 'image' as const, ...image }))],
       // 必须透传：恒置 false 会让失败的工具结果在回放时变成成功。
       isError: message.isError ?? false,
       timestamp: Date.now(),
@@ -147,11 +155,11 @@ export function toAgentMessages(messages: ChatMessage[]): AgentMessage[] {
   return out;
 }
 
-function parseArguments(raw: string): Record<string, unknown> {
+function parseArguments(raw: string): PiToolCall['arguments'] {
   try {
     const parsed: unknown = raw.trim() === '' ? {} : JSON.parse(raw);
     if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
+      return parsed as PiToolCall['arguments'];
     }
   } catch {
     // 参数不是合法 JSON：交给工具层报可读错误，这里给空对象。
@@ -191,6 +199,7 @@ export function toLlmMessages(messages: AgentMessage[]): { system: string; chat:
         .map((block) => ({ id: block.id, name: block.name, arguments: JSON.stringify(block.arguments) }));
       chat.push({
         role: 'assistant',
+        piMessage: message,
         content: text.length > 0 ? text : null,
         ...(toolCalls.length > 0 ? { toolCalls } : {}),
       });
@@ -198,25 +207,9 @@ export function toLlmMessages(messages: AgentMessage[]): { system: string; chat:
     }
     if (message.role !== 'toolResult') continue;
     const text = textOf(message.content);
-    // 模型侧 tool 消息只有 content，失败状态只能落在文本上；
-    // 内容里已经写了「失败 / 未执行」的不重复加前缀。
-    const flagged =
-      message.isError && !/失败|未执行|不可用|拒绝/.test(text) ? `[执行失败] ${text}` : text;
-    chat.push({
-      role: 'tool',
-      content: flagged,
-      toolCallId: message.toolCallId,
-      ...(message.isError ? { isError: true } : {}),
-    });
-    // 工具返回的图片（fs_view_image）不能挂在 tool 消息上——协议的 tool 角色只有文本。
-    // 折成紧随其后的一条 user 消息，正是 pi 的适配器对 toolResult 里图片块的处理方式。
-    const images =
-      typeof message.content === 'string'
-        ? []
-        : message.content
-            .filter((block): block is { type: 'image'; data: string; mimeType: string } => block.type === 'image')
-            .map((block) => ({ mimeType: block.mimeType, data: block.data }));
-    if (images.length > 0) chat.push({ role: 'user', content: '（上面工具返回的图片）', images });
+    const images = message.content.filter((block) => block.type === 'image').map((block) => ({ mimeType: block.mimeType, data: block.data }));
+    chat.push({ role: 'tool', content: text, toolCallId: message.toolCallId,
+      ...(message.isError ? { isError: true } : {}), ...(images.length ? { images } : {}) });
   }
   return { system: systemParts.join('\n\n'), chat };
 }
@@ -236,23 +229,17 @@ export function makeStreamFn(
   model: string,
   reasoningEffort?: string,
 ): StreamFn {
-  return (context, options) => {
-    const stream = new EventStream<AssistantMessageEvent, AssistantMessage>(
-      (event) => event.type === 'done' || event.type === 'error',
-      (event) => {
-        if (event.type === 'done') return event.message;
-        if (event.type === 'error') return event.error;
-        throw new Error('Unexpected event type');
-      },
-    );
+  return (_model, context, options = {}) => {
+    const stream = createAssistantMessageEventStream();
 
     void (async () => {
       const timestamp = Date.now();
       const empty: AssistantMessage = {
         role: 'assistant',
         content: [],
+        api: 'openai-completions', provider: 'super-agent',
         model: '',
-        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        usage: emptyUsage(),
         stopReason: 'pending',
         timestamp,
       };
@@ -275,35 +262,38 @@ export function makeStreamFn(
             arguments: parseArguments(call.arguments),
           });
         }
-        const message: AssistantMessage = {
+        const message: AssistantMessage = result.piMessage ?? {
           role: 'assistant',
           content,
+          api: 'openai-completions', provider: 'super-agent',
           model: result.model,
           usage: {
+            ...emptyUsage(),
             input: result.usage?.promptTokens ?? 0,
             output: result.usage?.completionTokens ?? 0,
-            cacheRead: 0,
-            cacheWrite: 0,
+            cacheRead: result.usage?.cacheReadTokens ?? 0,
+            cacheWrite: result.usage?.cacheWriteTokens ?? 0,
           },
           stopReason: mapStopReason(result.finishReason),
           timestamp,
         };
         stream.push({ type: 'start', partial: { ...empty } });
-        stream.push({ type: 'done', reason: message.stopReason, message });
+        stream.push({ type: 'done', reason: message.stopReason as 'stop' | 'length' | 'toolUse' | 'deferred', message });
         stream.end(message);
       } catch (error) {
         const aborted = options.signal?.aborted === true;
         const message: AssistantMessage = {
           role: 'assistant',
           content: [],
+          api: 'openai-completions', provider: 'super-agent',
           model: '',
-          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          usage: emptyUsage(),
           stopReason: aborted ? 'aborted' : 'error',
           errorMessage: (error as Error).message,
           timestamp,
         };
         stream.push({ type: 'start', partial: { ...empty } });
-        stream.push({ type: 'error', reason: message.stopReason, error: message });
+        stream.push({ type: 'error', reason: aborted ? 'aborted' : 'error', error: message });
         stream.end(message);
       }
     })();
@@ -346,7 +336,7 @@ function mapStopReason(finishReason: string): StopReason {
  * 返回 stop 表示这一轮为什么停下：等待依赖、已提交、步数用完、被取消。
  */
 export async function runWorkerTurn(input: WorkerTurnInput): Promise<WorkerTurnResult> {
-  const context: Context = {
+  const context: AgentContext = {
     // system 提示作为第一条消息进 transcript：agent-loop 只在工具集合变化时才插入
     // system 消息，提示本身必须由宿主提供，否则模型根本收不到角色说明。
     messages: [
@@ -354,12 +344,9 @@ export async function runWorkerTurn(input: WorkerTurnInput): Promise<WorkerTurnR
       ...toAgentMessages(input.history),
       ...toAgentMessages(input.prompts),
     ],
-    tools: input.tools.map((tool) => ({
-      name: tool.name,
-      description: tool.description,
-      parameters: tool.parameters,
-    })),
+    tools: [],
   };
+  const protectedMessages = new Set((input.protectedMessageIndexes ?? []).map((index) => context.messages[index + 1]).filter((message): message is AgentMessage => message !== undefined));
 
   let stop: TurnStop = 'steps';
   let reason: string | undefined;
@@ -388,9 +375,29 @@ export async function runWorkerTurn(input: WorkerTurnInput): Promise<WorkerTurnR
     steps += 1;
     input.onStep?.(message);
   };
+  let currentAssistant: AssistantMessage | null = null;
+  context.tools = input.tools.map((tool) => ({
+    ...tool,
+    label: tool.name,
+    prepareArguments: strictToolArguments(tool),
+    execute: async (id: string, args: Record<string, unknown>) => {
+      const executed = await input.runTool({ id, name: tool.name, arguments: JSON.stringify(args) });
+      if (executed.terminate) {
+        const calls = currentAssistant?.content.filter((block): block is PiToolCall => block.type === 'toolCall') ?? [];
+        const rest = calls.slice(calls.findIndex((call) => call.id === id) + 1)
+          .map((call) => ({ id: call.id, name: call.name, arguments: JSON.stringify(call.arguments) }));
+        if (rest.length > 0) input.onTerminate?.(rest, executed.outcome.content);
+        stopWith(executed.outcome.type as TurnStop, executed.outcome.content);
+      }
+      return { content: [{ type: 'text' as const, text: executed.outcome.content },
+        ...(executed.outcome.type === 'ok' ? (executed.outcome.images ?? []).map((image) => ({ type: 'image' as const, ...image })) : [])],
+        details: undefined, isError: executed.outcome.type === 'failed', terminate: executed.terminate };
+    },
+  }));
 
   const config: AgentLoopConfig = {
-    model: input.model,
+    model: { id: input.model, name: input.model, api: 'openai-completions', provider: 'super-agent', baseUrl: '', input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, reasoning: true, contextWindow: 200_000, maxTokens: 8192 },
+    toolExecution: 'sequential',
     convertToLlm: (messages) => messages,
     // pi 的 compaction 挂载点。不接这个回调 = 自动压缩不存在，上下文只能靠
     // 外层在调用前裁一次，轮内涨上去就没人管。
@@ -423,7 +430,7 @@ export async function runWorkerTurn(input: WorkerTurnInput): Promise<WorkerTurnR
         keptChars += chars;
         cut -= 1;
       }
-      // 系统提示永远保留。
+      // 系统提示和本轮输入的身份、状态始终保留；只裁剪历史与工具往返。
       const systemCount = messages.findIndex((message) => message.role !== 'system');
       const floor = systemCount < 0 ? messages.length : systemCount;
       cut = Math.max(cut, floor);
@@ -445,43 +452,22 @@ export async function runWorkerTurn(input: WorkerTurnInput): Promise<WorkerTurnR
         ],
         timestamp: Date.now(),
       };
-      const next = [...messages.slice(0, floor), notice, ...messages.slice(cut)];
-      const afterTokens = Math.ceil((totalChars - keptChars + 60) / charsPerToken);
+      const preserved = messages.slice(floor, cut).filter((message) => protectedMessages.has(message));
+      const next = [...messages.slice(0, floor), ...preserved, notice, ...messages.slice(cut)];
+      const afterTokens = Math.ceil(next.reduce((sum, message) => sum + agentMessageChars(message), 0) / charsPerToken);
       rule.onCompact?.({ beforeTokens, afterTokens, droppedMessages: dropped });
       return { context: { ...turn.context, messages: next } };
     },
-    executeToolCall: async ({ toolCall, assistantMessage }) => {
+    beforeToolCall: async ({ toolCall, assistantMessage }) => {
       // 每步之前再核一次资格：暂停/取消之后旧响应不得继续执行。
       const blocked = input.canContinue?.();
       if (blocked) {
         stopWith('cancelled', blocked);
-        return toolResultMessage(toolCall, `未执行：${blocked}`, true);
+        return { block: true, reason: `未执行：${blocked}`, terminate: true };
       }
-      ensureStep(assistantMessage);
-      const executed = await input.runTool({
-        id: toolCall.id,
-        name: toolCall.name,
-        arguments: JSON.stringify(toolCall.arguments),
-      });
-      if (executed.terminate) {
-        // 同一批里后面的调用没有结果，必须留下明确记录，否则历史里会出现无结果的 tool_call。
-        const rest = assistantMessage.content
-          .filter((block): block is PiToolCall => block.type === 'toolCall')
-          .slice(
-            assistantMessage.content
-              .filter((block): block is PiToolCall => block.type === 'toolCall')
-              .findIndex((block) => block.id === toolCall.id) + 1,
-          )
-          .map((block) => ({ id: block.id, name: block.name, arguments: JSON.stringify(block.arguments) }));
-        if (rest.length > 0) input.onTerminate?.(rest, executed.outcome.content);
-        stopWith(executed.outcome.type as TurnStop, executed.outcome.content);
-      }
-      return toolResultMessage(
-        toolCall,
-        executed.outcome.content,
-        executed.outcome.type === 'failed',
-        executed.outcome.type === 'ok' ? executed.outcome.images : undefined,
-      );
+      currentAssistant = assistantMessage as unknown as AssistantMessage;
+      ensureStep(currentAssistant);
+      return undefined;
     },
     finishTurn: async (turn) => {
       // 模型层报错/被取消要如实反映，不能当成"步数用完"。
@@ -512,7 +498,7 @@ export async function runWorkerTurn(input: WorkerTurnInput): Promise<WorkerTurnR
       return undefined;
     },
     // 每轮开始前把新到的消息注入对话：协作者的回复不能等到下一轮调度才看见。
-    getSteeringMessages: () => toAgentMessages(input.pullInbox?.() ?? []),
+    getSteeringMessages: async () => toAgentMessages(input.pullInbox?.() ?? []) as never,
   };
 
   try {
@@ -567,6 +553,7 @@ export function toStepResult(message: AssistantMessage): {
   finishReason: string;
   model: string;
   usage: { promptTokens: number; completionTokens: number } | null;
+  piMessage: AssistantMessage;
 } {
   const text = message.content
     .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
@@ -577,6 +564,7 @@ export function toStepResult(message: AssistantMessage): {
     .map((block) => block.thinking)
     .join('');
   return {
+    piMessage: message,
     text: text.length > 0 ? text : null,
     reasoning: reasoning.length > 0 ? reasoning : null,
     toolCalls: message.content

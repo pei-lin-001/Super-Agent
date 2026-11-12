@@ -77,6 +77,21 @@ const gate = new Semaphore(
   Number.isFinite(MIN_INTERVAL) ? MIN_INTERVAL : 1500,
 );
 
+/** 只接收适配器产生的助手消息，拒绝借原始字段注入其他角色或损坏内容块。 */
+export function validPiAssistant(value: unknown): value is AssistantMessage {
+  if (!value || typeof value !== 'object') return false;
+  const message = value as Record<string, unknown>;
+  if (message['role'] !== 'assistant' || !Array.isArray(message['content']) || typeof message['api'] !== 'string' || typeof message['provider'] !== 'string' || typeof message['model'] !== 'string' || !message['usage'] || typeof message['usage'] !== 'object' || typeof message['stopReason'] !== 'string' || typeof message['timestamp'] !== 'number') return false;
+  return message['content'].every((item: unknown) => {
+    if (!item || typeof item !== 'object') return false;
+    const block = item as Record<string, unknown>;
+    if (block['type'] === 'text') return typeof block['text'] === 'string';
+    if (block['type'] === 'thinking') return typeof block['thinking'] === 'string';
+    if (block['type'] === 'toolCall') return typeof block['id'] === 'string' && typeof block['name'] === 'string' && !!block['arguments'] && typeof block['arguments'] === 'object' && !Array.isArray(block['arguments']);
+    return false;
+  });
+}
+
 /** 把本仓库的消息形状转成 pi 的 Message。 */
 export function toPiMessage(message: ChatMessage, model: string): Message | null {
   if (message.role === 'system') {
@@ -108,11 +123,12 @@ export function toPiMessage(message: ChatMessage, model: string): Message | null
       // pi 的 toolResult 要 toolName，但我们历史里只存 toolCallId；
       // 提供方按 id 对应，留空不影响配对。
       toolName: '',
-      content: [{ type: 'text', text: message.content ?? '' }],
+      content: [{ type: 'text', text: message.isError ? `[执行失败] ${message.content ?? ''}` : (message.content ?? '') }, ...(message.images ?? []).map((image) => ({ type: 'image' as const, ...image }))],
       isError: message.isError === true,
       timestamp: Date.now(),
     };
   }
+  if (validPiAssistant(message.piMessage)) return message.piMessage;
   // assistant：文本 + 工具调用。历史里的思考块没有签名，重放会被提供方拒；
   // 我们只回放「说了什么」和「要做什么」。
   const content: Extract<Message, { role: 'assistant' }>['content'] = [];
@@ -180,6 +196,7 @@ export function fromPiMessage(message: AssistantMessage): StepResult {
     }
   }
   return {
+    piMessage: message,
     text: texts.length > 0 ? texts.join('') : null,
     reasoning: thoughts.length > 0 ? thoughts.join('') : null,
     toolCalls,
@@ -312,6 +329,7 @@ export class PiModel implements ModelClient {
         // pi 的适配器强制走流式（stream: true），HTTP 错误不抛异常而是落在
         // stopReason='error' + errorMessage 里，所以状态码要从 onResponse / 消息里取。
         let httpStatus: number | null = null;
+        let usagePresent = false;
         const events = stream(this.model, context, {
           apiKey: this.options.apiKey,
           signal: request.signal
@@ -321,6 +339,11 @@ export class PiModel implements ModelClient {
           maxRetries: 0,
           onResponse: (response) => {
             httpStatus = response.status;
+          },
+          onProviderStreamEvent: (event) => {
+            if (!event || typeof event !== 'object') return;
+            const chunk = event as { usage?: unknown; choices?: { usage?: unknown }[] };
+            if (chunk.usage != null || chunk.choices?.some((choice) => choice.usage != null)) usagePresent = true;
           },
           ...(thinkingLevel ? { thinkingLevel } : {}),
           ...(request.temperature !== undefined ? { temperature: request.temperature } : {}),
@@ -348,6 +371,7 @@ export class PiModel implements ModelClient {
           });
         }
         const step = fromPiMessage(result);
+        if (!usagePresent) step.usage = null;
         if ((step.text === null || step.text.trim() === '') && step.toolCalls.length === 0) {
           const detail =
             `模型既没有输出文本也没有工具调用` +

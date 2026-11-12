@@ -15,6 +15,8 @@ import type { DecisionClient } from '../model/decision.ts';
 import type { ImagePart } from '../model/types.ts';
 import { isDormantWorker, isTerminalWorker } from '../domain/state.ts';
 import { boundRouterHistory, planRouterContext, runRouterNote } from './router-context.ts';
+import { runAgentLoop, type AgentContext, type AgentLoopConfig } from '@earendil-works/pi-agent-core';
+import { makeStreamFn, strictToolArguments, toAgentMessages, toLlmMessages, toStepResult } from './pi-worker.ts';
 
 const ROUTER_TOOLS: ToolSchema[] = [
   {
@@ -538,9 +540,10 @@ export class Router {
       // 让后面的历史全部失去缓存。落库的只有用户原话，不重复存表单。
       messages.push({
         role: 'user',
-        content: `${stateBlock}\n\n# 用户这轮说的话\n${userText}`,
+        content: userText,
         ...(context.images && context.images.length > 0 ? { images: context.images } : {}),
       });
+      messages.push({ role: 'user', content: stateBlock });
       this.runtime.store.appendRouterTurn({
         id: `rt_${randomBytes(4).toString('hex')}_u`,
         role: 'user',
@@ -583,139 +586,124 @@ export class Router {
     this.activeSessions.add(sessionId);
     const maxRounds = Math.max(1, this.config.limits.maxRouterRounds);
 
-    const runOptions = (calls: unknown, results: Map<number, string>): string[] => {
-      const list = Array.isArray(calls) ? (calls as { id: string; name: string }[]) : [];
-      const outputs: string[] = [];
-      for (let index = 0; index < list.length; index += 1) {
-        const saved = results.get(index);
-        if (saved === undefined) return outputs;
-        messages.push({ role: 'tool', content: saved, toolCallId: list[index]!.id });
-        outputs.push(saved);
+    let step = 0;
+    // 恢复未完成的决策时沿用原有身份与回执，绝不重新请求模型或重复已完成的动作。
+    const pendingDecision = this.runtime.store.pendingRouterDecision(sessionId);
+    if (pendingDecision) {
+      const calls = (pendingDecision.toolCalls as { id: string; name: string; arguments: string }[]) ?? [];
+      const recovered: ChatMessage[] = [{ role: 'assistant', content: pendingDecision.text, ...(pendingDecision.piMessage ? { piMessage: pendingDecision.piMessage } : {}), ...(calls.length ? { toolCalls: calls } : {}) }];
+      for (let index = 0; index < calls.length; index += 1) {
+        const call = calls[index]!;
+        const actionKey = `${pendingDecision.id}:${index}`;
+        const cached = this.runtime.store.getRouterAction(sessionId, actionKey);
+        const content = cached?.result ?? await this.executeTool(call.name, call.arguments, { sessionId, actionKey, sessionKey, scope });
+        if (!cached) this.runtime.store.saveRouterAction({ id: `ra_${randomBytes(4).toString('hex')}`, sessionId, actionKey, tool: call.name, result: content });
+        recovered.push({ role: 'tool', content, toolCallId: call.id });
       }
-      return outputs;
-    };
-    void runOptions;
+      this.commitDecision(pendingDecision.id, sessionId, [...messages, ...recovered]);
+      messages.push(...recovered);
+      step += 1;
+    }
 
-    for (let step = 0; step < maxRounds; step += 1) {
-      // 先消费上次保存、但尚未执行完的那次决策：恢复时不会重放已完成的动作。
-      const pending = this.runtime.store.pendingRouterDecision(sessionId);
-      if (pending) {
-        const calls = (pending.toolCalls as { id: string; name: string; arguments: string }[]) ?? [];
-        messages.push({
-          role: 'assistant',
-          content: pending.text,
-          ...(calls.length > 0 ? { toolCalls: calls } : {}),
-        });
-        for (let index = 0; index < calls.length; index += 1) {
-          const call = calls[index]!;
-          const actionKey = `${pending.id}:${index}`;
-          const cached = this.runtime.store.getRouterAction(sessionId, actionKey);
-          if (cached) {
-            messages.push({ role: 'tool', content: cached.result, toolCallId: call.id });
-            continue;
+    let answer: string | null = null;
+    let answerPiMessage: import('@earendil-works/pi-ai').AssistantMessage | undefined;
+    if (step < maxRounds) {
+      const tools = this.readOnly ? [] : ROUTER_TOOLS;
+      let decision: { id: string; calls: ReturnType<typeof toStepResult>['toolCalls']; messages: ChatMessage[] } | null = null;
+      let modelError: unknown;
+      let toolError: unknown;
+      const recordingModel: ModelClient = {
+        kind: this.model.kind,
+        label: this.model.label,
+        chat: async (request) => {
+          try {
+            return await execution.attach(new RecordingModel(this.model, this.runtime.store, 'router', {
+              sessionId, routerSessionKey: sessionKey, conversationId: scope.conversationId,
+              modelAlias: this.config.defaultModelAlias,
+            }).chat(request));
+          } catch (error) {
+            modelError = error;
+            throw error;
           }
-          const content = await this.executeTool(call.name, call.arguments, {
-            sessionId,
-            actionKey,
-            sessionKey,
-            scope,
-          });
-          // create_task 已经在事务里写过回执，这里用 INSERT OR IGNORE 保证不会重复。
-          this.runtime.store.saveRouterAction({
-            id: `ra_${randomBytes(4).toString('hex')}`,
-            sessionId,
-            actionKey,
-            tool: call.name,
-            result: content,
-          });
-          messages.push({ role: 'tool', content, toolCallId: call.id });
+        },
+      };
+      const agentContext: AgentContext = {
+        messages: [{ role: 'system', content: messages.filter((m) => m.role === 'system').map((m) => m.content ?? '').join('\n\n'), timestamp: 0 }, ...toAgentMessages(messages)],
+        tools: tools.map((tool) => ({
+          ...tool, label: tool.name, prepareArguments: strictToolArguments(tool),
+          execute: async (id: string, args: Record<string, unknown>) => {
+            if (!decision) throw new Error('工具执行前缺少已保存的 Router 决策');
+            const index = decision.calls.findIndex((call) => call.id === id);
+            if (index < 0) throw new Error(`找不到 Router 工具调用 ${id}`);
+            const call = decision.calls[index]!;
+            const actionKey = `${decision.id}:${index}`;
+            const cached = this.runtime.store.getRouterAction(sessionId, actionKey);
+            try {
+              const content = cached?.result ?? await this.executeTool(call.name, JSON.stringify(args), { sessionId, actionKey, sessionKey, scope });
+              return { content: [{ type: 'text' as const, text: content }], details: undefined };
+            } catch (error) {
+              toolError = error;
+              throw error;
+            }
+          },
+        })),
+      };
+      const config: AgentLoopConfig = {
+        model: { id: this.modelName, name: this.modelName, api: 'openai-completions', provider: 'super-agent', baseUrl: '', input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, reasoning: true, contextWindow: 200_000, maxTokens: 8192 },
+        toolExecution: 'sequential',
+        convertToLlm: (agentMessages) => agentMessages,
+        finishTurn: async (turn) => {
+          if (turn.message.stopReason === 'error' || turn.message.stopReason === 'aborted') {
+            throw modelError ?? new Error(turn.message.errorMessage ?? 'Router 模型调用失败');
+          }
+          step += 1;
+          if (decision) {
+            this.commitDecision(decision.id, sessionId, [...messages, ...decision.messages]);
+            messages.push(...decision.messages);
+            decision = null;
+          } else {
+            answer = toStepResult(turn.message).text?.trim() ?? '';
+            answerPiMessage = turn.message;
+            return { action: 'end' as const };
+          }
+          if (step >= maxRounds) return { action: 'end' as const };
+          return undefined;
+        },
+      };
+      await execution.attach(runAgentLoop([], agentContext, config, async (event) => {
+        if (event.type === 'tool_execution_end' && toolError !== undefined) throw toolError;
+        if (event.type !== 'message_end') return;
+        if (event.message.role === 'assistant') {
+          const result = toStepResult(event.message);
+          if (!result.toolCalls.length || event.message.stopReason === 'error' || event.message.stopReason === 'aborted') return;
+          const id = `rd_${randomBytes(4).toString('hex')}`;
+          this.runtime.store.saveRouterDecision({ id, sessionId, turnNo: step, text: result.text, toolCalls: result.toolCalls, piMessage: result.piMessage });
+          decision = { id, calls: result.toolCalls, messages: [{ role: 'assistant', content: result.text, toolCalls: result.toolCalls, piMessage: result.piMessage }] };
+          this.publish({ type: 'router.progress', text: `正在执行：${result.toolCalls.map((call) => call.name).join('、')}`, sessionKey });
+        } else if (event.message.role === 'toolResult' && decision) {
+          const toolMessage = event.message;
+          const index = decision.calls.findIndex((call) => call.id === toolMessage.toolCallId);
+          if (index < 0) throw new Error(`找不到 Router 工具回执 ${event.message.toolCallId}`);
+          const content = event.message.content.filter((block) => block.type === 'text').map((block) => block.text).join('');
+          this.runtime.store.saveRouterAction({ id: `ra_${randomBytes(4).toString('hex')}`, sessionId, actionKey: `${decision.id}:${index}`, tool: decision.calls[index]!.name, result: content });
+          decision.messages.push(...toLlmMessages([event.message]).chat);
         }
-        this.commitDecision(pending.id, sessionId, messages);
-        continue;
-      }
+      }, this.runtime.lifecycleSignal ?? undefined, makeStreamFn(recordingModel, tools, this.modelName, this.config.reasoningEffort)));
+    }
 
-      const result = await execution.attach(
-        new RecordingModel(this.model, this.runtime.store, 'router', {
-          sessionId,
-          // Router 固定走默认模型配置；记下来，便于和 Worker 的调用区分核对。
-          modelAlias: this.config.defaultModelAlias,
-        }).chat({
-        model: this.modelName,
-        messages,
-        tools: this.readOnly ? [] : ROUTER_TOOLS,
-          reasoningEffort: this.config.reasoningEffort,
-          // 进程级取消：停机时 Router 的请求同样要停下，不能只在库里留下脏写。
-          signal: this.runtime.lifecycleSignal,
-        }),
-      );
-
-      if (result.toolCalls.length === 0) {
-        const answer = result.text?.trim() ?? '';
-        if (answer === '') {
-          this.publish({ type: 'router.notice', text: 'Router 没有输出内容，已忽略本轮。', sessionKey });
-          this.finishSession(sessionId, 'done', messages, sessionKey, scope.conversationId);
-          return 'done';
-        }
-        messages.push({ role: 'assistant', content: answer });
-        this.runtime.store.appendRouterTurn({
-          id: `rt_${randomBytes(4).toString('hex')}_a`,
-          role: 'assistant',
-          content: answer,
-          sessionKey,
-          // 最终回答必须和用户消息写同一个话题：漏了这个字段，
-          // 下一轮按话题取历史时上一轮回答就被过滤掉，模型像失忆。
-          conversationId: scope.conversationId,
-          createdAt: nowIso(),
-        });
-        // 回信目标由程序按会话决定，不接受模型给出的 chatId。
-        this.publish({ type: 'router.reply', text: answer, sessionKey });
-        this.publishOutbound(sessionKey, answer, inbox[0]?.taskId ?? null, null, scope.conversationId);
-        for (const message of inbox) this.consume(message.id);
-        // 完成即收尾：会话不能停在"进行中"，否则 tick 会再续接一次并重复建任务。
+    if (answer !== null) {
+      if (answer === '') {
+        this.publish({ type: 'router.notice', text: 'Router 没有输出内容，已忽略本轮。', sessionKey });
         this.finishSession(sessionId, 'done', messages, sessionKey, scope.conversationId);
         return 'done';
       }
-
-      // 决策先落库，工具调用身份从这条记录派生，不依赖每轮从 0 开始的循环位置。
-      const names = result.toolCalls.map((call) => call.name).join('、');
-      this.publish({ type: 'router.progress', text: `正在执行：${names}`, sessionKey });
-      const decisionId = `rd_${randomBytes(4).toString('hex')}`;
-      this.runtime.store.saveRouterDecision({
-        id: decisionId,
-        sessionId,
-        turnNo: step,
-        text: result.text,
-        toolCalls: result.toolCalls,
-      });
-      messages.push({
-        role: 'assistant',
-        content: result.text,
-        ...(result.toolCalls.length > 0 ? { toolCalls: result.toolCalls } : {}),
-      });
-      for (let index = 0; index < result.toolCalls.length; index += 1) {
-        const call = result.toolCalls[index]!;
-        const actionKey = `${decisionId}:${index}`;
-        const cached = this.runtime.store.getRouterAction(sessionId, actionKey);
-        if (cached) {
-          messages.push({ role: 'tool', content: cached.result, toolCallId: call.id });
-          continue;
-        }
-        const content = await this.executeTool(call.name, call.arguments, {
-            sessionId,
-            actionKey,
-            sessionKey,
-            scope,
-          });
-        this.runtime.store.saveRouterAction({
-          id: `ra_${randomBytes(4).toString('hex')}`,
-          sessionId,
-          actionKey,
-          tool: call.name,
-          result: content,
-        });
-        messages.push({ role: 'tool', content, toolCallId: call.id });
-      }
-      this.commitDecision(decisionId, sessionId, messages);
+      messages.push({ role: 'assistant', content: answer, ...(answerPiMessage ? { piMessage: answerPiMessage } : {}) });
+      this.runtime.store.appendRouterTurn({ id: `rt_${randomBytes(4).toString('hex')}_a`, role: 'assistant', content: answer, piMessage: answerPiMessage, sessionKey, conversationId: scope.conversationId, createdAt: nowIso() });
+      this.publish({ type: 'router.reply', text: answer, sessionKey });
+      this.publishOutbound(sessionKey, answer, inbox[0]?.taskId ?? null, null, scope.conversationId);
+      for (const message of inbox) this.consume(message.id);
+      this.finishSession(sessionId, 'done', messages, sessionKey, scope.conversationId);
+      return 'done';
     }
 
     // 挂起：保存最新进度，下一轮续接。这是唯一保留待续接状态的路径。

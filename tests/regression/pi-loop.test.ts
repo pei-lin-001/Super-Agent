@@ -6,6 +6,8 @@ import test from 'node:test';
 import { mockReply, MockModel } from '../../src/model/mock.ts';
 import type { ChatRequest } from '../../src/model/types.ts';
 import { runWorkerTurn, toAgentMessages, toLlmMessages } from '../../src/runtime/pi-worker.ts';
+import { PiModel } from '../../src/model/pi.ts';
+import { sseText, sseTools } from '../sse.ts';
 
 const TOOLS = [
   {
@@ -14,6 +16,30 @@ const TOOLS = [
     parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
   },
 ];
+
+test('轮内压缩：计入缓存并保留身份、当前任务和完整工具对', async () => {
+  const requests: { messages: { role: string; content: string | null; tool_call_id?: string }[] }[] = [];
+  const model = new PiModel({ baseUrl: 'http://127.0.0.1:1/v1', apiKey: 'fake', timeoutMs: 2000, retry: 0,
+    fetchImpl: async (_url, init) => {
+      requests.push(JSON.parse(String(init?.body)));
+      const data = requests.length === 1
+        ? sseTools([{ id: 'call_keep', name: 'read_file', args: { path: 'a' } }]).replace('"prompt_tokens":5,"completion_tokens":5', '"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":95}')
+        : sseText('完成');
+      return new Response(data, { headers: { 'content-type': 'text/event-stream' } });
+    } }, 'mock');
+  let compact = 0;
+  await runWorkerTurn({ model: 'mock', modelClient: model, systemPrompt: '规则', history: [],
+    prompts: [{ role: 'user', content: '身份 ID' }, { role: 'user', content: '旧记录'.repeat(1000) }, { role: 'user', content: '目标与产物状态' }],
+    protectedMessageIndexes: [0, 2], tools: TOOLS, maxSteps: 2, signal: null,
+    compaction: { contextWindowTokens: 100, reserveTokens: 0, keepRecentTokens: 1, onCompact: () => { compact++; } },
+    runTool: async () => ({ outcome: { type: 'ok', content: '结果' }, terminate: false }) });
+  assert.equal(compact, 1);
+  const next = requests[1]!.messages;
+  assert.ok(next.some((item) => item.content === '身份 ID'));
+  assert.ok(next.some((item) => item.content === '目标与产物状态'));
+  assert.ok(next.some((item) => item.role === 'assistant'));
+  assert.ok(next.some((item) => item.role === 'tool' && item.tool_call_id === 'call_keep'));
+});
 
 function makeModel(handler: (request: ChatRequest, callIndex: number) => ReturnType<typeof mockReply>): MockModel {
   let index = 0;
@@ -220,6 +246,21 @@ test('pi loop：工具失败标记进 pi 消息，也进模型可见文本', asy
     { role: 'toolResult', toolCallId: 'c1', toolName: 'read_file', content: [{ type: 'text', text: '返回值为 0' }], isError: true, timestamp: 0 },
   ]);
   assert.equal(chat[0]!.role, 'tool');
-  assert.match(chat[0]!.content ?? '', /执行失败/, '失败必须体现在模型可见文本上');
+  assert.equal(chat[0]!.content, '返回值为 0');
   assert.equal(chat[0]!.isError, true);
+});
+
+test('工具参数：数字不能转换成字符串后绕过原始类型校验', async () => {
+  let executed = false;
+  const seen: ChatRequest[] = [];
+  const model = makeModel((request, index) => {
+    seen.push(request);
+    return index === 0 ? mockReply({ toolCalls: [{ name: 'read_file', arguments: { path: 42 } }] }) : mockReply({ text: '参数错误' });
+  });
+  await runWorkerTurn({ model: 'mock', modelClient: model, systemPrompt: '规则', history: [], prompts: [{ role: 'user', content: '读取文件' }], tools: TOOLS, maxSteps: 2, signal: null,
+    runTool: async () => { executed = true; return { outcome: { type: 'ok', content: '不应执行' }, terminate: false }; } });
+  assert.equal(executed, false);
+  const tool = seen[1]!.messages.find((message) => message.role === 'tool');
+  assert.equal(tool?.isError, true);
+  assert.match(tool?.content ?? '', /path.*expected string/);
 });

@@ -1,3 +1,5 @@
+import type { AssistantMessage } from '@earendil-works/pi-ai';
+
 /** 模型层的最小契约：一次调用产出文本或工具调用，或两者都有。 */
 
 export interface ToolCall {
@@ -32,6 +34,8 @@ export interface ChatMessage {
    * 模型会重复一个已经失败过的操作。
    */
   isError?: boolean;
+  /** 模型适配器生成的原始助手消息，用于保留签名及内容块。 */
+  piMessage?: AssistantMessage;
 }
 
 export interface ToolSchema {
@@ -64,6 +68,7 @@ export interface StepResult {
   model: string;
   usage: StepUsage | null;
   /** 本次逻辑调用内部的 HTTP 尝试次数（含重试），不属于请求正文。 */
+  piMessage?: AssistantMessage;
   httpAttempts?: number;
 }
 

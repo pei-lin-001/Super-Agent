@@ -19,7 +19,7 @@ import {
 import { isDormantWorker, isInactiveWorker, isTerminalTask, isTerminalWorker } from '../domain/state.ts';
 import { Execution, ExecutionRevoked } from './execution.ts';
 import { runWorkerTurn, toStepResult } from './pi-worker.ts';
-import type { AssistantMessage } from '../vendor/pi/types.ts';
+import type { AssistantMessage } from '@earendil-works/pi-ai';
 
 /**
  * 进度汇报唤醒 Router 的最小间隔。
@@ -1689,7 +1689,7 @@ note: null,
    * Worker 的一次调度。
    *
    * 循环、工具批处理、输出被上限截断时的工具作废都交给 pi 的 agent-loop
-   * （见 src/vendor/pi）；epoch 撤销、收件箱、步数计量、落库、等待/提交的终态
+   * （官方 pi-agent-core）；epoch 撤销、收件箱、步数计量、落库、等待/提交的终态
    * 仍然由这里决定——「模型表达意图，程序决定事实」不因为换了循环而改变。
    */
   private async runWorkerBody(workerId: string): Promise<void> {
@@ -1726,8 +1726,8 @@ note: null,
     const messages = await this.buildWorkerMessages(worker, task);
     const systemPrompt = messages.find((message) => message.role === 'system')?.content ?? '';
     const chat = messages.filter((message) => message.role !== 'system');
-    const prompts = chat.slice(0, 1);
-    const history = chat.slice(1);
+    const prompts = chat;
+    const history: ChatMessage[] = [];
 
     const beforeRequest = this.canRun(workerId, epoch);
     if (!beforeRequest.ok) {
@@ -1751,6 +1751,7 @@ note: null,
       systemPrompt,
       prompts,
       history,
+      protectedMessageIndexes: [0, chat.length - 1],
       tools: this.tools.schemas(),
       maxSteps: this.config.limits.maxStepsPerRun,
       signal: runController?.signal ?? null,
@@ -2272,7 +2273,7 @@ note: null,
           following.push(turns[cursor]!);
           cursor += 1;
         }
-        messages.push({ role: 'assistant', content: turn.content, toolCalls: calls });
+        messages.push({ role: 'assistant', content: turn.content, toolCalls: calls, ...(turn.piMessage ? { piMessage: turn.piMessage } : {}) });
         const seen = new Set(following.map((item) => item.toolCallId));
         for (const item of following) messages.push(toToolMessage(item));
         for (const call of calls) {
@@ -2298,7 +2299,7 @@ note: null,
         messages.push({ role: 'user', content: turn.content });
         continue;
       }
-      messages.push({ role: 'assistant', content: turn.content });
+      messages.push({ role: 'assistant', content: turn.content, ...(turn.piMessage ? { piMessage: turn.piMessage } : {}) });
     }
     return messages;
   }
@@ -2410,6 +2411,7 @@ note: null,
       role: 'assistant',
       content: result.text,
       toolCalls: result.toolCalls.length > 0 ? result.toolCalls : null,
+      piMessage: result.piMessage ?? null,
       toolCallId: null,
       createdAt: nowIso(),
     });

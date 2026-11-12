@@ -356,7 +356,7 @@ export class WatchdogSession {
     const kept = plan.kept.map((item) => item.turn);
     const dropped = plan.dropped.map((item) => item.turn);
     return {
-      history: kept.map((item): ChatMessage => ({ role: item.role, content: item.content })),
+      history: kept.map((item): ChatMessage => ({ role: item.role, content: item.content, ...(item.piMessage ? { piMessage: item.piMessage } : {}) })),
       note: note?.content ?? null,
       toSummarize:
         plan.shouldCompact && dropped.length > 0
@@ -615,6 +615,7 @@ export class WatchdogSession {
     // 循环交给 pi 的 agent-loop（和 Worker 同一条路）：工具批处理、步数、截断作废都在内核里。
     const repeats = new Map<string, number>();
     const context = await this.contextForTurn();
+    let lastAssistant: import('@earendil-works/pi-ai').AssistantMessage | undefined;
     const result = await runWorkerTurn({
       model: modelName,
       modelClient: new RecordingModel(model, store, 'watchdog', { sessionId: null }),
@@ -640,6 +641,8 @@ export class WatchdogSession {
             `先用工具核对证据再回答。说清楚哪些是已确认的事实、哪些还不确定。`,
         },
       ],
+      protectedMessageIndexes: [context.history.length + (toolLog.length > 0 ? 1 : 0)],
+      onStep: (message) => { if (!message.content.some((block) => block.type === 'toolCall')) lastAssistant = message; },
       tools: WD_TOOLS,
       maxSteps: MAX_WATCHDOG_STEPS,
       signal: null,
@@ -669,7 +672,7 @@ export class WatchdogSession {
 
     const answer = (result.assistantText ?? '').trim();
     if (answer !== '') {
-      store.appendWdTurn({ id: `wdt_${randomBytes(4).toString('hex')}`, role: 'assistant', content: answer });
+      store.appendWdTurn({ id: `wdt_${randomBytes(4).toString('hex')}`, role: 'assistant', content: answer, ...(lastAssistant ? { piMessage: lastAssistant } : {}) });
       return answer;
     }
     return `（本轮达到 ${result.steps} 步上限，没有得出结论；已记录当前观察）`;
@@ -706,6 +709,7 @@ export class WatchdogSession {
         for (const message of newMessages) store.markIntercomDelivered(message.id);
       });
     }
+    let lastAssistant: import('@earendil-works/pi-ai').AssistantMessage | undefined;
     const result = await runWorkerTurn({
       model: modelName,
       modelClient: new RecordingModel(model, store, 'watchdog', { sessionId: null }),
@@ -734,6 +738,8 @@ export class WatchdogSession {
           }),
         },
       ],
+      protectedMessageIndexes: [context.history.length + (toolLog.length > 0 ? 1 : 0)],
+      onStep: (message) => { if (!message.content.some((block) => block.type === 'toolCall')) lastAssistant = message; },
       tools: WD_TOOLS,
       maxSteps: MAX_WATCHDOG_STEPS,
       signal: null,
@@ -752,7 +758,7 @@ export class WatchdogSession {
     const answer = (result.assistantText ?? '').trim();
     const summary = answer !== '' ? answer : `本轮达到 ${result.steps} 步上限，已记录当前观察`;
     if (answer !== '') {
-      store.appendWdTurn({ id: `wdt_${randomBytes(4).toString('hex')}`, role: 'assistant', content: answer });
+      store.appendWdTurn({ id: `wdt_${randomBytes(4).toString('hex')}`, role: 'assistant', content: answer, ...(lastAssistant ? { piMessage: lastAssistant } : {}) });
       store.appendWdAction({
         id: `wda_${randomBytes(4).toString('hex')}`,
         issueId: null,

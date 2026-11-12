@@ -79,13 +79,14 @@ async function withHarness<T>(
     new MockModel(async ({ request }: { request: ChatRequest }) => {
       await tick();
       requests.push([...request.messages]);
-      const lastUser = [...request.messages].reverse().find((message) => message.role === 'user')?.content ?? '';
+      const userMessages = request.messages.filter((message) => message.role === 'user');
+      const state = userMessages.at(-1)?.content ?? '';
+      const userText = userMessages.at(-2)?.content ?? '';
       // 已经拿到过 create_task 的回执就不再重复建：否则第二轮会再建一个。
       const alreadyCreated = request.messages.some(
         (message) => message.role === 'tool' && (message.content ?? '').includes('已创建任务'),
       );
-      // 本轮 user 消息前面拼了「系统当前状态」，判结尾而不是判相等。
-      if (!lastUser.trimEnd().endsWith('建个任务') || alreadyCreated) {
+      if (!state.includes('系统当前状态') || userText !== '建个任务' || alreadyCreated) {
         // 非法别名的失败也要能被观察到，所以这里不吞结果，只按普通回复收尾。
         return mockReply({ text: '收到。' });
       }
@@ -149,7 +150,7 @@ test('Router 指派模型：model 传非字符串时明确失败，不当成"没
       messages.filter((message) => message.role === 'tool').map((message) => message.content ?? ''),
     );
     assert.ok(
-      toolResults.some((content) => content.includes('model 必须是模型别名字符串')),
+      toolResults.some((content) => content.includes('/model') && content.includes('expected string')),
       `类型错误要回到模型上下文（实际 ${JSON.stringify(toolResults).slice(0, 300)}）`,
     );
   });

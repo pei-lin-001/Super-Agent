@@ -13,6 +13,17 @@ const TG_KEY = sessionKeyOf({ channel: 'telegram', accountId: 'bot_1', peerId: '
 const isNoteCall = (request: ChatRequest): boolean =>
   (request.messages[0]?.content ?? '').includes('对话摘要器');
 
+test('Router 用量：按会话和话题隔离并计入缓存写入', async () => {
+  const h = await createHarness({ worker: () => mockReply({ text: 'ok' }) });
+  try {
+    h.store.startModelCall({ id: 'mc_scope_a', purpose: 'router', model: 'm', sessionId: 'rs_a', routerSessionKey: TG_KEY, conversationId: 'topic_a' });
+    h.store.finishModelCall({ id: 'mc_scope_a', status: 'ok', usage: { promptTokens: 10, completionTokens: 2, cacheReadTokens: 80, cacheWriteTokens: 8 } });
+    assert.equal(h.store.latestContextUsage({ purpose: 'router', routerSessionKey: TG_KEY, conversationId: 'topic_a' })?.tokens, 100);
+    assert.equal(h.store.latestContextUsage({ purpose: 'router', routerSessionKey: TG_KEY, conversationId: 'topic_b' }), null);
+    assert.equal(h.store.latestContextUsage({ purpose: 'router', routerSessionKey: null, conversationId: null }), null);
+  } finally { await h.cleanup(); }
+});
+
 test('Router：窗口内不压缩，超出才生成摘要', async () => {
   const calls: ChatRequest[] = [];
   const harness = await createHarness({

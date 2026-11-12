@@ -220,12 +220,14 @@ export interface WorkerTurn {
   content: string | null;
   toolCalls: unknown;
   toolCallId: string | null;
+  piMessage?: import('@earendil-works/pi-ai').AssistantMessage | null;
   /** 仅 tool 轮有意义：这次执行是否失败。旧记录为 null（当时没有这个字段）。 */
   isError?: boolean | null;
   createdAt: string;
 }
 
 export interface RouterTurn {
+  piMessage?: import('@earendil-works/pi-ai').AssistantMessage | null;
   id: string;
   role: 'user' | 'assistant';
   content: string;

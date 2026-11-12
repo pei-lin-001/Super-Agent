@@ -60,6 +60,7 @@ function toRouterTurn(row: Record<string, unknown>): RouterTurn {
     id: str(row['id']),
     role: str(row['role']) as RouterTurn['role'],
     content: str(row['content']),
+    piMessage: row['pi_message'] ? JSON.parse(str(row['pi_message'])) : null,
     createdAt: str(row['created_at']),
   };
 }
@@ -241,6 +242,7 @@ function mapTurn(row: Row): WorkerTurn {
     content: strOrNull(row['content']),
     toolCalls: row['tool_calls'] ? JSON.parse(str(row['tool_calls'])) : null,
     toolCallId: strOrNull(row['tool_call_id']),
+    piMessage: row['pi_message'] ? JSON.parse(str(row['pi_message'])) : null,
     isError: row['is_error'] === null || row['is_error'] === undefined ? null : num(row['is_error']) === 1,
     createdAt: str(row['created_at']),
   };
@@ -307,6 +309,10 @@ export class Store {
     ensureColumn('channel_outbound', 'next_attempt_at', 'next_attempt_at TEXT');
     // 工具结果是否失败：历史回放要靠它区分「失败」和「成功但没输出」。
     ensureColumn('worker_turn', 'is_error', 'is_error INTEGER');
+    ensureColumn('worker_turn', 'pi_message', 'pi_message TEXT');
+    ensureColumn('router_decision', 'pi_message', 'pi_message TEXT');
+    ensureColumn('router_turn', 'pi_message', 'pi_message TEXT');
+    ensureColumn('wd_turn', 'pi_message', 'pi_message TEXT');
     ensureColumn('router_turn', 'session_key', 'session_key TEXT');
     ensureColumn('router_session', 'session_key', 'session_key TEXT');
     // 话题归属：老记录为 NULL，按"本聊天任何话题都可见"处理（见 router 的 visibleTo）。
@@ -388,6 +394,10 @@ export class Store {
     ensureColumn('model_call', 'response_model', 'response_model TEXT');
     // 旧库补列：缓存命中数之前没记，账本比真实消耗小一个数量级。
     ensureColumn('model_call', 'cached_tokens', 'cached_tokens INTEGER');
+    ensureColumn('model_call', 'cache_write_tokens', 'cache_write_tokens INTEGER');
+    ensureColumn('model_call', 'router_session_key', 'router_session_key TEXT');
+    ensureColumn('model_call', 'router_scope_known', 'router_scope_known INTEGER NOT NULL DEFAULT 0');
+    ensureColumn('model_call', 'conversation_id', 'conversation_id TEXT');
     ensureColumn('worker', 'run_epoch', 'run_epoch INTEGER NOT NULL DEFAULT 0');
     ensureColumn('message', 'dedupe_key', 'dedupe_key TEXT');
     ensureColumn('message', 'broadcast_id', 'broadcast_id TEXT');
@@ -907,14 +917,16 @@ export class Store {
     id: string;
     role: 'user' | 'assistant' | 'tool';
     content: string;
+    piMessage?: import('@earendil-works/pi-ai').AssistantMessage;
     /** 测试与导入场景可以指定时间；正常调用用当前时间。 */
     createdAt?: string;
   }): void {
     this.run(
-      'INSERT INTO wd_turn (id, role, content, created_at) VALUES (?, ?, ?, ?)',
+      'INSERT INTO wd_turn (id, role, content, pi_message, created_at) VALUES (?, ?, ?, ?, ?)',
       turn.id,
       turn.role,
       turn.content,
+      turn.piMessage ? JSON.stringify(turn.piMessage) : null,
       turn.createdAt ?? nowIso(),
     );
   }
@@ -924,15 +936,16 @@ export class Store {
    * 调查日志里的工具记录不在这里：它们没有调用标识，不能当正式 tool 消息重发。
    */
   /** 水位线之后的维护对话（摘要已覆盖的部分不重复取）。 */
-  listWdDialogueSince(afterRow: number, limit = 400): { row: number; id: string; role: 'user' | 'assistant'; content: string }[] {
+  listWdDialogueSince(afterRow: number, limit = 400): { row: number; id: string; role: 'user' | 'assistant'; content: string; piMessage?: import('@earendil-works/pi-ai').AssistantMessage }[] {
     return this.all(
-      `SELECT rowid AS rid, id, role, content FROM wd_turn WHERE rowid > ? ORDER BY rowid ASC LIMIT ?`,
+      `SELECT rowid AS rid, id, role, content, pi_message FROM wd_turn WHERE rowid > ? ORDER BY rowid ASC LIMIT ?`,
       afterRow, limit,
     ).map((row) => ({
       row: Number((row as { rid?: unknown }).rid ?? 0),
       id: str((row as { id?: unknown }).id),
       role: str((row as { role?: unknown }).role) as 'user' | 'assistant',
       content: str((row as { content?: unknown }).content),
+      ...(row['pi_message'] ? { piMessage: JSON.parse(str(row['pi_message'])) } : {}),
     }));
   }
 
@@ -1436,18 +1449,23 @@ export class Store {
     taskId?: string | null;
     workerId?: string | null;
     sessionId?: string | null;
+    routerSessionKey?: string | null;
+    conversationId?: string | null;
     /** Worker 选择的模型别名；为空表示按默认别名执行。 */
     modelAlias?: string | null;
   }): void {
     this.run(
-      `INSERT INTO model_call (id, instance_id, purpose, task_id, worker_id, session_id, model, model_alias, status, started_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)`,
+      `INSERT INTO model_call (id, instance_id, purpose, task_id, worker_id, session_id, router_session_key, router_scope_known, conversation_id, model, model_alias, status, started_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)`,
       input.id,
       this.instanceId,
       input.purpose,
       input.taskId ?? null,
       input.workerId ?? null,
       input.sessionId ?? null,
+      input.routerSessionKey ?? null,
+      input.purpose === 'router' && 'routerSessionKey' in input ? 1 : 0,
+      input.conversationId ?? null,
       input.model,
       input.modelAlias ?? null,
       nowIso(),
@@ -1468,9 +1486,11 @@ export class Store {
     purpose: 'router' | 'worker' | 'watchdog';
     workerId?: string | null;
     sessionId?: string | null;
+    routerSessionKey?: string | null;
+    conversationId?: string | null;
   }): { tokens: number; endedAt: string } | null {
     const clauses = ["purpose = ?", "status = 'ok'", 'ended_at IS NOT NULL', 'usage_known = 1'];
-    const params: (string | number)[] = [scope.purpose];
+    const params: (string | number | null)[] = [scope.purpose];
     if (scope.workerId) {
       clauses.push('worker_id = ?');
       params.push(scope.workerId);
@@ -1479,8 +1499,12 @@ export class Store {
       clauses.push('session_id = ?');
       params.push(scope.sessionId);
     }
+    if (scope.purpose === 'router') {
+      clauses.push('router_scope_known = 1', 'router_session_key IS ?', 'conversation_id IS ?');
+      params.push(scope.routerSessionKey ?? null, scope.conversationId ?? null);
+    }
     const row = this.get(
-      `SELECT ended_at, coalesce(prompt_tokens,0) + coalesce(cached_tokens,0) + coalesce(completion_tokens,0) AS total
+      `SELECT ended_at, coalesce(prompt_tokens,0) + coalesce(cached_tokens,0) + coalesce(cache_write_tokens,0) + coalesce(completion_tokens,0) AS total
        FROM model_call WHERE ${clauses.join(' AND ')} ORDER BY ended_at DESC LIMIT 1`,
       ...params,
     );
@@ -1498,12 +1522,15 @@ export class Store {
     purpose: 'router' | 'worker' | 'watchdog';
     workerId?: string | null;
     sessionId?: string | null;
+    routerSessionKey?: string | null;
+    conversationId?: string | null;
   }): number | null {
     const usage = this.latestContextUsage(scope);
     if (!usage) return null;
     const chars = this.charsSinceLastCall({
       kind: scope.purpose === 'worker' ? 'worker' : scope.purpose === 'router' ? 'router' : 'watchdog',
-      key: scope.purpose === 'worker' ? (scope.workerId ?? null) : scope.purpose === 'router' ? (scope.sessionId ?? null) : null,
+      key: scope.purpose === 'worker' ? (scope.workerId ?? null) : scope.purpose === 'router' ? (scope.routerSessionKey ?? null) : null,
+      conversationId: scope.conversationId,
       since: usage.endedAt,
     });
     // 增量用 chars/4 就够：它只是上次调用之后的几条，误差不累积。
@@ -1511,10 +1538,12 @@ export class Store {
   }
 
   /** 上次调用之后新增的历史字符数：估算增量用，误差不累积。 */
-  charsSinceLastCall(scope: { kind: 'worker' | 'router' | 'watchdog'; key: string | null; since: string }): number {
+  charsSinceLastCall(scope: { kind: 'worker' | 'router' | 'watchdog'; key: string | null; conversationId?: string | null; since: string }): number {
     const table = scope.kind === 'worker' ? 'worker_turn' : scope.kind === 'router' ? 'router_turn' : 'wd_turn';
     const column = scope.kind === 'worker' ? 'worker_id' : scope.kind === 'router' ? 'session_key' : null;
-    const row =
+    const row = scope.kind === 'router'
+      ? this.get('SELECT coalesce(sum(length(content)),0) AS chars FROM router_turn WHERE session_key IS ? AND conversation_id IS ? AND created_at > ?', scope.key, scope.conversationId ?? null, scope.since)
+      :
       column === null
         ? this.get(`SELECT coalesce(sum(length(content)),0) AS chars FROM ${table} WHERE created_at > ?`, scope.since)
         : this.get(
@@ -1542,12 +1571,13 @@ export class Store {
     // usage 缺失记为未知（usage_known=0），不填 0；提供方明确返回的 0 会保留。
     const known = input.usage ? 1 : 0;
     this.run(
-      `UPDATE model_call SET status = ?, prompt_tokens = ?, completion_tokens = ?, cached_tokens = ?,
+      `UPDATE model_call SET status = ?, prompt_tokens = ?, completion_tokens = ?, cached_tokens = ?, cache_write_tokens = ?,
          usage_known = ?, http_attempts = ?, error = ?, response_model = ?, ended_at = ? WHERE id = ?`,
       input.status,
       input.usage?.promptTokens ?? null,
       input.usage?.completionTokens ?? null,
       input.usage?.cacheReadTokens ?? null,
+      input.usage?.cacheWriteTokens ?? null,
       known,
       input.httpAttempts ?? null,
       input.error ?? null,
@@ -1642,17 +1672,18 @@ export class Store {
     turnNo: number;
     text: string | null;
     toolCalls: unknown;
+    piMessage?: import('@earendil-works/pi-ai').AssistantMessage;
   }): void {
     this.run(
-      `INSERT INTO router_decision (id, session_id, turn_no, text, tool_calls, status, created_at)
-       VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
-      input.id, input.sessionId, input.turnNo, input.text, JSON.stringify(input.toolCalls), nowIso(),
+      `INSERT INTO router_decision (id, session_id, turn_no, text, tool_calls, pi_message, status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)`,
+      input.id, input.sessionId, input.turnNo, input.text, JSON.stringify(input.toolCalls), input.piMessage ? JSON.stringify(input.piMessage) : null, nowIso(),
     );
   }
 
   pendingRouterDecision(
     sessionId: string,
-  ): { id: string; turnNo: number; text: string | null; toolCalls: unknown } | null {
+  ): { id: string; turnNo: number; text: string | null; toolCalls: unknown; piMessage?: import('@earendil-works/pi-ai').AssistantMessage } | null {
     const row = this.get(
       `SELECT * FROM router_decision WHERE session_id = ? AND status = 'pending' ORDER BY created_at ASC LIMIT 1`,
       sessionId,
@@ -1663,6 +1694,7 @@ export class Store {
       turnNo: num(row['turn_no']),
       text: strOrNull(row['text']),
       toolCalls: JSON.parse(str(row['tool_calls'])),
+      ...(row['pi_message'] ? { piMessage: JSON.parse(str(row['pi_message'])) } : {}),
     };
   }
 
@@ -1975,11 +2007,12 @@ export class Store {
 
   appendWorkerTurn(turn: WorkerTurn): void {
     this.run(
-      `INSERT INTO worker_turn (id, worker_id, seq, role, content, tool_calls, tool_call_id, is_error, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO worker_turn (id, worker_id, seq, role, content, tool_calls, tool_call_id, is_error, pi_message, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       turn.id, turn.workerId, turn.seq, turn.role, turn.content,
       turn.toolCalls ? JSON.stringify(turn.toolCalls) : null, turn.toolCallId,
       turn.isError === undefined || turn.isError === null ? null : (turn.isError ? 1 : 0),
+      turn.piMessage ? JSON.stringify(turn.piMessage) : null,
       turn.createdAt,
     );
   }
@@ -2091,9 +2124,9 @@ export class Store {
     // seq 是单调水位线，压缩时用它记住"摘要覆盖到哪一条"。
     const next = this.get('SELECT COALESCE(MAX(seq), 0) + 1 AS value FROM router_turn') as { value?: unknown } | null;
     this.run(
-      'INSERT INTO router_turn (id, role, content, session_key, conversation_id, seq, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO router_turn (id, role, content, session_key, conversation_id, seq, pi_message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       turn.id, turn.role, turn.content, turn.sessionKey ?? null, turn.conversationId ?? null,
-      Number(next?.value ?? 1), turn.createdAt,
+      Number(next?.value ?? 1), turn.piMessage ? JSON.stringify(turn.piMessage) : null, turn.createdAt,
     );
   }
 

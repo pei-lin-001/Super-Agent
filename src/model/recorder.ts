@@ -21,6 +21,8 @@ export class RecordingModel implements ModelClient {
     taskId?: string | null;
     workerId?: string | null;
     sessionId?: string | null;
+    routerSessionKey?: string | null;
+    conversationId?: string | null;
     modelAlias?: string | null;
   };
 
@@ -32,6 +34,8 @@ export class RecordingModel implements ModelClient {
       taskId?: string | null;
       workerId?: string | null;
       sessionId?: string | null;
+      routerSessionKey?: string | null;
+      conversationId?: string | null;
       modelAlias?: string | null;
     } = {},
   ) {

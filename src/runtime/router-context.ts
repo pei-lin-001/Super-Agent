@@ -51,7 +51,7 @@ export function planRouterContext(input: {
     contextWindowTokens: limits.contextWindowTokens,
     reserveTokens: limits.routerReserveTokens,
     // 真实 usage 当基准：纯字符估算对中文低估一倍以上，阈值会永远打不开。
-    measuredTokens: store.measureContextTokens({ purpose: 'router', sessionId: sessionKey }),
+    measuredTokens: store.measureContextTokens({ purpose: 'router', routerSessionKey: sessionKey, conversationId }),
   });
 
   const kept = plan.kept.map((item) => item.turn);
@@ -59,7 +59,7 @@ export function planRouterContext(input: {
   const tokens = plan.keptTokens + estimateTokens((note?.content.length ?? 0));
 
   return {
-    history: kept.map((turn): ChatMessage => ({ role: turn.role, content: turn.content })),
+    history: kept.map((turn): ChatMessage => ({ role: turn.role, content: turn.content, ...(turn.piMessage ? { piMessage: turn.piMessage } : {}) })),
     note: note?.content ?? null,
     tokens,
     toSummarize:

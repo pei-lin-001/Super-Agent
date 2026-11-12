@@ -89,7 +89,10 @@ test('话题隔离：任务归属原话题，别的话题里看不到也改不�
       const tools = context.request.messages.filter((message) => message.role === 'tool');
       const last = tools[tools.length - 1];
       if (last) toolResults.push(last.content ?? '');
-      const userTurn = context.request.messages.filter((message) => message.role === 'user').at(-1)?.content ?? '';
+      const userMessages = context.request.messages.filter((message) => message.role === 'user');
+      const state = userMessages.at(-1)?.content ?? '';
+      assert.match(state, /系统当前状态/, '动态状态必须作为独立尾部消息');
+      const userTurn = userMessages.at(-2)?.content ?? '';
       // 「停掉」这轮真的去调用工具：授权必须由代码拒绝，而不是靠模型自觉
       if (userTurn.includes('停掉') && target !== null) {
         return mockReply({ toolCalls: [{ name: 'stop_task', arguments: { task_id: target, reason: '用户要求' } }] });

@@ -307,8 +307,8 @@ test('续接与新用户消息相邻到达：两者都被处理，不互相覆�
       h.runtime,
       new MockModel((context) => {
         calls += 1;
-        const last = [...(context.request.messages as ChatMessage[])].reverse().find((m) => m.role === 'user');
-        texts.push(last?.content ?? '');
+        const userMessages = (context.request.messages as ChatMessage[]).filter((m) => m.role === 'user');
+        texts.push(userMessages.map((message) => message.content ?? '').join('\n'));
         if (calls === 1) {
           return { text: null, reasoning: null, toolCalls: [createTaskCall('A', 'a1')], finishReason: 'tool_calls', model: 'm', usage: null };
         }
@@ -330,4 +330,42 @@ test('续接与新用户消息相邻到达：两者都被处理，不互相覆�
   } finally {
     await h.cleanup();
   }
+});
+
+test('官方循环：第一条工具回执写入后故障，恢复不重复执行', async () => {
+  const h = await makeHarness(2);
+  try {
+    let modelCalls = 0;
+    const router = new Router(h.runtime, new MockModel(() => {
+      modelCalls += 1;
+      return modelCalls === 1
+        ? { text: null, reasoning: null, toolCalls: [createTaskCall('第一项', 'partial1'), createTaskCall('第二项', 'partial2')], finishReason: 'tool_calls', model: 'm', usage: null }
+        : { text: '完成', reasoning: null, toolCalls: [], finishReason: 'stop', model: 'm', usage: null };
+    }), h.config);
+    const original = h.store.saveRouterAction.bind(h.store);
+    let writes = 0;
+    h.store.saveRouterAction = ((input: Parameters<Store['saveRouterAction']>[0]) => {
+      original(input);
+      writes += 1;
+      // 第一次写在业务事务，第二次是官方循环的工具结果事件。
+      if (writes === 2) throw new Error('注入：第一项回执后中断');
+    }) as Store['saveRouterAction'];
+    await router.handleUserMessage('创建两项');
+    assert.deepEqual(h.store.listTasks().map((task) => task.title), ['第一项']);
+    h.store.saveRouterAction = original;
+    await router.resume();
+    assert.deepEqual(h.store.listTasks().map((task) => task.title).sort(), ['第一项', '第二项']);
+    assert.equal(modelCalls, 2);
+  } finally { await h.cleanup(); }
+});
+
+test('官方循环：决策保存失败时任何工具都不能执行', async () => {
+  const h = await makeHarness(2);
+  try {
+    const router = new Router(h.runtime, new MockModel(() => ({ text: null, reasoning: null, toolCalls: [createTaskCall('不应创建', 'failed-decision')], finishReason: 'tool_calls', model: 'm', usage: null })), h.config);
+    h.store.saveRouterDecision = (() => { throw new Error('注入：决策保存失败'); }) as Store['saveRouterDecision'];
+    await router.handleUserMessage('创建任务');
+    assert.equal(h.store.listTasks().length, 0);
+    assert.ok(h.store.pendingRouterSession());
+  } finally { await h.cleanup(); }
 });

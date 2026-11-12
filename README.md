@@ -987,7 +987,10 @@ pnpm accept:channel         # 进程级验收：本地假平台，真实启动 d
 
 ### Watchdog 的循环与上下文
 
-Watchdog 与 Worker 走同一条路：循环交给 `src/vendor/pi/agent-loop.ts`（见上方「移植自 pi」），
+Router、Watchdog 与 Worker 使用官方 `@earendil-works/pi-agent-core` 的循环和工具参数校验，工具权限及持久化由本项目处理。
+轮内通过官方 `prepareNextTurn` 挂载项目的有损裁剪；轮外的历史摘要使用项目提示词和 Pi 模型适配器。上游 coding-agent 的完整压缩依赖它的会话记录和文件操作，不迁入 CLI、插件或 UI。
+
+Watchdog 与 Worker 走同一条路：
 步数上限 40。不同点只在工具与作用域：
 
 | 项 | Worker | Watchdog |

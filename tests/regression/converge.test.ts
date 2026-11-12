@@ -82,6 +82,8 @@ test('负责人完成、协作者仍在等待时：任务终结后协作者收�
   // 负责人：立即 artifact_save → submit_result
   // 协作者：永远等（由测试控制释放时机）
   let holds = 0;
+  let releaseOwner: () => void = () => undefined;
+  const ownerGate = new Promise<void>((resolve) => { releaseOwner = resolve; });
   const releaseRef: { fn?: () => void } = {};
   const held = new Promise<void>((resolve) => {
     releaseRef.fn = resolve;
@@ -110,7 +112,7 @@ test('负责人完成、协作者仍在等待时：任务终结后协作者收�
         if (!outputs.includes('deliverable.md')) {
           sendSse(res, reply('artifact_save', { name: 'deliverable.md', content: '# done\n' }, 'o1'));
         } else {
-          sendSse(res, reply('submit_result', { summary: '负责人完成', artifacts: ['deliverable.md'] }, 'o2'));
+          void ownerGate.then(() => sendSse(res, reply('submit_result', { summary: '负责人完成', artifacts: ['deliverable.md'] }, 'o2')));
         }
         return;
       }
@@ -154,6 +156,7 @@ test('负责人完成、协作者仍在等待时：任务终结后协作者收�
     h.runtime.enqueue(collaborator.id);
     assert.ok(await waitFor(() => holds > 0, 10_000), '协作者必须真的发出了模型请求');
     assert.equal(h.store.getWorker(collaborator.id)?.status, 'running', '完成之前协作者确实在执行');
+    releaseOwner();
     assert.ok(await waitFor(() => h.store.getTask(task.id)?.status === 'completed', 15_000), '负责人应完成任务');
 
     // 释放迟到响应

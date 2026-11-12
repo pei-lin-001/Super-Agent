@@ -21,8 +21,7 @@ const WX_KEY = sessionKeyOf({ channel: 'weixin', accountId: 'wx_1', peerId: 'own
 const ownerBrief = { ownerRole: '执行者', ownerBrief: '把活干完' };
 
 test('任务卡：只看得到当前会话建的任务，CLI 与别的聊天互不串', async () => {
-  // 按调用顺序收集：本轮消息现在与「系统当前状态」拼在同一条 user 消息里，
-  // 不能再拿它的内容当 key。
+  // 按调用顺序收集各会话的状态。
   const prompts: string[] = [];
   const harness = await createHarness({
     worker: () => mockReply({ text: '在跑' }),
@@ -123,10 +122,10 @@ test('决策检查点：崩溃后从已保存的工具结果续接，不重复�
   const harness = await createHarness({
     worker: () => mockReply({ text: '在跑' }),
     router: ({ request }) => {
-      const lastUser = [...request.messages].reverse().find((message) => message.role === 'user')?.content ?? '';
-      // 只有用户那条输入走"建任务 → 崩溃"的剧本；后台汇报走普通回复。
-      // 本轮 user 消息前面还会拼「系统当前状态」，所以判结尾而不是判相等。
-      if (!lastUser.trimEnd().endsWith('建个任务')) return mockReply({ text: '收到进展。' });
+      const userMessages = request.messages.filter((message) => message.role === 'user');
+      const state = userMessages.at(-1)?.content ?? '';
+      const userText = userMessages.at(-2)?.content ?? '';
+      if (!state.includes('系统当前状态') || userText !== '建个任务') return mockReply({ text: '收到进展。' });
       if (!hasTaskId(request)) {
         return mockReply({
           toolCalls: [
@@ -151,7 +150,10 @@ test('决策检查点：崩溃后从已保存的工具结果续接，不重复�
 
   try {
     void harness.router.handleUserMessage('建个任务', { sessionKey: TG_KEY });
-    await second;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([second, new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error('未进入第二次模型请求')), 5000); })]);
+    } finally { if (timeout) clearTimeout(timeout); }
 
     const tasks = harness.store.listTasks();
     assert.equal(tasks.length, 1, '第一轮只建一个任务');

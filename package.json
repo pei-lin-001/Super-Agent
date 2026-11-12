@@ -28,6 +28,8 @@
     "typescript": "^5.9.3"
   },
   "dependencies": {
-    "@earendil-works/pi-ai": "1.5.1"
+    "@earendil-works/pi-agent-core": "1.5.1",
+    "@earendil-works/pi-ai": "1.5.1",
+    "@earendil-works/pi-schema": "1.5.1"
   }
 }
