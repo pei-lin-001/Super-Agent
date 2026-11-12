@@ -164,6 +164,8 @@ export class Runtime implements ToolHost {
   private readonly executions = new Set<Execution>();
   /** 启动时补报未送达的 Worker 消息，只做一次。 */
   private inboxCatchUpDone = false;
+  /** 上次因为维护者消息唤醒 Router 的时间：节流用。 */
+  private lastMaintainerPumpAt = 0;
   /** 上次因进度唤醒 Router 的时间（按任务），用于节流。 */
   private readonly progressNotifyAt = new Map<string, number>();
 
@@ -1907,6 +1909,13 @@ note: null,
   private pumpRouter(): void {
     const router = this.router;
     if (!router || this.stopped) return;
+    // 维护者发了消息：叫醒 Router 去处理。节流到 60 秒一次——
+    // 不节流的话维护者每写一条都会触发一轮 Router，两边会互相抽起来。
+    const pendingFromMaintainer = this.store.listPendingIntercom('router', 1).length > 0;
+    if (pendingFromMaintainer && Date.now() - this.lastMaintainerPumpAt >= 60_000) {
+      this.lastMaintainerPumpAt = Date.now();
+      void this.router?.notify?.();
+    }
     if (!router.hasPendingSession?.()) {
       // 没有断点，但收件箱里有没送达的 Worker 消息：启动后补报一次，
       // 否则它们会一直躺着，直到用户自己来问"跑完了吗"。
@@ -2575,6 +2584,23 @@ note: null,
       '检测到同组 Worker 全部处于互相等待。请根据已有信息自行决策：完成当前部分、改为直接汇报，或明确说明还缺什么。',
     );
     this.enqueue(earliest.worker.id);
+  }
+
+  /**
+   * 叫醒维护者进程。
+   *
+   * 两个进程之间没有 socket，唯一能跨进程传递的就是数据库和时间戳。
+   * 维护者自己的循环会读 intercom 表，这里只需保证「有新消息」这个事实
+   * 在它的判据里成立——即写一个标记文件，让它的下一轮巡检不用等到定时点。
+   */
+  wakeMaintainer(): void {
+    try {
+      const file = join(this.config.workDir, '.runtime', 'maintainer.wake');
+      mkdirSync(dirname(file), { recursive: true });
+      writeFileSync(file, nowIso(), 'utf8');
+    } catch {
+      // 叫不醒不该拖垮业务路径：维护者的定时巡检照样能看到这条消息。
+    }
   }
 
   tick(): void {

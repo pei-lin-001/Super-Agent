@@ -246,6 +246,23 @@ function mapTurn(row: Row): WorkerTurn {
   };
 }
 
+export interface IntercomMessage {
+  id: string;
+  fromLayer: 'router' | 'watchdog';
+  toLayer: 'router' | 'watchdog';
+  kind: 'notice' | 'request' | 'question' | 'reply';
+  topicId: string | null;
+  replyTo: string | null;
+  sessionKey: string | null;
+  taskId: string | null;
+  body: string;
+  refs: string[] | null;
+  status: string;
+  hops: number;
+  expiresAt: string | null;
+  createdAt: string;
+}
+
 export class Store {
   readonly db: DatabaseSync;
 
@@ -1038,6 +1055,166 @@ export class Store {
       input.result,
       nowIso(),
     );
+  }
+
+  // ---------------- Router ↔ Watchdog 通道 ----------------
+
+  /**
+   * 写一条跨层消息。
+   *
+   * 两个进程只靠数据库通信：Router 在主系统里、Watchdog 在另一个进程里，
+   * 谁也不能直接调用对方，所以这里是唯一的传送带。
+   */
+  insertIntercom(input: {
+    id: string;
+    fromLayer: 'router' | 'watchdog';
+    kind: 'notice' | 'request' | 'question' | 'reply';
+    body: string;
+    topicId?: string | null;
+    replyTo?: string | null;
+    sessionKey?: string | null;
+    taskId?: string | null;
+    refs?: string[] | null;
+    hops?: number;
+    ttlMs?: number;
+  }): void {
+    const now = Date.now();
+    this.run(
+      `INSERT INTO intercom (id, from_layer, to_layer, kind, topic_id, reply_to, session_key, task_id,
+                             body, refs, status, hops, expires_at, created_at, consumed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, NULL)`,
+      input.id,
+      input.fromLayer,
+      input.fromLayer === 'router' ? 'watchdog' : 'router',
+      input.kind,
+      input.topicId ?? null,
+      input.replyTo ?? null,
+      input.sessionKey ?? null,
+      input.taskId ?? null,
+      input.body,
+      input.refs && input.refs.length > 0 ? JSON.stringify(input.refs) : null,
+      input.hops ?? 0,
+      new Date(now + (input.ttlMs ?? 24 * 3600_000)).toISOString(),
+      new Date(now).toISOString(),
+    );
+  }
+
+  /**
+   * 某个层还没看到的消息，最老的在前（先看到的先处理）。
+   *
+   * 只取 pending：投递过的绝不再给。否则每轮都会重复注入同一批"已经看过的旧话"，
+   * 上下文会被自己的历史撑爆——这正是上下文预算那个 bug 的同一个形态。
+   */
+  listPendingIntercom(toLayer: 'router' | 'watchdog', limit = 10): IntercomMessage[] {
+    const now = nowIso();
+    return this.all(
+      `SELECT * FROM intercom
+       WHERE to_layer = ? AND status = 'pending' AND (expires_at IS NULL OR expires_at > ?)
+       ORDER BY created_at ASC LIMIT ?`,
+      toLayer,
+      now,
+      limit,
+    ).map((row) => this.toIntercom(row));
+  }
+
+  /**
+   * 注入上下文时调用。
+   *
+   * notice 投递即终结（没人会回复它）；question/request 停在 delivered，
+   * 等对方 reply 之后才变 answered。
+   */
+  markIntercomDelivered(id: string): void {
+    const row = this.get('SELECT kind FROM intercom WHERE id = ?', id);
+    const terminal = row && str(row['kind']) === 'notice';
+    this.run(
+      `UPDATE intercom SET status = ?, consumed_at = ? WHERE id = ? AND status = 'pending'`,
+      terminal ? 'consumed' : 'delivered',
+      nowIso(),
+      id,
+    );
+  }
+
+  /** 对方已经处理完（回复了或明确不需要动作）。 */
+  consumeIntercom(id: string): void {
+    this.run(
+      `UPDATE intercom SET status = 'answered', consumed_at = ? WHERE id = ? AND status IN ('pending', 'delivered')`,
+      nowIso(),
+      id,
+    );
+  }
+
+  getIntercom(id: string): IntercomMessage | null {
+    const row = this.get('SELECT * FROM intercom WHERE id = ?', id);
+    return row ? this.toIntercom(row) : null;
+  }
+
+  expireIntercom(now = nowIso()): void {
+    this.run(
+      `UPDATE intercom SET status = 'expired' WHERE status IN ('pending', 'delivered') AND expires_at IS NOT NULL AND expires_at <= ?`,
+      now,
+    );
+  }
+
+  private toIntercom(row: Record<string, unknown>): IntercomMessage {
+    let refs: string[] | null = null;
+    const rawRefs = strOrNull(row['refs']);
+    if (rawRefs !== null) {
+      try {
+        const parsed: unknown = JSON.parse(rawRefs);
+        if (Array.isArray(parsed)) refs = parsed.filter((item): item is string => typeof item === 'string');
+      } catch {
+        refs = null;
+      }
+    }
+    return {
+      id: str(row['id']),
+      fromLayer: str(row['from_layer']) as 'router' | 'watchdog',
+      toLayer: str(row['to_layer']) as 'router' | 'watchdog',
+      kind: str(row['kind']) as IntercomMessage['kind'],
+      topicId: strOrNull(row['topic_id']),
+      replyTo: strOrNull(row['reply_to']),
+      sessionKey: strOrNull(row['session_key']),
+      taskId: strOrNull(row['task_id']),
+      body: str(row['body']),
+      refs,
+      status: str(row['status']),
+      hops: num(row['hops']),
+      expiresAt: strOrNull(row['expires_at']),
+      createdAt: str(row['created_at']),
+    };
+  }
+
+  /**
+   * 维护者状态快照：给 Router 的只读视图。
+   *
+   * 只给可核对的事实，不给维护者的推测——Router 分不清「事实」和「猜测」的话，
+   * 会把猜测当结论转述给用户。
+   */
+  maintainerStatus(): {
+    openIssues: { id: string; title: string; note: string | null; lastSeen: string }[];
+    recentCommands: { command: string; status: string; result: string | null; createdAt: string }[];
+    lastRestartAt: string | null;
+  } {
+    const issues = this.all(
+      `SELECT id, title, note, last_seen FROM wd_issue WHERE status = 'open' ORDER BY last_seen DESC LIMIT 5`,
+    ).map((row) => ({
+      id: str(row['id']),
+      title: str(row['title']),
+      note: strOrNull(row['note']),
+      lastSeen: str(row['last_seen']),
+    }));
+    const commands = this.all(
+      `SELECT command, status, result, created_at FROM control_command ORDER BY created_at DESC LIMIT 5`,
+    ).map((row) => ({
+      command: str(row['command']),
+      status: str(row['status']),
+      result: strOrNull(row['result']),
+      createdAt: str(row['created_at']),
+    }));
+    const restart = this.get(
+      `SELECT created_at FROM wd_action WHERE action LIKE '%restart%' ORDER BY created_at DESC LIMIT 1`,
+    );
+    return { openIssues: issues, recentCommands: commands, lastRestartAt: restart ? str(restart['created_at']) : null };
   }
 
   insertWdQuestion(id: string, question: string): void {

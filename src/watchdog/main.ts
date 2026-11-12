@@ -316,6 +316,9 @@ let lastModelReview = 0;
  */
 function dueForReview(): { run: boolean; reason: string } {
   const now = Date.now();
+  // Router 主动找了维护者：立刻看，不能等到定时点。用户那边正等着回话。
+  const fromRouter = store.listPendingIntercom('watchdog', 1);
+  if (fromRouter.length > 0) return { run: true, reason: `${fromRouter.length} 条来自 Router 的消息` };
   const issues = store.listOpenIssues();
   const due = issues.filter((issue) => !issue.checkAfter || Date.parse(issue.checkAfter) <= now);
   if (due.length > 0) return { run: true, reason: `${due.length} 个事件到期待复查` };

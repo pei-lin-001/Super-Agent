@@ -192,6 +192,8 @@ export function routerStateBlock(input: {
   taskCards: string;
   pendingMessages: string;
   conversationNote?: string | null;
+  /** 维护者（Watchdog）转来的消息，注入过一次就不再出现。 */
+  maintainerMessages?: string;
 }): string {
   return [
     '# 系统当前状态（由程序生成，不是用户说的话）',
@@ -201,6 +203,14 @@ export function routerStateBlock(input: {
     '',
     '## 待你处理的 Worker 消息',
     input.pendingMessages || '（无）',
+    ...(input.maintainerMessages
+      ? [
+          '',
+          '## 维护者（Watchdog）转来的消息',
+          '（它管重启、任务挂起、环境异常这些事；它不能直接找用户，所以由你转述。提问和请求要回复。）',
+          input.maintainerMessages,
+        ]
+      : []),
     ...(input.conversationNote
       ? [
           '',

@@ -414,6 +414,30 @@ CREATE TABLE IF NOT EXISTS model_call (
 CREATE INDEX IF NOT EXISTS idx_model_call_started ON model_call(started_at);
 CREATE INDEX IF NOT EXISTS idx_model_call_purpose ON model_call(purpose, status);
 
+-- Router 与 Watchdog 之间的通道。
+-- 两个进程只通过数据库通信，所以这里既是消息队列也是审计记录。
+-- notice 不要求回应；request/question 要求 reply，且 reply 不能再 reply
+-- （否则两个模型会互相唤醒到天亮的死循环）。hops 就是那道闸门。
+CREATE TABLE IF NOT EXISTS intercom (
+  id          TEXT PRIMARY KEY,
+  from_layer  TEXT NOT NULL,
+  to_layer    TEXT NOT NULL,
+  kind        TEXT NOT NULL,
+  topic_id    TEXT,
+  reply_to    TEXT,
+  session_key TEXT,
+  task_id     TEXT,
+  body        TEXT NOT NULL,
+  refs        TEXT,
+  status      TEXT NOT NULL DEFAULT 'pending',
+  hops        INTEGER NOT NULL DEFAULT 0,
+  expires_at  TEXT,
+  created_at  TEXT NOT NULL,
+  consumed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_intercom_to ON intercom(to_layer, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_intercom_topic ON intercom(topic_id);
+
 CREATE TABLE IF NOT EXISTS wd_question (
   id         TEXT PRIMARY KEY,
   question   TEXT NOT NULL,

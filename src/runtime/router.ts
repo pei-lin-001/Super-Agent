@@ -2,7 +2,7 @@ import type { Config } from '../config.ts';
 import { parseSessionKey } from '../channels/types.ts';
 import { ConversationService } from '../channels/conversations.ts';
 import { randomBytes } from 'node:crypto';
-import { nowIso } from '../domain/ids.ts';
+import { beijingTime, nowIso } from '../domain/ids.ts';
 import { RecordingModel } from '../model/recorder.ts';
 import type { OutboundArtifact, RuntimeEvent, Task } from '../domain/types.ts';
 import type { ChatMessage, ModelClient, ToolSchema } from '../model/types.ts';
@@ -120,6 +120,41 @@ const ROUTER_TOOLS: ToolSchema[] = [
       properties: { title: { type: 'string', description: '话题名，可为空' } },
       required: [],
     },
+  },
+  {
+    name: 'notify_maintainer',
+    description:
+      '给维护者（Watchdog，独立进程）留一条通报，不要求它回应。' +
+      '适合：用户报告了系统异常、你观察到某个 Worker 反复失败或卡住、你发现配置或环境有问题。' +
+      '它会在下一次巡检里看到。不要用它转述用户的普通需求——那些用 create_task。',
+    parameters: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: '要说的事，一句话讲清现象和影响' },
+        refs: { type: 'array', items: { type: 'string' }, description: '可核对的东西：任务 id、worker id、用户原话' },
+      },
+      required: ['text'],
+    },
+  },
+  {
+    name: 'ask_maintainer',
+    description:
+      '向维护者提问，只有它知道的事（例如：主系统最近重启过吗、某个 Worker 是不是被它挂起的、有什么未解决事件）。' +
+      '它是异步的：这一轮先把问题发出去并告诉用户"我在核实"，回答到达后你会被重新唤醒。不要在同一轮里等它。',
+    parameters: {
+      type: 'object',
+      properties: {
+        question: { type: 'string', description: '具体问题，一次只问一件' },
+      },
+      required: ['question'],
+    },
+  },
+  {
+    name: 'read_maintainer_status',
+    description:
+      '只读查看维护者当前掌握的事实：未解决事件、最近的控制指令结果、上次重启时间。' +
+      '回答"系统最近有什么问题""刚才为什么断了一下"之前先看它，不要猜。',
+    parameters: { type: 'object', properties: {}, required: [] },
   },
   {
     name: 'conversation_switch',
@@ -328,7 +363,14 @@ export class Router {
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
       if (this.runtime.isStopped) return;
       // 按来源会话+话题分组汇报：多条聊天交错时，不能把别人的材料混进一次总结。
-      const targets = this.runtime.store.routerInboxTargets();
+      const targets = [...this.runtime.store.routerInboxTargets()];
+      // 维护者的通报同样需要一次 Router 轮次：没有 Worker 汇报时也得跑。
+      for (const message of this.runtime.store.listPendingIntercom('router', 6)) {
+        const key = message.sessionKey;
+        if (key === null) continue;
+        if (targets.some((target) => target.sessionKey === key)) continue;
+        targets.push({ sessionKey: key, conversationId: this.runtime.store.currentConversationId(key) });
+      }
       if (targets.length === 0) return;
       const outcome = await Promise.all(
         targets.map((target) =>
@@ -343,6 +385,27 @@ export class Router {
     } finally {
       this.notifyRun = null;
     }
+  }
+
+  /**
+   * 维护者转来的消息。注入即标记已投递——不标记的话每轮都会重复出现，
+   * 上下文会被"已经处理过的旧话"撑满。
+   *
+   * CLI 会话（sessionKey 为空）也收：维护者的通报对谁都该看得到。
+   */
+  private renderMaintainerMessages(sessionKey: string | null): string {
+    const store = this.runtime.store;
+    const pending = store.listPendingIntercom('router', 6);
+    if (pending.length === 0) return '';
+    const lines: string[] = [];
+    for (const message of pending) {
+      // 有会话归属的只给那个会话看，别把别人聊天里的事串进来。
+      if (message.sessionKey !== null && sessionKey !== null && message.sessionKey !== sessionKey) continue;
+      const kind = message.kind === 'question' ? '提问（需要回复）' : message.kind === 'request' ? '请求（需要判断）' : '通报';
+      lines.push(`- [${message.id}] ${kind}｜${message.body}`);
+      store.markIntercomDelivered(message.id);
+    }
+    return lines.join('\n');
   }
 
   private publish(event: RuntimeEvent): void {
@@ -441,6 +504,7 @@ export class Router {
       taskCards: this.renderWorkspaces(sessionKey, conversationId),
       pendingMessages: pending,
       conversationNote: assembled?.note ?? null,
+      maintainerMessages: this.renderMaintainerMessages(sessionKey),
     });
     const messages: ChatMessage[] = [{ role: 'system', content: routerSystemPrompt() }, ...history];
 
@@ -938,6 +1002,55 @@ export class Router {
           const created = this.conversations.create(sessionKey, title);
           this.rebindConversation(receipt, created.id);
           return `已新建并切换到话题「${created.title}」（${created.id}）。后续操作都属于这个新话题。`;
+        }
+        case 'notify_maintainer': {
+          const notice = text(args['text'], 'text').trim();
+          if (notice === '') return '通报内容不能为空。';
+          const refs = Array.isArray(args['refs'])
+            ? (args['refs'] as unknown[]).filter((item): item is string => typeof item === 'string')
+            : null;
+          const id = `ic_${randomBytes(4).toString('hex')}`;
+          this.runtime.store.insertIntercom({
+            id,
+            fromLayer: 'router',
+            kind: 'notice',
+            body: notice.slice(0, 2000),
+            refs,
+            sessionKey: receipt?.sessionKey ?? null,
+          });
+          // 立刻叫醒维护者：它下一次巡检本来可能在半小时后。
+          this.runtime.wakeMaintainer();
+          return `已通报维护者（${id}），它会在下一次巡检看到。`;
+        }
+        case 'ask_maintainer': {
+          const question = text(args['question'], 'question').trim();
+          if (question === '') return '问题不能为空。';
+          const id = `ic_${randomBytes(4).toString('hex')}`;
+          this.runtime.store.insertIntercom({
+            id,
+            fromLayer: 'router',
+            kind: 'question',
+            body: question.slice(0, 2000),
+            topicId: id,
+            sessionKey: receipt?.sessionKey ?? null,
+          });
+          this.runtime.wakeMaintainer();
+          return `问题已发给维护者（${id}）。这是异步的：先告诉用户你在核实，回答到达后你会被重新唤醒。`;
+        }
+        case 'read_maintainer_status': {
+          const status = this.runtime.store.maintainerStatus();
+          const lines = [
+            `上次重启：${status.lastRestartAt ? beijingTime(status.lastRestartAt) : '（没有重启记录）'}`,
+            `未解决事件：${status.openIssues.length === 0 ? '无' : ''}`,
+            ...status.openIssues.map(
+              (issue) => `- ${issue.id}｜${issue.title}｜最后出现 ${beijingTime(issue.lastSeen)}${issue.note ? `｜${issue.note}` : ''}`,
+            ),
+            `最近控制指令：${status.recentCommands.length === 0 ? '无' : ''}`,
+            ...status.recentCommands.map(
+              (command) => `- ${beijingTime(command.createdAt)} ${command.command} → ${command.status}｜${command.result ?? ''}`,
+            ),
+          ];
+          return lines.join('\n');
         }
         case 'conversation_switch': {
           const sessionKey = receipt?.sessionKey ?? null;

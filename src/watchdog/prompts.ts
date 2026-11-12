@@ -42,6 +42,8 @@ export function observationPrompt(input: {
   lastActions: string;
   now: string;
   intervalMinutes: number;
+  /** Router 转来的消息，已经注入过一次就不会再出现。 */
+  routerMessages?: string;
 }): string {
   return `# 本次巡检
 
@@ -55,6 +57,7 @@ ${input.issues || '（无）'}
 
 ## 你最近做过什么
 ${input.lastActions || '（无）'}
+${input.routerMessages ? `\n## Router 转来的消息\n${input.routerMessages}\n` : ''}
 
 请判断：有没有需要你介入的问题？如果没有，简短说明理由后结束，不要为了显得有用而制造动作。
 如果需要介入，用工具调查后再决定，并在结束时给出：结论、证据引用、不确定性、已采取的动作、预期的变化、下次复查条件。
