@@ -79,6 +79,7 @@ import {
   type HistoryPlan,
 } from './context.ts';
 import { buildNotePrompt, decideNote, runNote, type NoteDecision } from './note.ts';
+import { compactionTrigger } from './window.ts';
 import type { Store } from '../storage/store.ts';
 
 export interface CreateTaskInput {
@@ -209,6 +210,7 @@ export class Runtime implements ToolHost {
             model: options.config.workerModel,
             reasoningEffort: null,
 kind: 'chat',
+contextWindow: null,
 note: null,
             costHint: null,
           },
@@ -1751,6 +1753,22 @@ note: null,
       maxSteps: this.config.limits.maxStepsPerRun,
       signal: runController?.signal ?? null,
       reasoningEffort: this.config.reasoningEffort,
+      // 轮内压缩：一轮可能跑几十步工具，上下文在轮内还会涨，
+      // 外层调用前的裁剪管不到这里。
+      compaction: {
+        contextWindowTokens:
+          this.models.contextWindowOf(worker.model ?? this.config.defaultModelAlias) ?? this.config.limits.contextWindowTokens,
+        reserveTokens: this.config.limits.routerReserveTokens,
+        keepRecentTokens: this.config.limits.workerKeepRecentTokens,
+        onCompact: (info) => {
+          this.store.appendEvent(
+            task?.id ?? null,
+            workerId,
+            'context.compacted',
+            `轮内压缩：${info.beforeTokens} → ${info.afterTokens} token，略去 ${info.droppedMessages} 条`,
+          );
+        },
+      },
       canContinue: staleReason,
       stopOnPlainText: task.ownerWorkerId !== workerId,
       pullInbox: () => {
@@ -2087,11 +2105,29 @@ note: null,
   }
 
   private planFor(worker: Worker): HistoryPlan {
+    const limits = this.config.limits;
+    const stats = this.store.workerTurnStats(worker.id);
+    // 上下文规模以提供方回报的真实 usage 为准。纯字符估算对中文低估一倍以上，
+    // 拿它当阈值会让压缩永远不触发（实测 400k 字符被当成 100k token，实际 226k）。
+    const measured = this.store.measureContextTokens({ purpose: 'worker', workerId: worker.id });
+    // 窗口优先用该别名自己声明的真实值；没声明才用全局配置。
+    const windowTokens = this.models.contextWindowOf(worker.model ?? this.config.defaultModelAlias) ?? limits.contextWindowTokens;
+    const trigger = compactionTrigger({
+      contextWindowTokens: windowTokens,
+      reserveTokens: limits.routerReserveTokens,
+    });
+    const overBudget = measured !== null && measured > trigger;
+    // 实测的字符/token 比例：中英混排自动适配，不必猜换算常数。
+    const charsPerToken = measured !== null && measured > 0 && stats.chars > 0 ? stats.chars / measured : 4;
     return planHistory({
       store: this.store,
       workerId: worker.id,
-      windowChars: this.config.limits.contextWindowChars,
-      overshootChars: this.config.limits.pairingOvershootChars,
+      // 没超阈值就用字符预算兜底（它本身约等于半个窗口，够安全）；
+      // 超了才按 token 预算 + 实测比例换算成字符预算去裁。
+      windowChars: overBudget
+        ? Math.min(Math.floor(limits.workerKeepRecentTokens * charsPerToken), limits.contextWindowChars)
+        : limits.contextWindowChars,
+      overshootChars: limits.pairingOvershootChars,
     });
   }
 

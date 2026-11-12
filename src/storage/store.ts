@@ -1225,6 +1225,77 @@ export class Store {
     );
   }
 
+  /**
+   * 最近一次成功调用回报的上下文规模（token）。
+   *
+   * usage 是提供方的实数，不是估算：prompt_tokens 已扣掉缓存命中部分，
+   * 所以要把 cached_tokens 加回来；completion_tokens 会成为下一轮的历史，也算进去。
+   * 和 pi 的 calculateContextTokens 同一口径。
+   *
+   * 为什么要它：纯字符估算对中文低估 2 倍多（实测 400k 字符被估成 10 万 token，
+   * 实际发了 22.6 万），拿估算做压缩阈值会让安全阀永远打不开。
+   */
+  latestContextUsage(scope: {
+    purpose: 'router' | 'worker' | 'watchdog';
+    workerId?: string | null;
+    sessionId?: string | null;
+  }): { tokens: number; endedAt: string } | null {
+    const clauses = ["purpose = ?", "status = 'ok'", 'ended_at IS NOT NULL', 'usage_known = 1'];
+    const params: (string | number)[] = [scope.purpose];
+    if (scope.workerId) {
+      clauses.push('worker_id = ?');
+      params.push(scope.workerId);
+    }
+    if (scope.sessionId) {
+      clauses.push('session_id = ?');
+      params.push(scope.sessionId);
+    }
+    const row = this.get(
+      `SELECT ended_at, coalesce(prompt_tokens,0) + coalesce(cached_tokens,0) + coalesce(completion_tokens,0) AS total
+       FROM model_call WHERE ${clauses.join(' AND ')} ORDER BY ended_at DESC LIMIT 1`,
+      ...params,
+    );
+    if (!row) return null;
+    return { tokens: num(row['total']), endedAt: str(row['ended_at']) };
+  }
+
+  /**
+   * 当前上下文规模（token）：上次调用的真实 usage + 之后新增内容的估算。
+   *
+   * 这就是 pi 的 estimateContextTokens 那套：真实值当基准，估算只吃增量，
+   * 所以中英文混排都不会累积误差。没有调用记录时返回 null，调用方退回纯估算。
+   */
+  measureContextTokens(scope: {
+    purpose: 'router' | 'worker' | 'watchdog';
+    workerId?: string | null;
+    sessionId?: string | null;
+  }): number | null {
+    const usage = this.latestContextUsage(scope);
+    if (!usage) return null;
+    const chars = this.charsSinceLastCall({
+      kind: scope.purpose === 'worker' ? 'worker' : scope.purpose === 'router' ? 'router' : 'watchdog',
+      key: scope.purpose === 'worker' ? (scope.workerId ?? null) : scope.purpose === 'router' ? (scope.sessionId ?? null) : null,
+      since: usage.endedAt,
+    });
+    // 增量用 chars/4 就够：它只是上次调用之后的几条，误差不累积。
+    return usage.tokens + Math.ceil(chars / 4);
+  }
+
+  /** 上次调用之后新增的历史字符数：估算增量用，误差不累积。 */
+  charsSinceLastCall(scope: { kind: 'worker' | 'router' | 'watchdog'; key: string | null; since: string }): number {
+    const table = scope.kind === 'worker' ? 'worker_turn' : scope.kind === 'router' ? 'router_turn' : 'wd_turn';
+    const column = scope.kind === 'worker' ? 'worker_id' : scope.kind === 'router' ? 'session_key' : null;
+    const row =
+      column === null
+        ? this.get(`SELECT coalesce(sum(length(content)),0) AS chars FROM ${table} WHERE created_at > ?`, scope.since)
+        : this.get(
+            `SELECT coalesce(sum(length(content)),0) AS chars FROM ${table} WHERE ${column} = ? AND created_at > ?`,
+            scope.key ?? '',
+            scope.since,
+          );
+    return row ? num(row['chars']) : 0;
+  }
+
   finishModelCall(input: {
     id: string;
     status: 'ok' | 'failed' | 'cancelled' | 'interrupted';

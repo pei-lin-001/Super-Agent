@@ -10,6 +10,7 @@
 import type { ChatMessage, ModelClient, ToolSchema } from '../model/types.ts';
 import type { ToolOutcome } from '../tools/types.ts';
 import { runAgentLoop, type AgentLoopConfig, type StreamFn } from '../vendor/pi/agent-loop.ts';
+import { compactionTrigger } from './window.ts';
 import { EventStream } from '../vendor/pi/event-stream.ts';
 import type {
   AgentMessage,
@@ -44,6 +45,19 @@ export interface WorkerTurnInput {
   /** 单轮调度最多几步。 */
   maxSteps: number;
   signal: AbortSignal | null;
+  /**
+   * 一轮内部的上下文压缩（pi 的 prepareNextTurn 挂载点）。
+   *
+   * 外层在调用本函数之前已经按预算裁剪过一次；但一轮里可能跑几十步工具，
+   * 上下文在轮内还会涨。pi 把这个位置留成挂载点，宿主不接就等于自动压缩不存在。
+   */
+  compaction?: {
+    contextWindowTokens: number;
+    reserveTokens: number;
+    keepRecentTokens: number;
+    /** 真实压缩发生时回调一次，给宿主记事件。 */
+    onCompact?: (info: { beforeTokens: number; afterTokens: number; droppedMessages: number }) => void;
+  };
   /** 执行一次工具；返回业务结果与是否终止本轮。 */
   runTool: (call: { id: string; name: string; arguments: string }) => Promise<ToolRunResult>;
   /** 每完成一次模型调用（=一步）。有工具调用时在动手之前触发。 */
@@ -298,6 +312,25 @@ export function makeStreamFn(
   };
 }
 
+/** 一条 pi 消息的字符数：文本、思考、工具参数、工具结果都要算。 */
+function agentMessageChars(message: AgentMessage): number {
+  const anyMessage = message as unknown as { content?: unknown; toolName?: string };
+  const content = anyMessage.content;
+  if (typeof content === 'string') return content.length;
+  if (!Array.isArray(content)) return 0;
+  let chars = 0;
+  for (const block of content) {
+    if (typeof block !== 'object' || block === null) continue;
+    const item = block as Record<string, unknown>;
+    if (item['type'] === 'text' && typeof item['text'] === 'string') chars += item['text'].length;
+    else if (item['type'] === 'thinking' && typeof item['thinking'] === 'string') chars += item['thinking'].length;
+    else if (item['type'] === 'toolCall') chars += JSON.stringify(item['arguments'] ?? {}).length + 32;
+    else if (item['type'] === 'image') chars += 4800; // 与 pi 的 ESTIMATED_IMAGE_CHARS 一致
+    else if (typeof item['text'] === 'string') chars += item['text'].length;
+  }
+  return chars;
+}
+
 function mapStopReason(finishReason: string): StopReason {
   const value = finishReason.toLowerCase();
   if (value.includes('length') || value.includes('max_tokens')) return 'length';
@@ -359,6 +392,64 @@ export async function runWorkerTurn(input: WorkerTurnInput): Promise<WorkerTurnR
   const config: AgentLoopConfig = {
     model: input.model,
     convertToLlm: (messages) => messages,
+    // pi 的 compaction 挂载点。不接这个回调 = 自动压缩不存在，上下文只能靠
+    // 外层在调用前裁一次，轮内涨上去就没人管。
+    prepareNextTurn: async (turn) => {
+      const rule = input.compaction;
+      if (!rule) return undefined;
+      const usage = turn.message.usage;
+      if (!usage) return undefined;
+      // usage 是实数：input 已扣缓存，要把命中部分加回来；output 会成为下一轮历史。
+      const beforeTokens = usage.input + usage.cacheRead + usage.cacheWrite + usage.output;
+      const trigger = compactionTrigger({
+        contextWindowTokens: rule.contextWindowTokens,
+        reserveTokens: rule.reserveTokens,
+      });
+      if (beforeTokens <= trigger) return undefined;
+
+      const messages = turn.context.messages;
+      const totalChars = messages.reduce((sum, message) => sum + agentMessageChars(message), 0);
+      // 本段文本真实的「字符 / token」：中文约 1.7，英文约 4，用实测值而不是猜。
+      const charsPerToken = totalChars > 0 ? totalChars / beforeTokens : 4;
+      const budget = Math.max(1, rule.keepRecentTokens) * charsPerToken;
+
+      // 从尾部往前累计到预算；切点必须落在 user 消息之前，
+      // 否则会把 assistant 的 toolCall 和它的 toolResult 拆开，提供方直接拒收。
+      let cut = messages.length;
+      let keptChars = 0;
+      while (cut > 0) {
+        const chars = agentMessageChars(messages[cut - 1]!);
+        if (keptChars + chars > budget && cut < messages.length) break;
+        keptChars += chars;
+        cut -= 1;
+      }
+      // 系统提示永远保留。
+      const systemCount = messages.findIndex((message) => message.role !== 'system');
+      const floor = systemCount < 0 ? messages.length : systemCount;
+      cut = Math.max(cut, floor);
+      // 切点回退到最近的 user 消息之前（不含 system 区）。
+      while (cut > floor && messages[cut - 1]?.role !== 'user') cut -= 1;
+      if (cut <= floor) return undefined;
+
+      const dropped = cut - floor;
+      if (dropped <= 0) return undefined;
+      const notice = {
+        role: 'user' as const,
+        content: [
+          {
+            type: 'text' as const,
+            text:
+              `（系统压缩：本轮更早的 ${dropped} 条对话（含工具输出）已略去以控制请求体积。` +
+              '需要细节用 history_search 定位、history_read 读原文。不要因为看不到就重做已经做完的事。）',
+          },
+        ],
+        timestamp: Date.now(),
+      };
+      const next = [...messages.slice(0, floor), notice, ...messages.slice(cut)];
+      const afterTokens = Math.ceil((totalChars - keptChars + 60) / charsPerToken);
+      rule.onCompact?.({ beforeTokens, afterTokens, droppedMessages: dropped });
+      return { context: { ...turn.context, messages: next } };
+    },
     executeToolCall: async ({ toolCall, assistantMessage }) => {
       // 每步之前再核一次资格：暂停/取消之后旧响应不得继续执行。
       const blocked = input.canContinue?.();

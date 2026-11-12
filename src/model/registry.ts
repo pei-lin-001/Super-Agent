@@ -26,6 +26,15 @@ export class ModelRegistry {
     }));
   }
 
+  /**
+   * 该别名真实的上下文窗口；没配就返回 null，调用方退回全局配置。
+   * 填大了会被提供方 400，所以宁可让它在目录里显式写出来。
+   */
+  contextWindowOf(alias: string | null): number | null {
+    if (!alias) return null;
+    return this.profiles.get(alias)?.contextWindow ?? null;
+  }
+
   has(alias: string): boolean {
     return this.profiles.has(alias);
   }

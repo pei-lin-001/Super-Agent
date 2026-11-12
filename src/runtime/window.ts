@@ -1,10 +1,20 @@
 /**
- * 上下文预算：token 估算、压缩阈值、按预算切窗口。
+ * 上下文预算：规模测量、压缩阈值、按预算切窗口。
  *
- * 三处来源，都是移植不是自创。注意本条与其它两条性质不同：换算比例是设计参照，
- * 阈值与切点是代码搬运（见 THIRD_PARTY_NOTICES.md「pi」与「OpenClaw」两节）。
- * - token 估算 `chars / 4`：pi 的 estimateTokens 用同一换算（上游为 monorepo
- *   `packages/ai` 下的工具函数；本地只取换算比例，未搬运其代码）
+ * ## 关键：必须用「真实 usage」当基准，不能只用字符估算
+ *
+ * pi 的 estimateTokens 是 `chars / 4`，但它**只用来估算上一次调用之后新增的几条**，
+ * 判断要不要压缩用的是提供方回报的真实 usage（见 pi 的 estimateContextTokens）。
+ * 我们早期只搬了 `/4` 这个比例、没搬这套算法，结果中文全量估算低了 2.2 倍：
+ * 实测 400,151 字符被估成 100,037 token，实际发出去 226,023 token——
+ * 阈值 150,000「远未达到」，安全阀从未打开，上下文一路涨到贴着模型窗口。
+ *
+ * 中文是约 1.7 字符 1 token（英文约 4），所以 `chars/4` 对中文是低估不是高估。
+ *
+ * 现在：触发判断用 `measuredTokens`（真实 usage + 尾部估算），
+ * 并且用 `总字符 / 真实token` 反算出本段文本的真实比例，再用它把 keepRecentTokens
+ * 换算成字符预算。这样中英混排都能自适应，不必猜换算常数。
+ *
  * - 压缩阈值 `min(window - reserve, window * 0.75)`：OpenClaw
  *   `packages/agent-core/src/harness/compaction/compaction-threshold.ts`
  * - 按 keepRecentTokens 从尾部累计切点：pi `findCutPoint`
@@ -62,15 +72,25 @@ export function planWindow<T extends WindowItem>(input: {
   keepRecentTokens: number;
   contextWindowTokens: number;
   reserveTokens: number;
+  /**
+   * 当前上下文的真实规模（token），由调用方用「上次调用的 usage + 尾部估算」算好。
+   * 不传则退回纯字符估算——**那对中文会低估一倍以上**，只适合没有 usage 可用时兜底。
+   */
+  measuredTokens?: number | null;
 }): WindowPlan<T> {
   const trigger = compactionTrigger({
     contextWindowTokens: input.contextWindowTokens,
     reserveTokens: input.reserveTokens,
   });
-  const totalTokens = input.items.reduce((sum, item) => sum + estimateTokens(item.chars), 0);
+  const totalChars = input.items.reduce((sum, item) => sum + item.chars, 0);
+  // 有实测值就以它为准。估算只在没有 usage 时兜底（首次调用、usage 丢失）。
+  const totalTokens = input.measuredTokens ?? estimateTokens(totalChars);
   const shouldCompact = totalTokens > trigger;
+  // 本段文本真实的「字符 / token」。有 usage 才算得出；没有就退回英文经验值 4。
+  const charsPerToken = totalTokens > 0 && totalChars > 0 ? totalChars / totalTokens : 4;
 
-  let budget = Math.max(0, input.keepRecentTokens);
+  // keepRecentTokens 是 token 预算，按实测比例换成字符预算再切。
+  let budget = Math.max(0, input.keepRecentTokens) * charsPerToken;
   if (!shouldCompact) {
     // 没到触发点就整段保留：不做无谓的摘要调用。
     return {
@@ -84,18 +104,19 @@ export function planWindow<T extends WindowItem>(input: {
   }
 
   let cut = input.items.length;
-  let keptTokens = 0;
+  let keptChars = 0;
   for (let index = input.items.length - 1; index >= 0; index -= 1) {
-    const tokens = estimateTokens(input.items[index]!.chars);
-    if (keptTokens + tokens > budget && cut < input.items.length) break;
-    keptTokens += tokens;
+    const chars = input.items[index]!.chars;
+    if (keptChars + chars > budget && cut < input.items.length) break;
+    keptChars += chars;
     cut = index;
   }
   // 预算为 0 或全部装不下时，至少留最后一条。
   if (cut === input.items.length && input.items.length > 0) {
     cut = input.items.length - 1;
-    keptTokens = estimateTokens(input.items[cut]!.chars);
+    keptChars = input.items[cut]!.chars;
   }
+  const keptTokens = Math.ceil(keptChars / charsPerToken);
 
   const kept = input.items.slice(cut);
   const dropped = input.items.slice(0, cut);

@@ -50,6 +50,8 @@ export function planRouterContext(input: {
     keepRecentTokens: limits.routerKeepRecentTokens,
     contextWindowTokens: limits.contextWindowTokens,
     reserveTokens: limits.routerReserveTokens,
+    // 真实 usage 当基准：纯字符估算对中文低估一倍以上，阈值会永远打不开。
+    measuredTokens: store.measureContextTokens({ purpose: 'router', sessionId: sessionKey }),
   });
 
   const kept = plan.kept.map((item) => item.turn);
@@ -169,6 +171,7 @@ export function boundRouterHistory(input: {
   messages: ChatMessage[];
   limits: Limits;
 }): ChatMessage[] {
+  // 续接没有 store 可查 usage，只能按字符估算兜底。
   const plan = planWindow({
     items: input.messages.map((message) => ({ message, chars: (message.content ?? '').length })),
     keepRecentTokens: input.limits.routerKeepRecentTokens,

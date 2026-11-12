@@ -294,6 +294,9 @@ export class WatchdogSession {
       keepRecentTokens: limits.routerKeepRecentTokens,
       contextWindowTokens: limits.contextWindowTokens,
       reserveTokens: limits.routerReserveTokens,
+      // 真实 usage 当基准。之前只用 chars/4 全量估算，中文低估 2.3 倍，
+      // 400k 字符被当成 10 万 token，阈值 15 万永远够不到，上下文一路涨到 23 万。
+      measuredTokens: this.deps.store.measureContextTokens({ purpose: 'watchdog' }),
     });
     const kept = plan.kept.map((item) => item.turn);
     const dropped = plan.dropped.map((item) => item.turn);

@@ -36,6 +36,7 @@ function twoAliasConfig(dir: string): Config {
         model: 'mock-pro',
         reasoningEffort: 'max',
         kind: 'chat',
+        contextWindow: null,
         note: '规划、检查、疑难判断',
         costHint: '按 token 计费，高于默认模型',
       },

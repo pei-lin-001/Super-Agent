@@ -41,6 +41,8 @@ export interface Limits {
   routerReserveTokens: number;
   /** Router 压缩后保留的近期对话 token（越大约不常压缩、越贵）。 */
   routerKeepRecentTokens: number;
+  /** Worker 超出窗口后保留的近期历史 token。 */
+  workerKeepRecentTokens: number;
   /** Router 摘要长度上限（字符）。 */
   routerNoteMaxChars: number;
   /** 触发一次整理所需的新增历史条数与字符数，两者同时满足。 */
@@ -85,6 +87,12 @@ export interface ModelProfile {
    * 所以选路线时不能只看模型名，要看这个标记。
    */
   kind: 'chat' | 'decision';
+  /**
+   * 这个模型真实的上下文窗口（token）；为空则用全局 contextWindowTokens。
+   *
+   * 必须填真实值：填大了提供方直接 400，填小了压缩过早、白花钱。
+   */
+  contextWindow: number | null;
   /** 来自配置的用途说明，不是实测能力。 */
   note: string | null;
   /** 来自配置的相对成本说明，不是实时价格。 */
@@ -193,6 +201,7 @@ function loadModelProfiles(fallback: {
         model: fallback.modelName,
         reasoningEffort: null,
         kind: 'chat',
+        contextWindow: null,
         note: null,
         costHint: null,
       },
@@ -236,6 +245,10 @@ function loadModelProfiles(fallback: {
       model,
       reasoningEffort: typeof record['reasoningEffort'] === 'string' ? record['reasoningEffort'] : null,
       kind: record['kind'] === 'decision' ? 'decision' : 'chat',
+      contextWindow:
+        typeof record['contextWindow'] === 'number' && Number.isFinite(record['contextWindow']) && record['contextWindow'] > 0
+          ? Math.floor(record['contextWindow'])
+          : null,
       note: typeof record['note'] === 'string' ? record['note'] : null,
       costHint: typeof record['costHint'] === 'string' ? record['costHint'] : null,
     });
@@ -325,9 +338,12 @@ export function loadConfig(options: { requireModel?: boolean } = {}): Config {
       pairingOvershootChars: intEnv('CONTEXT_PAIRING_OVERSHOOT_CHARS', 8_000),
       // Router 的压缩阈值取 min(窗口-reserve, 窗口*0.75)：窗口越大，前者越接近窗口本身，
       // 于是永不触发。200k 窗口下阈值 150k，留 50k 给任务卡、待处理消息和输出。
-      contextWindowTokens: intEnv('CONTEXT_WINDOW_TOKENS', 200_000),
+      // 必须是模型**真实**窗口，不是名义值：配大了会直接被提供方 400。
+      // deepseek-v4.1-flash 实测 226k token 的请求能过，取 256k。
+      contextWindowTokens: intEnv('CONTEXT_WINDOW_TOKENS', 256_000),
       routerReserveTokens: intEnv('ROUTER_RESERVE_TOKENS', 16_384),
       routerKeepRecentTokens: intEnv('ROUTER_KEEP_RECENT_TOKENS', 40_000),
+      workerKeepRecentTokens: intEnv('WORKER_KEEP_RECENT_TOKENS', 40_000),
       routerNoteMaxChars: intEnv('ROUTER_NOTE_MAX_CHARS', 6_000),
       noteTriggerTurns: intEnv('NOTE_TRIGGER_TURNS', 10),
       noteTriggerChars: intEnv('NOTE_TRIGGER_CHARS', 3_000),
