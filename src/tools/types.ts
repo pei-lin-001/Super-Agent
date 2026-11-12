@@ -119,7 +119,7 @@ export interface ToolHost {
   /** 只能查自己的历史；调用方已在工具层限定为当前 Worker。 */
   searchWorkerTurns(
     workerId: string,
-    options: { fromSeq: number; toSeq: number; role: string | null; limit: number },
+    options: { fromSeq: number; toSeq: number; role: string | null; limit: number; query?: string },
   ): WorkerTurn[];
   listWorkerTurnsRange(workerId: string, fromSeq: number, toSeq: number): WorkerTurn[];
   getMessageForWorker(workerId: string, messageId: string): Message | null;

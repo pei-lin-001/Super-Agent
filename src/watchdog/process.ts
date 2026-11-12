@@ -180,6 +180,9 @@ async function stopMain(config: Config, timeoutMs: number): Promise<{ stopped: b
   if (health.state === 'exited' || health.state === 'absent') {
     return { stopped: true, message: '主系统本就不在运行' };
   }
+  if (health.state === 'unverified') {
+    return { stopped: false, message: `无法确认主系统身份（${health.detail}），不贸然杀进程` };
+  }
   if (health.pid === null || !isValidPid(health.pid)) {
     return { stopped: false, message: `无法确认主系统 pid（${health.detail}），不贸然杀进程` };
   }
@@ -193,6 +196,10 @@ async function stopMain(config: Config, timeoutMs: number): Promise<{ stopped: b
   while (Date.now() < deadline) {
     if (!isPidAlive(pid)) return { stopped: true, message: `主系统 ${pid} 已按 SIGTERM 退出` };
     await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  const current = mainHealth(config);
+  if (current.pid !== pid || (current.state !== 'alive' && current.state !== 'unresponsive')) {
+    return { stopped: false, message: `主系统身份已变化或无法确认（${current.detail}），不发送 SIGKILL` };
   }
   // 优雅停机等不到就只能强杀：SIGTERM 已经给过机会了。
   try {
@@ -212,20 +219,20 @@ async function stopMain(config: Config, timeoutMs: number): Promise<{ stopped: b
 async function waitForHeartbeat(
   config: Config,
   previousStartedAt: string | null,
+  expectedPid: number | null,
+  spawnedAt: number,
   timeoutMs: number,
 ): Promise<{ ok: boolean; detail: string }> {
   const path = join(config.workDir, '.runtime', 'heartbeat.json');
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      const beat = JSON.parse(readFileSync(path, 'utf8')) as { at?: number; startedAt?: string };
-      const fresh = typeof beat.at === 'number' && Date.now() - beat.at < 15_000;
-      const changed = !previousStartedAt || beat.startedAt !== previousStartedAt;
-      if (fresh && (changed || !previousStartedAt)) return { ok: true, detail: '新心跳已写入' };
-      if (fresh && previousStartedAt) {
-        // 心跳新鲜但 startedAt 相同：可能是旧进程的心跳还没被覆盖，再看一眼进程。
-        const health = mainHealth(config);
-        if (health.state === 'alive') return { ok: true, detail: '主系统被判定为 alive' };
+      const beat = JSON.parse(readFileSync(path, 'utf8')) as { at?: number; pid?: number };
+      const instance = readInstance(config);
+      const fresh = typeof beat.at === 'number' && beat.at >= spawnedAt && Date.now() - beat.at < 15_000;
+      const changed = typeof instance?.startedAt === 'string' && instance.startedAt !== previousStartedAt;
+      if (fresh && changed && expectedPid !== null && beat.pid === expectedPid && instance?.pid === expectedPid) {
+        return { ok: true, detail: '新心跳已写入' };
       }
     } catch {
       // 文件还没写出来，继续等。
@@ -259,7 +266,7 @@ export async function restartMainWithRollbackPoint(
   try {
     const { execFileSync } = await import('node:child_process');
     tag = `restart-before-${beijingTime(new Date()).replace(/[: ]/g, '-')}`;
-    execFileSync('git', ['tag', '-f', tag], { cwd: process.cwd(), stdio: 'ignore' });
+    execFileSync('git', ['tag', tag], { cwd: process.cwd(), stdio: 'ignore' });
   } catch {
     tag = null;
   }
@@ -285,6 +292,7 @@ export async function restartMainWithRollbackPoint(
   }
 
   // 3) 拉起。allowRunning 是因为实例文件还是旧的那份，不能当"还活着"看待。
+  const spawnedAt = Date.now();
   const spawned = spawnMain(config, {
     cooldownMs: options.cooldownMs ?? 0,
     allowRunning: true,
@@ -304,9 +312,11 @@ export async function restartMainWithRollbackPoint(
   const beat = await waitForHeartbeat(
     config,
     previousInstance?.startedAt ?? null,
+    spawned.pid,
+    spawnedAt,
     options.heartbeatTimeoutMs ?? 45_000,
   );
-  const tail = tag ? `｜回滚点 ${tag}（git reset --hard ${tag}）` : '｜没有可用的回滚点';
+  const tail = tag ? `｜重启前提交的标记 ${tag}（不包含未提交改动）` : '｜没有可用的提交标记';
   return {
     ok: beat.ok && spawned.ok,
     tag,

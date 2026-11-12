@@ -2,12 +2,11 @@ import { createHash } from 'node:crypto';
 import { beijingTime } from '../domain/ids.ts';
 import { readFile, stat, writeFile } from 'node:fs/promises';
 import { existsSync, statSync } from 'node:fs';
-import { extname, resolve } from 'node:path';
+import { isAbsolute, relative, resolve } from 'node:path';
 import { readdirSync } from 'node:fs';
-import { assertInsideRoot, normalizeRelativePath, resolveInside, ToolError } from './paths.ts';
-import { resolveReadPath } from './files.ts';
+import { ToolError } from './paths.ts';
+import { resolveReadPath, resolveWritePath } from './files.ts';
 import {
-  argNumber,
   argOptionalNumber,
   argOptionalString,
   argString,
@@ -15,7 +14,6 @@ import {
   type ToolDefinition,
   type ToolOutcome,
 } from './types.ts';
-import { taskDir } from './files.ts';
 
 const MAX_EDIT_BYTES = 2_000_000;
 const MAX_GLOB_RESULTS = 200;
@@ -23,15 +21,6 @@ const SKIP_DIRS = new Set(['node_modules', '.git', '.venv', '__pycache__', 'dist
 
 function ok(content: string): ToolOutcome {
   return { type: 'ok', content };
-}
-
-function writablePath(context: ToolContext, logical: string): string {
-  const root = taskDir(context);
-  const normalized = normalizeRelativePath(logical);
-  if (normalized === 'inputs' || normalized.startsWith('inputs/')) throw new Error('inputs 目录只读');
-  const absolute = resolveInside(root, normalized);
-  assertInsideRoot(root, absolute);
-  return absolute;
 }
 
 /** glob → 正则：支持 **、*、?，其余字符按字面量处理。 */
@@ -58,23 +47,18 @@ function globToRegExp(pattern: string): RegExp {
   return new RegExp(`^${out}$`);
 }
 
-function walk(root: string, base: string, out: string[], depth = 0): void {
+function walk(base: string, out: string[], depth = 0): void {
   if (depth > 12 || out.length > MAX_GLOB_RESULTS * 4) return;
-  let entries;
-  try {
-    entries = readdirSync(base, { withFileTypes: true });
-  } catch {
-    return;
-  }
+  const entries = readdirSync(base, { withFileTypes: true });
   for (const entry of entries) {
     if (out.length > MAX_GLOB_RESULTS * 4) return;
     const absolute = resolve(base, entry.name);
     if (entry.isDirectory()) {
       if (SKIP_DIRS.has(entry.name)) continue;
-      walk(root, absolute, out, depth + 1);
+      walk(absolute, out, depth + 1);
       continue;
     }
-    out.push(absolute);
+    if (entry.isFile()) out.push(absolute);
   }
 }
 
@@ -83,7 +67,7 @@ function diffSummary(before: string, after: string, label: string): string {
   if (before === after) return `${label}：内容未变化`;
   const beforeLines = before.split('\n');
   const afterLines = after.split('\n');
-  const removed = beforeLines.length - afterLines.length;
+  const removed = afterLines.length - beforeLines.length;
   const changed = beforeLines
     .map((line, index) => ({ line, index }))
     .filter(({ line }) => !afterLines.includes(line))
@@ -114,20 +98,23 @@ export const editTools: ToolDefinition[] = [
     run(args, context) {
       const pattern = argString(args, 'pattern');
       // 只在读文件时放开到仓库；写入仍然限制在任务目录（fs_write/fs_edit 没变）。
-      const root = context.readRoot;
-      const start = resolveReadPath(context, argOptionalString(args, 'path') ?? '.');
+      const logical = argOptionalString(args, 'path') ?? '.';
+      const start = resolveReadPath(context, logical);
+      if (!statSync(start).isDirectory()) throw new ToolError(`不是目录：${logical}`);
       const limit = Math.max(1, Math.min(MAX_GLOB_RESULTS, argOptionalNumber(args, 'limit') ?? 100));
       const files: string[] = [];
-      walk(root, start, files);
+      walk(start, files);
       const matcher = globToRegExp(pattern.replace(/^\.\//, ''));
+      const root = isAbsolute(logical) ? context.readRoot : start;
+      const prefix = isAbsolute(logical) ? relative(context.readRoot, start) : logical === '.' ? '' : logical.replace(/\/$/, '');
       const matched = files
-        .map((absolute) => absolute.slice(root.length + 1))
-        .filter((relative) => matcher.test(relative))
-        .sort();
+        .map((absolute) => ({ absolute, local: relative(start, absolute), path: prefix ? `${prefix}/${relative(start, absolute)}` : relative(start, absolute) }))
+        .filter((item) => matcher.test(item.path) || matcher.test(item.local))
+        .sort((a, b) => a.path.localeCompare(b.path));
       if (matched.length === 0) return ok(`没有匹配 ${pattern} 的文件`);
-      const shown = matched.slice(0, limit).map((relative) => {
-        const info = statSync(resolve(root, relative));
-        return `${relative}（${info.size}B）`;
+      const shown = matched.slice(0, limit).map((item) => {
+        const info = statSync(item.absolute);
+        return `${isAbsolute(logical) ? resolve(root, item.path) : item.path}（${info.size}B）`;
       });
       const suffix = matched.length > limit ? `\n…共 ${matched.length} 个，已显示 ${limit} 个` : '';
       return ok(shown.join('\n') + suffix);
@@ -187,7 +174,7 @@ export const editTools: ToolDefinition[] = [
     },
     async run(args, context) {
       const logical = argString(args, 'path');
-      const absolute = writablePath(context, logical);
+      const absolute = resolveWritePath(context, logical);
       if (!existsSync(absolute)) throw new ToolError(`文件不存在：${logical}（新建请用 fs_write）`);
       const info = await stat(absolute);
       if (!info.isFile()) throw new ToolError(`不是文件：${logical}`);
@@ -224,9 +211,9 @@ export const editTools: ToolDefinition[] = [
       }
 
       // 先整体校验：任何一处不合法都不写盘。
-      const counts = ops.map((op) => before.split(op.oldText).length - 1);
-      ops.forEach((op, index) => {
-        const count = counts[index] ?? 0;
+      let after = before;
+      const counts = ops.map((op, index) => {
+        const count = after.split(op.oldText).length - 1;
         if (count === 0) throw new ToolError(`第 ${index + 1} 处修改没有找到原文，未做任何改动：${op.oldText.slice(0, 80)}`);
         if (count > 1 && !op.all) {
           throw new ToolError(
@@ -234,12 +221,10 @@ export const editTools: ToolDefinition[] = [
               '请提供更长的上下文，或显式设置 replace_all=true。',
           );
         }
-      });
-
-      let after = before;
-      for (const op of ops) {
         after = op.all ? after.split(op.oldText).join(op.newText) : after.replace(op.oldText, op.newText);
-      }
+        return count;
+      });
+      resolveWritePath(context, logical);
       await writeFile(absolute, after, 'utf8');
       const nextDigest = createHash('sha256').update(Buffer.from(after, 'utf8')).digest('hex');
       const total = counts.reduce((sum, count) => sum + count, 0);

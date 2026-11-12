@@ -66,7 +66,7 @@ export const artifactTools: ToolDefinition[] = [
   {
     name: 'artifact_read',
     description:
-      '按名字与版本读取已登记产物（版本默认最新）。返回内容与总长度；内容过长时用 offset 继续读取。',
+      '按名字与版本读取已登记的 UTF-8 文本产物（版本默认最新）。内容过长时用 offset 继续读取；图片可用 fs_view_image 查看。',
     parameters: {
       type: 'object',
       properties: {

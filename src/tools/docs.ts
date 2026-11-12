@@ -1,9 +1,8 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { assertInsideRoot, resolveInside, ToolError } from './paths.ts';
+import { dirname } from 'node:path';
+import { ToolError } from './paths.ts';
 import {
-  argNumber,
   argOptionalNumber,
   argOptionalString,
   argString,
@@ -11,14 +10,15 @@ import {
   type ToolDefinition,
   type ToolOutcome,
 } from './types.ts';
-import { taskDir } from './files.ts';
+import { resolveReadPath, resolveWritePath } from './files.ts';
 
 const MAX_TEXT = 8_000;
 
 /** 把转换后的全文写进任务目录，并做与 fs_write 相同的越界检查。 */
 function saveText(context: ToolContext, relative: string, text: string): string {
-  const target = resolveInside(taskDir(context), relative);
+  const target = resolveWritePath(context, relative);
   mkdirSync(dirname(target), { recursive: true });
+  resolveWritePath(context, relative);
   writeFileSync(target, text, 'utf8');
   return relative;
 }
@@ -28,19 +28,7 @@ function ok(content: string): ToolOutcome {
 }
 
 function readPath(context: ToolContext, logical: string): string {
-  const absolute = logical.startsWith('materials/')
-    ? (() => {
-        const rest = logical.slice('materials'.length).replace(/^\/+/, '');
-        const target = resolveInside(context.materialsDir, rest);
-        assertInsideRoot(context.materialsDir, target);
-        return target;
-      })()
-    : (() => {
-        const root = taskDir(context);
-        const target = resolveInside(root, logical);
-        assertInsideRoot(root, target);
-        return target;
-      })();
+  const absolute = resolveReadPath(context, logical);
   if (!existsSync(absolute)) throw new ToolError(`文件不存在：${logical}`);
   return absolute;
 }
@@ -87,6 +75,9 @@ export const docTools: ToolDefinition[] = [
       const limit = Math.max(500, Math.min(40_000, argOptionalNumber(args, 'limit') ?? MAX_TEXT));
       const from = argOptionalNumber(args, 'from_page');
       const to = argOptionalNumber(args, 'to_page');
+      if ((from !== null && (!Number.isInteger(from) || from < 1)) || (to !== null && (!Number.isInteger(to) || to < 1)) || (from !== null && to !== null && to < from)) {
+        throw new ToolError('页码必须为正整数，结束页不能早于起始页');
+      }
       const argv = ['-layout'];
       if (from !== null) {
         argv.push('-f', String(Math.max(1, Math.trunc(from))));
@@ -124,9 +115,11 @@ export const docTools: ToolDefinition[] = [
       for (let index = 0; index < pages.length; index += 1) {
         const pageText = pages[index]!.trim();
         if (pageText === '') continue;
-        const block = `--- 第 ${index + 1} 页 ---\n${pageText}`;
+        const block = `--- 第 ${(from ?? 1) + index} 页 ---\n${pageText}`;
         if (used + block.length > limit) {
-          shown.push(`…（已达输出上限 ${limit} 字符；请用 from_page/to_page 分段读取剩余页面）`);
+          const remaining = Math.max(0, limit - used - 100);
+          if (shown.length === 0 && remaining > 0) shown.push(`${block.slice(0, remaining)}\n…（该页超过输出上限；请用 save_to 保存全文后分段读取）`);
+          else shown.push(`…（已达输出上限 ${limit} 字符；请从第 ${(from ?? 1) + index} 页继续读取）`);
           break;
         }
         shown.push(block);
@@ -162,12 +155,14 @@ export const docTools: ToolDefinition[] = [
       } catch (error) {
         throw new ToolError(`不是合法的 notebook JSON：${(error as Error).message}`);
       }
-      const cells = parsed.cells ?? [];
+      const cells = parsed?.cells ?? [];
+      if (!Array.isArray(cells)) throw new ToolError('notebook 的 cells 必须是数组');
       if (cells.length === 0) return ok(`${logical}：没有单元格`);
       const limit = Math.max(500, Math.min(40_000, argOptionalNumber(args, 'limit') ?? MAX_TEXT));
       const blocks: string[] = [];
       let used = 0;
-      cells.forEach((cell, index) => {
+      for (const [index, cell] of cells.entries()) {
+        if (!cell || typeof cell !== 'object') throw new ToolError(`notebook 第 ${index + 1} 个单元格无效`);
         const source = Array.isArray(cell.source) ? cell.source.join('') : (cell.source ?? '');
         const outputs = (cell.outputs ?? [])
           .map((output) => (Array.isArray(output.text) ? output.text.join('') : (output.text ?? '')))
@@ -177,10 +172,13 @@ export const docTools: ToolDefinition[] = [
           `--- 单元格 ${index + 1}（${cell.cell_type ?? 'unknown'}）---\n` +
           `${source.trim()}` +
           (outputs ? `\n[输出]\n${outputs.trim()}` : '');
-        if (used + block.length > limit) return;
+        if (used + block.length > limit) {
+          blocks.push(`…（从第 ${index + 1} 个单元格起超过输出上限；可用 fs_read 读取原文件）`);
+          break;
+        }
         blocks.push(block);
         used += block.length;
-      });
+      }
       return ok(`${logical}｜共 ${cells.length} 个单元格\n\n${blocks.join('\n\n')}`);
     },
   },

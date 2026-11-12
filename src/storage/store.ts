@@ -275,6 +275,7 @@ export class Store {
     this.path = path;
     this.instanceId = options.instanceId ?? `local_${process.pid}_${Date.now()}`;
     this.db = new DatabaseSync(path);
+    this.db.function('casefold', { deterministic: true }, (value) => typeof value === 'string' ? value.toLowerCase() : '');
     // 多进程同时访问同一个库（主系统 + 维护者 + 命令行客户端）：
     // WAL 让读写不互相阻塞，busy_timeout 让短时的写冲突自动重试而不是直接失败。
     this.db.exec('PRAGMA journal_mode = WAL');
@@ -2099,7 +2100,7 @@ export class Store {
 
   searchWorkerTurns(
     workerId: string,
-    options: { fromSeq: number; toSeq: number; role: string | null; limit: number },
+    options: { fromSeq: number; toSeq: number; role: string | null; limit: number; query?: string },
   ): WorkerTurn[] {
     const params: (string | number)[] = [workerId, options.fromSeq, options.toSeq];
     let sql =
@@ -2107,6 +2108,11 @@ export class Store {
     if (options.role) {
       sql += ' AND role = ?';
       params.push(options.role);
+    }
+    if (options.query !== undefined) {
+      // instr 按字面查找，casefold 与原来的 JavaScript 大小写处理一致。
+      sql += " AND instr(casefold(coalesce(content, '') || coalesce(tool_calls, '')), casefold(?)) > 0";
+      params.push(options.query);
     }
     sql += ' ORDER BY seq DESC LIMIT ?';
     params.push(options.limit);

@@ -93,7 +93,7 @@ export function workerStateBlock(input: {
     '',
     ...(noteBlock ? [noteBlock] : []),
     '## 近期历史',
-    `${input.windowSummary}。更早的内容不在输入里，需要时用 history_search 定位、history_read 读原文、message_read 读消息、artifact_read 读产物版本。`,
+    `${input.windowSummary}。更早的内容不在输入里，需要时用 history_search 定位、history_read 读原文、message_read 读消息、artifact_read 读文本产物版本。`,
     '',
     '## 你的身份',
     `- Worker：${worker.id}`,
@@ -151,7 +151,7 @@ export function workerSystemPrompt(input: {
 - PDF 要反复查关键词时，先用 doc_pdf 的 save_to 存成文本（如 pdf/paper.txt），再用 fs_search / fs_read 定位——转换一次就够，不要每换一个关键词就让 proc_run 重新解析一遍 PDF。
 - 看图片用 fs_view_image（png/jpeg/gif/webp）：它返回的是图片本身，你确实能看到画面——截图里的报错、图表里的数字、设计稿的布局都能读。fs_read 读二进制只会给你一串乱码，不要用它试图片。每次调用都会把整张图放进上下文，同一张图不要反复看。
 - .env 与 .env.* 读不到，这是程序故意的：凭据不进模型上下文，因为一旦进去就会跟着每一轮请求发出去，收不回来。需要某个配置项时，说明你要它做什么，由维护者决定怎么给。
-- 工作记录帮助延续工作，细节不足时用 history_search 定位、history_read 读取原文、message_read 查回消息、artifact_read 读取指定版本；只访问工具允许的范围。
+- 工作记录帮助延续工作，细节不足时用 history_search 定位、history_read 读取原文、message_read 查回消息、artifact_read 读取指定文本产物版本；只访问工具允许的范围。
 - 优先复用已有可靠依据；材料更新、依据缺失或需要独立核对时可以重新读取。长内容按 offset/limit 续读，不把截断片段当作全文。
 - 「执行结果未知」表示只有调用记录、没有结果，不能当成功，也不能当没发生；先核对现状再决定是否重做。「未执行」才表示程序确定没有执行。
 

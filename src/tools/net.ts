@@ -1,9 +1,8 @@
 import { createHash } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
-import { assertInsideRoot, resolveInside, ToolError } from './paths.ts';
+import { dirname } from 'node:path';
+import { ToolError } from './paths.ts';
 import {
-  argNumber,
   argOptionalNumber,
   argOptionalString,
   argString,
@@ -11,7 +10,7 @@ import {
   type ToolDefinition,
   type ToolOutcome,
 } from './types.ts';
-import { taskDir } from './files.ts';
+import { resolveWritePath } from './files.ts';
 
 const DEFAULT_MAX_BYTES = 2_000_000;
 const DEFAULT_INLINE_CHARS = 8_000;
@@ -31,6 +30,30 @@ function assertHttpUrl(raw: string): URL {
     throw new ToolError(`只支持 http/https，当前是 ${url.protocol}`);
   }
   return url;
+}
+
+async function readLimited(response: Response, maxBytes: number): Promise<{ bytes: Buffer; truncated: boolean }> {
+  if (!response.body) return { bytes: Buffer.alloc(0), truncated: false };
+  const reader = response.body.getReader();
+  const chunks: Buffer[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) return { bytes: Buffer.concat(chunks, size), truncated: false };
+      const available = maxBytes - size;
+      if (value.length > available) {
+        chunks.push(Buffer.from(value.subarray(0, available)));
+        size += available;
+        await reader.cancel();
+        return { bytes: Buffer.concat(chunks, size), truncated: true };
+      }
+      chunks.push(Buffer.from(value));
+      size += value.length;
+    }
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 /** 极简 HTML → 文本：去掉脚本样式与标签，保留段落换行。只用于阅读，不追求渲染精度。 */
@@ -60,7 +83,7 @@ function htmlToText(html: string): string {
  * ollama 那条是自动推导的：它的检索端点在根路径 `/api/web_search`（不是 `/v1`），
  * 凭据与模型调用同一个 key，所以配过 ollama 模型就不必再填一遍。
  */
-function resolveSearchTarget(): { name: string; endpoint: string; apiKey: string; keyHint: string } {
+export function resolveSearchTarget(): { name: string; endpoint: string; apiKey: string; keyHint: string } {
   const explicitUrl = process.env['SEARCH_API_URL'];
   const explicitKey = process.env['SEARCH_API_KEY'] ?? process.env['TAVILY_API_KEY'] ?? '';
   const provider = (process.env['SEARCH_PROVIDER'] ?? '').trim().toLowerCase();
@@ -106,7 +129,7 @@ export const netTools: ToolDefinition[] = [
       const url = assertHttpUrl(argString(args, 'url'));
       const method = (argOptionalString(args, 'method') ?? 'GET').toUpperCase();
       const timeoutSeconds = Math.max(1, Math.min(300, argOptionalNumber(args, 'timeout_seconds') ?? 30));
-      const maxBytes = Math.max(1024, argOptionalNumber(args, 'max_bytes') ?? DEFAULT_MAX_BYTES);
+      const maxBytes = Math.max(1024, Math.trunc(argOptionalNumber(args, 'max_bytes') ?? DEFAULT_MAX_BYTES));
       const rawHeaders = args['headers'];
       const headers: Record<string, string> = { 'user-agent': 'super-agent/0.1' };
       if (rawHeaders && typeof rawHeaders === 'object' && !Array.isArray(rawHeaders)) {
@@ -122,8 +145,12 @@ export const netTools: ToolDefinition[] = [
       context.signal?.addEventListener('abort', onAbort, { once: true });
 
       let response: Response;
+      let bytes: Buffer;
+      let truncated: boolean;
       try {
+        if (context.signal?.aborted) controller.abort();
         response = await fetch(url, { method, headers, body, redirect: 'follow', signal: controller.signal });
+        ({ bytes, truncated } = await readLimited(response, maxBytes));
       } catch (error) {
         const reason = controller.signal.aborted ? `请求超时或已取消（${timeoutSeconds} 秒）` : (error as Error).message;
         throw new ToolError(`获取 ${url.href} 失败：${reason}`);
@@ -132,11 +159,8 @@ export const netTools: ToolDefinition[] = [
         context.signal?.removeEventListener('abort', onAbort);
       }
 
-      const buffer = Buffer.from(await response.arrayBuffer());
       const contentType = response.headers.get('content-type') ?? 'unknown';
       const finalUrl = response.url || url.href;
-      const truncated = buffer.length > maxBytes;
-      const bytes = truncated ? buffer.subarray(0, maxBytes) : buffer;
       const digest = createHash('sha256').update(bytes).digest('hex');
       const isText =
         contentType.startsWith('text/') ||
@@ -147,13 +171,12 @@ export const netTools: ToolDefinition[] = [
 
       const saveTo = argOptionalString(args, 'save_to');
       let savedPath: string | null = null;
-      const needSave = saveTo !== null || truncated || (!isText && response.ok);
+      const needSave = saveTo !== null || truncated || (isText && bytes.toString('utf8').length > DEFAULT_INLINE_CHARS) || (!isText && response.ok);
       if (needSave) {
         const logical = saveTo ?? `downloads/${url.pathname.split('/').filter(Boolean).at(-1) || 'index'}.bin`;
-        const root = taskDir(context);
-        const absolute = resolveInside(root, logical);
-        assertInsideRoot(root, absolute);
+        const absolute = resolveWritePath(context, logical);
         await mkdir(dirname(absolute), { recursive: true });
+        resolveWritePath(context, logical);
         await writeFile(absolute, bytes);
         savedPath = logical;
       }
@@ -162,7 +185,7 @@ export const netTools: ToolDefinition[] = [
         `状态码：${response.status}`,
         `最终 URL：${finalUrl}`,
         `内容类型：${contentType}`,
-        `字节：${bytes.length}${truncated ? `（已截断，原始至少 ${buffer.length}）` : ''}`,
+        `字节：${bytes.length}${truncated ? '（已截断）' : ''}`,
         `sha256：${digest.slice(0, 12)}…`,
         savedPath ? `已保存：${savedPath}` : null,
       ]
@@ -171,7 +194,7 @@ export const netTools: ToolDefinition[] = [
 
       if (!isText) {
         return ok(
-          `${head}\n二进制内容${savedPath ? `已保存为 ${savedPath}，可用 fs_read / artifact_import 处理` : '未保存，请指定 save_to'}。`,
+          `${head}\n二进制内容${savedPath ? `已保存为 ${savedPath}，可用 artifact_import 登记` : '未保存，请指定 save_to'}。`,
         );
       }
 
@@ -211,37 +234,44 @@ export const netTools: ToolDefinition[] = [
       }
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 30_000);
-      context.signal?.addEventListener('abort', () => controller.abort(), { once: true });
+      const onAbort = (): void => controller.abort();
+      context.signal?.addEventListener('abort', onAbort, { once: true });
       let response: Response;
       try {
+        if (context.signal?.aborted) controller.abort();
         response = await fetch(endpoint, {
           method: 'POST',
           headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
           body: JSON.stringify({ query, max_results: limit }),
           signal: controller.signal,
         });
+        if (!response.ok) {
+          const { bytes } = await readLimited(response, 1024);
+          throw new ToolError(`搜索服务返回 ${response.status}：${bytes.toString('utf8').slice(0, 300)}`);
+        }
+        const { bytes, truncated } = await readLimited(response, DEFAULT_MAX_BYTES);
+        if (truncated) throw new ToolError('搜索服务响应超过 2MB 上限');
+        const payload = JSON.parse(bytes.toString('utf8')) as { results?: { title?: string; url?: string; content?: string }[] };
+        const results = payload.results ?? [];
+        if (!Array.isArray(results)) throw new ToolError('搜索服务返回的 results 不是数组');
+        if (results.length === 0) return ok(`没有找到与「${query}」相关的结果`);
+        return ok(
+          results.slice(0, limit)
+            .map((item, index) => {
+              const title = item.title ?? '(无标题)';
+              const url = item.url ?? '(无链接)';
+              const snippet = (item.content ?? '').replace(/\s+/g, ' ').slice(0, 240);
+              return `${index + 1}. ${title}\n   ${url}\n   ${snippet}`;
+            })
+            .join('\n\n') + '\n\n（以上是搜索摘要，不是网页正文；需要确认细节请用 net_fetch 打开来源）',
+        );
       } catch (error) {
+        if (error instanceof ToolError) throw error;
         throw new ToolError(`搜索请求失败：${(error as Error).message}`);
       } finally {
         clearTimeout(timer);
+        context.signal?.removeEventListener('abort', onAbort);
       }
-      if (!response.ok) {
-        const detail = (await response.text()).slice(0, 300);
-        throw new ToolError(`搜索服务返回 ${response.status}：${detail}`);
-      }
-      const payload = (await response.json()) as { results?: { title?: string; url?: string; content?: string }[] };
-      const results = payload.results ?? [];
-      if (results.length === 0) return ok(`没有找到与「${query}」相关的结果`);
-      return ok(
-        results
-          .map((item, index) => {
-            const title = item.title ?? '(无标题)';
-            const url = item.url ?? '(无链接)';
-            const snippet = (item.content ?? '').replace(/\s+/g, ' ').slice(0, 240);
-            return `${index + 1}. ${title}\n   ${url}\n   ${snippet}`;
-          })
-          .join('\n\n') + '\n\n（以上是搜索摘要，不是网页正文；需要确认细节请用 net_fetch 打开来源）',
-      );
     },
   },
 ];

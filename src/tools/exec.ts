@@ -3,7 +3,6 @@ import { beijingTime } from '../domain/ids.ts';
 import { resolve } from 'node:path';
 import { assertInsideRoot, resolveInside, ToolError } from './paths.ts';
 import {
-  argNumber,
   argOptionalNumber,
   argOptionalString,
   argString,
@@ -81,10 +80,10 @@ export const execTools: ToolDefinition[] = [
       });
 
       if (job.status !== 'running') {
-        return ok(
+        return { type: 'failed', content:
           `作业 ${job.id} 未能启动：${job.status}${job.error ? `｜${job.error}` : ''}\n` +
             '常见原因：程序不存在或没有执行权限。请改用 `command` 指定可用解释器（python3 / node），或先确认依赖。',
-        );
+        };
       }
 
       if (!wait) {
@@ -101,18 +100,21 @@ export const execTools: ToolDefinition[] = [
         current = context.host.getJob(job.id);
       }
       // 取输出的**尾部**：报错和最终结论在结尾，只给开头等于让人猜。
-      const stdout = context.host.readJob(job.id, 'stdout', 0, Math.max(WAIT_READ_BYTES, DEFAULT_READ));
-      const stderr = context.host.readJob(job.id, 'stderr', 0, Math.max(WAIT_READ_BYTES, DEFAULT_READ));
+      const readTail = (stream: 'stdout' | 'stderr') => {
+        const first = context.host.readJob(job.id, stream, 0, WAIT_READ_BYTES);
+        if (!first?.hasMore) return first;
+        return context.host.readJob(job.id, stream, Math.max(0, first.total - WAIT_READ_BYTES), WAIT_READ_BYTES);
+      };
+      const stdout = readTail('stdout');
+      const stderr = readTail('stderr');
       const stillRunning = current?.status === 'running';
       const render = (label: string, stream: { text: string; hasMore: boolean; total: number } | null): string => {
         if (!stream?.text) return `--- ${label} ---\n(空)`;
         const clipped = truncateTail(stream.text, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
-        const hint = clipped.truncated
+        const hint = clipped.truncated || stream.total > stream.text.length
           ? `\n…（${label} 共 ${stream.total} 字符，这里只给末尾 ${formatSize(clipped.outputBytes)}；` +
             `要看开头用 proc_read offset=0）`
-          : stream.hasMore
-            ? `\n…（${label} 共 ${stream.total} 字符，继续用 proc_read offset=（从头部读））`
-            : '';
+          : '';
         return `--- ${label} ---\n${clipped.content}${hint}`;
       };
       const lines = [
@@ -123,21 +125,25 @@ export const execTools: ToolDefinition[] = [
       if (stillRunning) {
         lines.push(`命令仍在运行，已等待 ${waitSeconds} 秒。用 proc_wait 继续等，或 proc_read 看进度。`);
       }
-      return ok(lines.filter(Boolean).join('\n'));
+      const content = lines.filter(Boolean).join('\n');
+      return current && ['failed', 'timeout', 'killed'].includes(current.status)
+        ? { type: 'failed', content }
+        : ok(content);
     },
   },
   {
     name: 'proc_read',
     description:
-      '分段读取作业的标准输出或错误输出（按字符偏移）。返回是否还有剩余内容以及下一次的 offset。' +
+      '分段读取作业的标准输出或错误输出（偏移按 JavaScript UTF-16 字符串长度计算，emoji 占 2）。' +
+      '返回下一次 offset；分页不会拆开 emoji，若 offset 落在 emoji 中间则从其后继续。' +
       '进程仍在运行时也可以读，已产生的输出不会丢失。',
     parameters: {
       type: 'object',
       properties: {
         job_id: { type: 'string', description: 'proc_run 返回的作业 ID' },
         stream: { type: 'string', enum: ['stdout', 'stderr'], description: '默认 stdout' },
-        offset: { type: 'number', description: '字符偏移，默认 0' },
-        limit: { type: 'number', description: '本次读取字符数，默认 8000，上限 20000' },
+        offset: { type: 'integer', description: 'UTF-16 字符串偏移，默认 0；续读使用上次返回的 offset' },
+        limit: { type: 'integer', description: 'UTF-16 字符串长度，默认 8000，上限 20000；为避免拆开 emoji 可能多返回 1' },
       },
       required: ['job_id'],
     },
@@ -146,6 +152,7 @@ export const execTools: ToolDefinition[] = [
       const stream = (argOptionalString(args, 'stream') ?? 'stdout') as 'stdout' | 'stderr';
       const offset = Math.max(0, argOptionalNumber(args, 'offset') ?? 0);
       const limit = Math.max(1, Math.min(MAX_READ, argOptionalNumber(args, 'limit') ?? DEFAULT_READ));
+      if (!Number.isInteger(offset) || !Number.isInteger(limit)) throw new ToolError('参数 offset 和 limit 必须是整数');
       const job = context.host.getJob(jobId);
       if (!job) throw new ToolError(`作业不存在：${jobId}`);
       if (job.taskId !== context.task.id) throw new ToolError(`作业 ${jobId} 不属于本任务`);
@@ -209,6 +216,9 @@ export const execTools: ToolDefinition[] = [
       if (!job) throw new ToolError(`作业不存在：${jobId}`);
       if (job.taskId !== context.task.id) throw new ToolError(`作业 ${jobId} 不属于本任务`);
       const stopped = context.host.stopJob(jobId, argOptionalString(args, 'reason') ?? 'Worker 主动停止');
+      if (stopped?.status === 'running' || stopped?.status === 'unknown') {
+        return { type: 'failed', content: `作业 ${jobId} 状态 ${stopped.status}，当前服务无法确认或停止该进程${stopped.error ? `｜${stopped.error}` : ''}` };
+      }
       return ok(`作业 ${jobId} 当前状态：${stopped?.status ?? 'unknown'}${stopped?.error ? `｜${stopped.error}` : ''}`);
     },
   },

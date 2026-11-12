@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { assertInsideRoot, resolveInside } from '../tools/paths.ts';
 import { fileTools } from '../tools/files.ts';
 import { runWorkerTurn } from '../runtime/pi-worker.ts';
-import type { ToolContext, ToolDefinition } from '../tools/types.ts';
+import type { ToolContext, ToolDefinition, ToolOutcome } from '../tools/types.ts';
 import { planWindow } from '../runtime/window.ts';
 import { observationPrompt, WATCHDOG_SYSTEM } from './prompts.ts';
 
@@ -203,9 +203,9 @@ export interface WatchdogDeps {
    * 与业务作业分开恢复，不会把主系统 running 作业标成 unknown。
    */
   processes?: {
-    start: (input: { command: string; args: string[]; cwd: string; timeoutMs: number }) => { id: string; status: string };
+    start: (input: { command: string; args: string[]; cwd: string; timeoutMs: number }) => { id: string; status: string; error?: string | null };
     read: (id: string) => { text: string; hasMore: boolean; running: boolean } | null;
-    get: (id: string) => { status: string; exitCode: number | null } | null;
+    get: (id: string) => { status: string; exitCode: number | null; error?: string | null } | null;
     stop: (id: string) => void;
   };
 }
@@ -428,16 +428,16 @@ export class WatchdogSession {
     return { system, history: this.dialogueHistory().history };
   }
 
-  private async executeTool(name: string, args: Record<string, unknown>): Promise<string> {
-    void 0;
+  private async executeTool(name: string, args: Record<string, unknown>): Promise<string | ToolOutcome> {
     const store = this.deps.store;
+    const failed = (content: string): ToolOutcome => ({ type: 'failed', content });
     const str = (key: string): string => (typeof args[key] === 'string' ? (args[key] as string) : '');
     const num = (key: string, fallback: number): number =>
       typeof args[key] === 'number' ? (args[key] as number) : fallback;
 
     if (name === 'notify_router') {
       const body = str('text').trim();
-      if (body === '') return '通报内容不能为空';
+      if (body === '') return failed('通报内容不能为空');
       const id = `ic_${randomBytes(4).toString('hex')}`;
       store.insertIntercom({
         id,
@@ -449,7 +449,7 @@ export class WatchdogSession {
     }
     if (name === 'ask_router') {
       const question = str('question').trim();
-      if (question === '') return '问题不能为空';
+      if (question === '') return failed('问题不能为空');
       const id = `ic_${randomBytes(4).toString('hex')}`;
       store.insertIntercom({ id, fromLayer: 'watchdog', kind: 'question', body: question.slice(0, 2000), topicId: id });
       return `问题已保存（${id}），无会话归属，等待管理入口查看并回复。`;
@@ -457,18 +457,17 @@ export class WatchdogSession {
     if (name === 'reply_intercom') {
       const target = str('message_id').trim();
       const body = str('body').trim();
-      if (target === '') return '需要 message_id';
-      if (body === '') return '回复内容不能为空';
+      if (target === '') return failed('需要 message_id');
+      if (body === '') return failed('回复内容不能为空');
       const original = store.getIntercom(target);
-      if (!original) return `找不到消息 ${target}`;
-      if (original.toLayer !== 'watchdog') return `${target} 不是发给维护者的消息`;
+      if (!original) return failed(`找不到消息 ${target}`);
+      if (original.toLayer !== 'watchdog') return failed(`${target} 不是发给维护者的消息`);
       return store.replyIntercom(original, `ic_${randomBytes(4).toString('hex')}`, body.slice(0, 2000))
-        ? `已回复 ${target}。` : `${target} 已回复或不需要回复`;
+        ? `已回复 ${target}。` : failed(`${target} 已回复或不需要回复`);
     }
     if (name === 'check_main') {
       const health = this.deps.health?.();
-    const toolLog = store.listWdToolLog(12);
-      if (!health) return '当前环境没有配置主系统健康探测';
+      if (!health) return failed('当前环境没有配置主系统健康探测');
       return `${health.state}｜${health.detail}${health.pid ? `｜pid=${health.pid}` : ''}` +
         `${health.heartbeatAgeMs === null ? '' : `｜心跳 ${Math.round(health.heartbeatAgeMs / 1000)} 秒前`}`;
     }
@@ -482,14 +481,13 @@ export class WatchdogSession {
     }
     if (name.startsWith('fs_')) {
       const tool = fileTools.find((item) => item.name === name && item.name !== 'fs_write');
-      if (!tool) return `未知工具：${name}`;
-      const outcome = await tool.run(args, this.readContext());
-      return outcome.type === 'ok' ? outcome.content : (outcome as { content?: string }).content ?? '';
+      if (!tool) return failed(`未知工具：${name}`);
+      return await tool.run(args, this.readContext());
     }
     if (name === 'run_command') {
-      if (!this.deps.processes) return '当前环境没有配置维护者作业服务';
+      if (!this.deps.processes) return failed('当前环境没有配置维护者作业服务');
       const command = str('command');
-      if (command.trim() === '') return '缺少 command';
+      if (command.trim() === '') return failed('缺少 command');
       const rawArgs = args['args'];
       const list = Array.isArray(rawArgs) ? rawArgs.filter((item): item is string => typeof item === 'string') : [];
       const cwdRel = str('cwd');
@@ -499,21 +497,22 @@ export class WatchdogSession {
           cwd = resolveInside(this.deps.config.workDir, cwdRel);
           assertInsideRoot(this.deps.config.workDir, cwd);
         } catch (error) {
-          return `拒绝执行：${(error as Error).message}`;
+          return failed(`拒绝执行：${(error as Error).message}`);
         }
       }
       const seconds = Math.min(Math.max(num('timeout_seconds', 30), 1), 60);
       const job = this.deps.processes.start({ command, args: list, cwd, timeoutMs: seconds * 1000 });
       const output = this.deps.processes.read(job.id);
-      return `作业 ${job.id}｜${job.status}\n${output?.text ?? '（暂无输出）'}`;
+      const text = `作业 ${job.id}｜${job.status}${job.error ? `｜${job.error}` : ''}\n${output?.text ?? '（暂无输出）'}`;
+      return job.status === 'failed' || job.status === 'timeout' || job.status === 'killed' ? failed(text) : text;
     }
     if (name === 'job_output') {
-      if (!this.deps.processes) return '当前环境没有配置维护者作业服务';
+      if (!this.deps.processes) return failed('当前环境没有配置维护者作业服务');
       const id = str('job_id');
       const job = this.deps.processes.get(id);
-      if (!job) return `找不到作业 ${id}`;
+      if (!job) return failed(`找不到作业 ${id}`);
       const output = this.deps.processes.read(id);
-      return `${id}｜${job.status}｜退出码 ${job.exitCode ?? '-'}\n${output?.text ?? '（暂无输出）'}`;
+      return `${id}｜${job.status}｜退出码 ${job.exitCode ?? '-'}${job.error ? `｜${job.error}` : ''}\n${output?.text ?? '（暂无输出）'}`;
     }
     if (name === 'inspect_task') {
       return this.describeTask(str('task_id'), num('limit', 15));
@@ -535,7 +534,7 @@ export class WatchdogSession {
     if (name === 'maintain') {
       const action = str('action');
       if (action === 'restart_main') {
-        if (!this.deps.restartMain) return '当前环境没有配置主系统重启能力';
+        if (!this.deps.restartMain) return failed('当前环境没有配置主系统重启能力');
         const result = await this.deps.restartMain();
         store.appendWdAction({
           id: `wda_${randomBytes(4).toString('hex')}`,
@@ -545,7 +544,7 @@ export class WatchdogSession {
           expected: '主系统恢复调度',
           result: result.message,
         });
-        return result.message;
+        return result.ok ? result.message : failed(result.message);
       }
       const payload: Record<string, unknown> = {
         taskId: str('task_id'),
@@ -601,7 +600,7 @@ export class WatchdogSession {
       });
       return `事件 ${issueId} 已记录，${minutes} 分钟后复查`;
     }
-    return `未知工具：${name}`;
+    return failed(`未知工具：${name}`);
   }
 
   /** 维护者提问：用同一套会话与工具，主系统不可用时也能回答。 */
@@ -650,12 +649,14 @@ export class WatchdogSession {
         const key = `${call.name}|${call.arguments}`;
         const seen = (repeats.get(key) ?? 0) + 1;
         repeats.set(key, seen);
-        let output: string;
+        let outcome: ToolOutcome;
         try {
-          output = await this.executeTool(call.name, JSON.parse(call.arguments || '{}') as Record<string, unknown>);
+          const result = await this.executeTool(call.name, JSON.parse(call.arguments || '{}') as Record<string, unknown>);
+          outcome = typeof result === 'string' ? { type: 'ok', content: result } : result;
         } catch (error) {
-          output = `执行失败：${(error as Error).message}`;
+          outcome = { type: 'failed', content: `执行失败：${(error as Error).message}` };
         }
+        let output = outcome.content;
         // 只报告"相同参数第 N 次调用"。是否与上次结果一致需要真的比较返回值，
         // 不能凭调用名相同就断言——健康状态、作业输出本来就是会变的。
         if (seen > 1) {
@@ -666,7 +667,7 @@ export class WatchdogSession {
           role: 'tool',
           content: `${call.name}: ${output.slice(0, 300)}`,
         });
-        return { outcome: { type: 'ok' as const, content: output }, terminate: false };
+        return { outcome: { ...outcome, content: output }, terminate: false };
       },
     });
 
@@ -744,14 +745,17 @@ export class WatchdogSession {
       maxSteps: MAX_WATCHDOG_STEPS,
       signal: null,
       runTool: async (call) => {
-        let output: string;
         try {
-          output = await this.executeTool(call.name, JSON.parse(call.arguments || '{}') as Record<string, unknown>);
-          if (call.name === 'maintain' || call.name === 'record') acted = true;
+          const result = await this.executeTool(call.name, JSON.parse(call.arguments || '{}') as Record<string, unknown>);
+          const outcome: ToolOutcome = typeof result === 'string' ? { type: 'ok', content: result } : result;
+          // 重启可能在停止旧进程或创建新进程后失败；失败不代表没有产生动作。
+          if ((call.name === 'maintain' || call.name === 'record') && outcome.type === 'ok') acted = true;
+          if (call.name === 'maintain' && this.deps.restartMain &&
+              (JSON.parse(call.arguments || '{}') as Record<string, unknown>)['action'] === 'restart_main') acted = true;
+          return { outcome, terminate: false };
         } catch (error) {
-          output = `执行失败：${(error as Error).message}`;
+          return { outcome: { type: 'failed' as const, content: `执行失败：${(error as Error).message}` }, terminate: false };
         }
-        return { outcome: { type: 'ok' as const, content: output }, terminate: false };
       },
     });
 

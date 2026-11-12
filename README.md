@@ -174,7 +174,7 @@ Message: queued → delivered → consumed
 - **推进**：只有新记录成功保存，`covered_seq` 才前移到本次片段末尾。失败记录 `failed=1`，不参与注入、不推进覆盖。
 - **失效**：记录带生成时的要求版本 `epoch`。用户补充要求后版本变化，注入时标注「上一份记录基于要求版本 N」，
   下一次整理按新要求重建，而不是无条件重扫全部历史。
-- **长度**：记录有上限，放不下的细节只保留引用；原文永远可以用 `history_read` / `message_read` / `artifact_read` 查回。
+- **长度**：记录有上限，放不下的细节只保留引用；历史与消息原文可用 `history_read` / `message_read` 查回，文本产物可用 `artifact_read` 查回。
 - **失败处理**：失败写一条诊断记录，任务照常推进；连续失败达到 `NOTE_MAX_FAILURES` 或未到
   `NOTE_RETRY_MS` 间隔时不再重试，避免失败反而变成空转。
 - **不删除原文**：`worker_turn`、消息、产物版本一条都不删。
@@ -186,7 +186,7 @@ Message: queued → delivered → consumed
 | `history_search` | 在自己的历史里按关键字检索，返回 `turn#N` 与摘要 |
 | `history_read` | 按序号或区间读原文，支持 `offset` 续读 |
 | `message_read` | 按 `msg_xxx` 读消息全文，支持续读 |
-| `artifact_read` | 按名字 + 版本读产物 |
+| `artifact_read` | 按名字 + 版本读文本产物 |
 | `note_read` | 读自己的工作记录（含失败记录） |
 
 范围限定：只能读自己的 `worker_turn`、自己收发的消息、本任务产物。跨 Worker 的过程信息只能通过消息或产物交换。
@@ -264,20 +264,19 @@ MODEL_RETRY=2              仅对超时/5xx 重试
 ## 6.5 产物与路径
 
 - 产物版本各自落盘：`<taskId>/artifacts/v<n>/<name>`，保存 v2 不会覆盖 v1。
-- 读取用 `artifact_read`（按名字 + 版本），并校验登记时的 `sha256`，文件被绕过改写会直接报错。
-- `fs_write` 不能写 `artifacts/` 目录；`materials/` 只读。
+- `artifact_read` 按名字与版本读取 UTF-8 文本，先按原始字节校验 `sha256`；二进制产物可导出，图片也可用 `fs_view_image` 查看。快照缺失或被改写时，不能复用旧登记。
+- 文件工具及网络、PDF 的直接保存入口不能写 `artifacts/` 和 `inputs/`；`materials/` 只读。别名和硬链接也会检查；这些限制不是命令执行沙箱。
 - 路径统一规整：拒绝空路径、绝对路径、`..` 段，写入前再做一次 realpath 校验防符号链接逃逸。
 - 文件写成功但登记失败时删除文件，不留下"看起来成功"的状态。
 - 后续任务需要引用同一会话和话题的既有产物时，Router 可用 `read_task` 查产物 ID 和版本，再在 `create_task` 的 `input_artifact_ids` 中指定。程序核对来源、文件大小和 SHA-256，将指定版本复制为新任务 `inputs/` 中的快照；它是待核对的输入，不继承原来的检查结果。文件工具不允许修改 `inputs/`；`proc_run` 仍使用当前用户权限，不构成系统沙箱。
 
 ## 7. 工具
 
-Worker：`fs_list` `fs_read`（支持 `offset`/`limit` 分段续读）`fs_search` `fs_write`（限定任务目录，禁写产物目录）、
-`artifact_save` `artifact_read` `artifact_list`、`create_worker`、`message_send`、`wait_for`、
-`submit_result`（仅负责人）、`report_to_router`。
+Worker 工具完整清单见下文；其中 `submit_result` 仅负责人可用。
 
 Router：`create_task` `send_to_worker` `stop_task` `list_tasks` `read_task` `send_file`
-`attach_materials` `conversation_list` `conversation_new` `conversation_switch`。
+`attach_materials` `conversation_list` `conversation_new` `conversation_switch`，以及与维护者通信的
+`notify_maintainer` `ask_maintainer` `reply_intercom` `read_maintainer_status`。
 
 **没有开放 shell**：`proc_run` 只接受「程序名 + 参数数组」，不经过 shell，不做管道/通配/变量展开，
 因此取消与幂等语义可控。但它确实能执行真实命令（python3 / node / git …），
@@ -327,6 +326,8 @@ Router：`create_task` `send_to_worker` `stop_task` `list_tasks` `read_task` `se
 - 等待超时：`proc_wait` 的 `timeout_seconds` 只结束本次等待，作业继续跑。
 - 环境变量：子进程只继承 `PATH`/`HOME`/`LANG`/`TMPDIR` 等基础变量，**不传模型密钥与搜索凭据**。
 - 日志：落在 `work/.jobs/<taskId>/<jobId>.out|.err`，进程结束后仍可分段读取。
+- `proc_read` 的偏移和总长度按 JavaScript UTF-16 字符单位计算，表情通常占两个单位；分页不会返回拆开的表情。
+- `proc_run` 等到非零退出或超时等明确失败时返回失败；后台作业仍在运行时先返回作业 ID，可再查询结果。
 - 重启：上次运行遗留的 `running` 作业一律标为 `unknown`（结果未知），不重放、不按 PID 误杀。
 
 ### 联网与资料
@@ -352,9 +353,30 @@ Router：`create_task` `send_to_worker` `stop_task` `list_tasks` `read_task` `se
 |---|---|
 | `artifact_save` | 文本内容存为产物（原有用法定持） |
 | `artifact_import` | 把任务目录里的真实文件按字节登记为产物 |
-| `artifact_read` / `artifact_list` | 读版本、列清单 |
+| `artifact_read` / `artifact_list` | 读文本版本、列清单 |
 
 `artifact_import` 登记的是**快照**：源文件之后再改，也不会改变已登记的版本；检查与交付绑定的始终是这个快照的指纹。
+
+### 2026-11 工具与通信检查记录
+
+本次检查了 Worker 注册表中的 33 个工具、Router 的 14 个工具及 Watchdog 的 11 个专用工具和 4 个只读文件工具。下表记录本轮实际采用的证据；覆盖某组不表示每种参数和外部环境都已实测。
+
+| 范围 | 工具 | 本轮证据 |
+|---|---|---|
+| 文件 | `fs_list` `fs_read` `fs_view_image` `fs_write` `fs_search` `fs_glob` `fs_stat` `fs_edit` | 临时目录、分页、搜索、图片数据、编辑冲突和快照保护；`fs_list` 主要检查实现及既有测试 |
+| 产物 | `artifact_save` `artifact_import` `artifact_read` `artifact_list` | 版本复用、指纹、损坏快照和真实二进制导入；文本读取及分页使用已有回归测试 |
+| 资料与网络 | `doc_pdf` `doc_notebook` `net_fetch` `net_search` `env_capabilities` | 本地 PDF 转换、本机 HTTP、模拟搜索接口、缺失凭据和能力探测 |
+| 作业 | `proc_run` `proc_read` `proc_wait` `proc_stop` `proc_list` | 本地子进程、退出状态、超时、等待唤醒、停止及大日志分页 |
+| 协作 | `create_worker` `message_send` `wait_for` `submit_result` `report_to_router` `wake_worker` `request_maintenance` | 检查工具实现和现有协作、消息、交付、等待及维护回归；并非逐参数端到端实测 |
+| 历史 | `history_search` `history_read` `message_read` `note_read` | 历史隔离、旧记录、工具参数和引用、分页及工作记录回归 |
+| Router | 上节列出的 14 个工具 | 检查分派、任务状态、文件交接、话题及维护通信实现，复用会话和通道回归；并非每个工具均做新场景 |
+| Watchdog | `inspect_task` `read_history` `maintain` `check_main` `command_status` `run_command` `job_output` `notify_router` `ask_router` `reply_intercom` `record`，另有 `fs_list` `fs_read` `fs_view_image` `fs_search` | 维护动作、失败回执、通道归属、独立进程与临时环境重启检查；部分工具仅检查实现和既有回归 |
+
+同时核对了 Router、Worker、Watchdog 的角色和动态状态提示，以及三者的对话或工作记录整理提示。此次调整 Watchdog 的重启说明：说明提交标记可能失败且不包含未提交文件，失败后先核对状态和日志，去掉破坏性回滚指令与固定核对顺序；Worker 提示同步注明产物读取限文本。其余提示仍保留请求与引用、结果状态、未完成事项和不确定性，未作整体重写。
+
+现有工具足以处理已发现的问题，本次没有新增工具或编排层；修正集中在现有工具的结果、图片传递、历史检索和通信契约。
+
+这些检查使用临时数据库、模拟模型、本机 HTTP 和测试子进程；没有调用真实外网搜索、付费模型或真实业务守护进程，也没有验证视觉识别或扫描 PDF 的 OCR。PDF 页码及特殊错误未逐项实测，提示词对真实模型效果的提升尚未做对照评估。
 
 ### 工具链的真实端到端验收
 

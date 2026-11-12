@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ToolDefinition, ToolOutcome } from './types.ts';
+import { resolveSearchTarget } from './net.ts';
 
 function ok(content: string): ToolOutcome {
   return { type: 'ok', content };
@@ -39,7 +40,8 @@ export const capabilityTools: ToolDefinition[] = [
       lines.push('# 工作范围');
       lines.push(`任务目录：${join(context.workDir, context.task.id)}`);
       lines.push(`只读材料目录：${context.materialsDir}`);
-      lines.push('文件工具只能在这些目录内读写；命令执行不受此限制（见下方隔离说明）。');
+      lines.push(`额外只读根：${context.readRoot}`);
+      lines.push('文件写入限于任务目录；命令执行不受此限制（见下方隔离说明）。');
 
       lines.push('\n# 解释器与系统工具');
       for (const binary of ['python3', 'python', 'node', 'git', 'rg', 'jq', 'pdftotext', 'pdfinfo', 'make', 'curl']) {
@@ -48,26 +50,22 @@ export const capabilityTools: ToolDefinition[] = [
       }
 
       lines.push('\n# 联网');
-      const searchKey =
-        process.env['SEARCH_API_KEY'] ?? process.env['TAVILY_API_KEY'] ?? process.env['OLLAMA_API_KEY'] ?? '';
+      const target = resolveSearchTarget();
       lines.push(`- net_fetch：可用（HTTP/HTTPS，未知地址请勿猜测）`);
       lines.push(
         `- net_search：${
-          searchKey.trim() === ''
-            ? '不可用（未配置 SEARCH_API_KEY / TAVILY_API_KEY / OLLAMA_API_KEY）'
-            : `已配置（${process.env['SEARCH_PROVIDER'] === 'ollama' ? 'ollama 检索' : 'tavily'}）`
+          target.apiKey.trim() === ''
+            ? `不可用（未配置 ${target.keyHint}）`
+            : `已配置（${target.name}，未测试连接）`
         }`,
       );
 
       lines.push('\n# 资料读取');
       lines.push(`- PDF 文本：${probe('pdftotext').ok ? '可用（不支持扫描件 OCR）' : '不可用（缺少 pdftotext）'}`);
       lines.push('- Notebook：可用（读取单元格与文本输出）');
-      // 默认按可用处理：入站图片会随当轮请求以多模态发出，模型支持就能看见。
-      // 显式 MODEL_VISION=0 才标不可用（换到纯文本模型时用）。
       const vision = process.env['MODEL_VISION'] !== '0';
       lines.push(
-        `- 图片视觉输入：${vision ? '可用（入站图片随当轮请求发出）' : '按配置标记为不可用'}；` +
-          '你自己读不到图片文件的内容，但用户在消息里发的图你能看到',
+        `- 图片视觉输入：${vision ? 'fs_view_image 可加载图片；实际识别取决于模型是否支持视觉' : '按配置标记为不可用'}。`,
       );
 
       lines.push('\n# 执行与隔离边界');

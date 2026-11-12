@@ -167,6 +167,66 @@ test('Watchdog：独立会话观察主系统、记录事件并安排复查', asy
   }
 });
 
+test('Watchdog：文件工具失败和重启失败都作为失败回执交给模型', async () => {
+  const harness = await createHarness({ worker: () => mockReply({ text: 'ok' }) });
+  try {
+    const results: { content: string | null; isError?: boolean }[] = [];
+    let step = 0;
+    const model = new MockModel(({ request }) => {
+      results.push(...request.messages.filter((message) => message.role === 'tool'));
+      step += 1;
+      if (step === 1) return mockReply({ toolCalls: [{ name: 'fs_read', arguments: { path: '不存在的文件' } }] });
+      if (step === 2) return mockReply({ toolCalls: [{ name: 'maintain', arguments: { action: 'restart_main', reason: '测试' } }] });
+      return mockReply({ text: '操作失败' });
+    });
+    const session = new WatchdogSession({
+      store: harness.store, config: harness.config, model, modelName: 'mock',
+      restartMain: async () => ({ ok: false, message: '重启失败' }),
+    });
+    const result = await session.runOnce(1);
+    assert.equal(result.acted, true, '重启失败仍可能已经停止旧进程或启动新进程，应记录为尝试过维护');
+    assert.ok(results.some((message) => message.isError && /不存在|失败|ENOENT/.test(message.content ?? '')));
+    assert.ok(results.some((message) => message.isError && /重启失败/.test(message.content ?? '')));
+  } finally { await harness.cleanup(); }
+});
+
+test('Watchdog：启动命令失败与读取失败作业的结果分别标记', async () => {
+  const harness = await createHarness({ worker: () => mockReply({ text: 'ok' }) });
+  try {
+    let step = 0;
+    const model = new MockModel(() => {
+      step += 1;
+      if (step === 1) return mockReply({ toolCalls: [{ name: 'run_command', arguments: { command: 'bad' } }] });
+      if (step === 2) return mockReply({ toolCalls: [{ name: 'job_output', arguments: { job_id: 'job_bad' } }] });
+      return mockReply({ text: '已核对' });
+    });
+    const session = new WatchdogSession({ store: harness.store, config: harness.config, model, modelName: 'mock', processes: {
+      start: () => ({ id: 'job_bad', status: 'failed', error: '启动失败' }),
+      get: () => ({ status: 'failed', exitCode: null, error: '启动失败' }),
+      read: () => null, stop: () => {},
+    } });
+    await session.ask('查看命令');
+    const results = model.calls.at(-1)!.messages.filter((message) => message.role === 'tool');
+    assert.equal(results[0]?.isError, true);
+    assert.notEqual(results[1]?.isError, true);
+    assert.match(results[1]?.content ?? '', /failed.*启动失败/);
+  } finally { await harness.cleanup(); }
+});
+
+test('Watchdog：没有重启能力时拒绝申请，不记作维护动作', async () => {
+  const harness = await createHarness({ worker: () => mockReply({ text: 'ok' }) });
+  try {
+    let step = 0;
+    const model = new MockModel(() => ++step === 1
+      ? mockReply({ toolCalls: [{ name: 'maintain', arguments: { action: 'restart_main', reason: '测试' } }] })
+      : mockReply({ text: '无法重启' }));
+    const session = new WatchdogSession({ store: harness.store, config: harness.config, model, modelName: 'mock' });
+    const result = await session.runOnce(1);
+    assert.equal(result.acted, false);
+    assert.ok(model.calls.at(-1)!.messages.some((message) => message.role === 'tool' && message.isError && /没有配置主系统重启能力/.test(message.content ?? '')));
+  } finally { await harness.cleanup(); }
+});
+
 test('隔离：启动 Watchdog 不恢复、不调度、不改主系统运行中的作业', async () => {
   const harness = await createHarness({
     limits: { maxConcurrentRuns: 0 },

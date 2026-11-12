@@ -396,7 +396,7 @@ async function tick(): Promise<void> {
     }
     lastModelReview = Date.now();
     const result = await session.runOnce(Math.round(intervalMs / 60_000));
-    log(`巡检完成（${gate.reason}）：${result.steps} 次模型调用${result.acted ? '，执行了维护动作' : ''}｜${result.summary.split('\n')[0]?.slice(0, 160) ?? ''}`);
+    log(`巡检完成（${gate.reason}）：${result.steps} 次模型调用${result.acted ? '，尝试了维护动作' : ''}｜${result.summary.split('\n')[0]?.slice(0, 160) ?? ''}`);
   } catch (error) {
     log(`巡检失败：${(error as Error).message}（保留观察记录，继续按间隔重试）`);
     store.appendWdAction({

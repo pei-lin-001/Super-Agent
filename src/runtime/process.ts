@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { createWriteStream, existsSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { closeSync, createWriteStream, existsSync, mkdirSync, openSync, readSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 import { newJobId, nowIso } from '../domain/ids.ts';
 import type { ProcessJob } from '../domain/types.ts';
 import type { Store } from '../storage/store.ts';
@@ -10,8 +11,6 @@ const SAFE_ENV_KEYS = [
   'PATH', 'HOME', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TMPDIR', 'TZ', 'SHELL', 'USER', 'LOGNAME',
   'PWD', 'NODE_PATH', 'PYTHONPATH', 'PYTHONHOME', 'VIRTUAL_ENV', 'TERM', 'TERMINFO',
 ];
-
-const MAX_LOG_BYTES = 20_000_000;
 
 export interface StartJobInput {
   taskId: string;
@@ -57,6 +56,7 @@ export class ProcessService {
   private readonly options: ProcessServiceOptions;
   private readonly alive = new Map<string, ChildProcess>();
   private readonly timers = new Map<string, NodeJS.Timeout>();
+  private readonly abortCleanups = new Map<string, () => void>();
   private disposed = false;
 
   constructor(options: ProcessServiceOptions) {
@@ -135,69 +135,80 @@ export class ProcessService {
     this.store.updateJob(job);
     this.alive.set(id, child);
 
-    if (input.stdin !== undefined && input.stdin !== null) {
-      try {
-        child.stdin?.end(input.stdin);
-      } catch {
-        // stdin 关闭失败不影响进程本身。
-      }
-    } else {
-      child.stdin?.end();
-    }
-
-    const finish = (status: ProcessJob['status'], extra: { exitCode?: number | null; error?: string | null }): void => {
+    const cleanup = (): void => {
+      this.alive.delete(id);
+      const timer = this.timers.get(id);
+      if (timer) clearTimeout(timer);
+      this.timers.delete(id);
+      this.abortCleanups.get(id)?.();
+      this.abortCleanups.delete(id);
+    };
+    const finish = (status: ProcessJob['status'], extra: { exitCode?: number | null; signal?: string | null; error?: string | null }): void => {
       if (this.disposed) return;
       const current = this.store.getJob(id);
-      if (!current || current.status !== 'running') return;
+      if (!current || current.status !== 'running') { cleanup(); return; }
       current.status = status;
       current.exitCode = extra.exitCode ?? current.exitCode;
+      current.signal = extra.signal ?? current.signal;
       current.endedAt = nowIso();
       if (extra.error !== undefined) current.error = extra.error;
       this.store.updateJob(current);
-      this.alive.delete(id);
-      const timer = this.timers.get(id);
-      if (timer) {
-        clearTimeout(timer);
-        this.timers.delete(id);
-      }
+      cleanup();
       const settled = this.store.getJob(id) ?? current;
       this.options.onFinished?.(settled);
     };
 
-    const timer = setTimeout(() => {
-      const current = this.store.getJob(id);
-      if (!current || current.status !== 'running') return;
-      this.killTree(id);
-      finish('timeout', { error: `超过执行时限 ${Math.round(input.timeoutMs / 1000)} 秒，已终止` });
-    }, Math.max(1000, input.timeoutMs));
-    this.timers.set(id, timer);
+    const deadline = Date.now() + Math.max(1000, input.timeoutMs);
+    const scheduleTimeout = (): void => {
+      const timer = setTimeout(() => {
+        if (Date.now() < deadline) { scheduleTimeout(); return; }
+        if (this.store.getJob(id)?.status !== 'running') { cleanup(); return; }
+        this.killTree(id);
+        finish('timeout', { error: `超过执行时限 ${Math.round(input.timeoutMs / 1000)} 秒，已终止` });
+      }, Math.min(2_147_483_647, Math.max(1, deadline - Date.now())));
+      this.timers.set(id, timer);
+    };
+    scheduleTimeout();
 
     const onAbort = (): void => {
+      if (!this.alive.has(id)) return;
       this.killTree(id);
       finish('killed', { error: '任务或 Worker 被取消，进程已终止' });
     };
     if (input.signal) {
       if (input.signal.aborted) onAbort();
-      else input.signal.addEventListener('abort', onAbort, { once: true });
+      else {
+        input.signal.addEventListener('abort', onAbort, { once: true });
+        this.abortCleanups.set(id, () => input.signal?.removeEventListener('abort', onAbort));
+      }
     }
 
     child.on('error', (error: Error) => {
-      if (this.disposed) return;
       finish('failed', { error: `进程错误：${error.message}` });
     });
-    child.on('close', (code: number | null, signalName: NodeJS.Signals | null) => {
-      outStream.end();
-      errStream.end();
-      if (this.disposed) return;
-      const current = this.store.getJob(id);
-      if (!current || current.status !== 'running') return;
-      const signalText = signalName ?? null;
-      if (signalText) {
-        const next = this.store.getJob(id);
-        if (next) next.signal = signalText;
+    // 子进程可能先关闭 stdin，异步 EPIPE 不能让宿主进程崩溃。
+    child.stdin?.on('error', (error: NodeJS.ErrnoException) => {
+      if (error.code !== 'EPIPE' && error.code !== 'ERR_STREAM_DESTROYED') {
+        this.killTree(id);
+        finish('failed', { error: `写入标准输入失败：${error.message}` });
       }
-      const status: ProcessJob['status'] = code === 0 ? 'exited' : 'failed';
-      finish(status, { exitCode: code });
+    });
+    child.stdin?.end(input.stdin ?? undefined);
+    const onLogError = (error: Error): void => {
+      this.killTree(id);
+      finish('failed', { error: `写入作业日志失败：${error.message}` });
+    };
+    outStream.on('error', onLogError);
+    errStream.on('error', onLogError);
+    child.on('close', (code: number | null, signalName: NodeJS.Signals | null) => {
+      // close 表示子进程管道关闭，文件写入流仍可能在落盘。
+      const complete = (): void => {
+        if (!outStream.writableFinished || !errStream.writableFinished) return;
+        finish(code === 0 ? 'exited' : 'failed', { exitCode: code, signal: signalName });
+      };
+      outStream.once('finish', complete);
+      errStream.once('finish', complete);
+      complete();
     });
 
     return this.store.getJob(id) ?? job;
@@ -206,8 +217,8 @@ export class ProcessService {
   /** 结束整棵进程树；只停外层命令会让真正干活的脚本继续跑。 */
   killTree(jobId: string): void {
     const child = this.alive.get(jobId);
-    const job = this.store.getJob(jobId);
-    const pid = child?.pid ?? job?.pid ?? null;
+    if (!child || child.exitCode !== null || child.signalCode !== null) return;
+    const pid = child?.pid ?? null;
     if (pid === null) return;
     if (process.platform !== 'win32') {
       try {
@@ -229,6 +240,7 @@ export class ProcessService {
     const job = this.store.getJob(jobId);
     if (!job) return null;
     if (job.status !== 'running') return job;
+    if (!this.alive.has(jobId)) return job;
     this.killTree(jobId);
     job.status = 'killed';
     job.endedAt = nowIso();
@@ -240,6 +252,8 @@ export class ProcessService {
       this.timers.delete(jobId);
     }
     this.alive.delete(jobId);
+    this.abortCleanups.get(jobId)?.();
+    this.abortCleanups.delete(jobId);
     const settled = this.store.getJob(jobId) ?? job;
     this.options.onFinished?.(settled);
     return settled;
@@ -249,8 +263,10 @@ export class ProcessService {
   stopAllForTask(taskId: string, reason: string): string[] {
     const stopped: string[] = [];
     for (const job of this.store.listRunningJobs(taskId)) {
-      this.stop(job.id, reason);
-      stopped.push(job.id);
+      if (this.alive.has(job.id)) {
+        this.stop(job.id, reason);
+        stopped.push(job.id);
+      }
     }
     return stopped;
   }
@@ -262,27 +278,43 @@ export class ProcessService {
     const path = stream === 'stdout' ? job.stdoutPath : job.stderrPath;
     let text = '';
     let total = 0;
+    let actualOffset = offset;
     if (existsSync(path)) {
-      const size = statSync(path).size;
-      if (size > MAX_LOG_BYTES) {
-        text = `[日志超过 ${MAX_LOG_BYTES} 字节，只读取末尾部分]\n`;
-        total = size;
-        const buffer = readFileSync(path);
-        const tail = buffer.subarray(Math.max(0, buffer.length - limit)).toString('utf8');
-        return { text: text + tail, nextOffset: total, total, hasMore: false, running: job.status === 'running' };
+      const fd = openSync(path, 'r');
+      try {
+        const decoder = new StringDecoder('utf8');
+        const buffer = Buffer.allocUnsafe(64 * 1024);
+        let requestedEnd = offset + limit;
+        const collect = (part: string): void => {
+          let start = Math.max(0, offset - total);
+          if (start > 0 && start < part.length && /[\uD800-\uDBFF]/.test(part[start - 1]!) && /[\uDC00-\uDFFF]/.test(part[start]!)) {
+            start++;
+            actualOffset++;
+            requestedEnd++;
+          }
+          let end = Math.min(part.length, requestedEnd - total);
+          // 不把 UTF-16 代理对拆到两个页面；下一次 offset 仍按 JS 字符串长度计算。
+          if (end > start && end < part.length && /[\uD800-\uDBFF]/.test(part[end - 1]!) && /[\uDC00-\uDFFF]/.test(part[end]!)) {
+            end++;
+            requestedEnd++;
+          }
+          if (end > start) text += part.slice(start, end);
+          total += part.length;
+        };
+        let bytes: number;
+        while ((bytes = readSync(fd, buffer, 0, buffer.length, null)) > 0) collect(decoder.write(buffer.subarray(0, bytes)));
+        if (job.status !== 'running') collect(decoder.end());
+      } finally {
+        closeSync(fd);
       }
-      const buffer = readFileSync(path);
-      const full = buffer.toString('utf8');
-      total = full.length;
-      text = full.slice(offset, offset + limit);
     }
-    const nextOffset = offset + text.length;
+    const nextOffset = Math.min(actualOffset, total) + text.length;
     return {
       text,
       nextOffset,
       total,
       hasMore: nextOffset < total,
-      running: job.status === 'running' || job.status === 'unknown',
+      running: job.status === 'running',
     };
   }
 
@@ -303,13 +335,15 @@ export class ProcessService {
 
   /** 关闭：结束所有仍存活的进程，并停止写库（进程退出事件可能晚于关闭）。 */
   dispose(): void {
+    this.disposed = true;
     for (const jobId of [...this.alive.keys()]) {
       this.killTree(jobId);
     }
     for (const timer of this.timers.values()) clearTimeout(timer);
     this.timers.clear();
+    for (const cleanup of this.abortCleanups.values()) cleanup();
+    this.abortCleanups.clear();
     this.alive.clear();
-    this.disposed = true;
   }
 
   /** 清空某个任务的日志目录（仅用于测试与显式清理）。 */

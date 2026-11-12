@@ -374,6 +374,34 @@ test('产物：相同内容复用版本，改内容才新建，复用不自动�
   }
 });
 
+test('产物：登记快照被改写或丢失时，不能谎称同内容复用成功', async () => {
+  const harness = await staticHarness();
+  try {
+    const { owner } = harness.runtime.createTask({ title: '快照', goal: 'g', ownerRole: '负责人', ownerBrief: 'b' });
+    const artifact = harness.runtime.saveArtifact(owner, 'report.md', '原文').artifact;
+    const { writeFileSync, unlinkSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const path = join(harness.config.workDir, artifact.path);
+    writeFileSync(path, '被改写');
+    assert.throws(() => harness.runtime.saveArtifact(owner, 'report.md', '原文'), /不一致.*不能复用/);
+    unlinkSync(path);
+    assert.throws(() => harness.runtime.saveArtifact(owner, 'report.md', '原文'), /缺失.*不能复用/);
+  } finally { await harness.cleanup(); }
+});
+
+test('产物：二进制导入校验原始字节，读取时说明文本限制', async () => {
+  const harness = await staticHarness();
+  try {
+    const { task, owner } = harness.runtime.createTask({ title: '二进制', goal: 'g', ownerRole: '负责人', ownerBrief: 'b' });
+    const { mkdirSync, writeFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    mkdirSync(join(harness.config.workDir, task.id), { recursive: true });
+    writeFileSync(join(harness.config.workDir, task.id, 'image.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    harness.runtime.importArtifact(owner, 'image.png', 'image.png');
+    await assert.rejects(harness.runtime.readArtifactVersion(task.id, 'image.png'), /不是 UTF-8 文本/);
+  } finally { await harness.cleanup(); }
+});
+
 test('三态：未执行与执行结果未知在历史与工作记录输入中都不混淆', async () => {
   const harness = await staticHarness();
   try {
@@ -827,4 +855,25 @@ test('协作：运行中收到请求时立即看到身份、请求编号与引�
     const reply = harness.runtime.sendMessage({ from: worker, to: owner.id, kind: 'reply', replyTo: msg.messageId!, body: '已核查' });
     assert.equal(reply.ok, true);
   } finally { release(); await harness.cleanup(); }
+});
+
+test('历史检索：旧记录、工具参数、字面符号和 Unicode 不因最近 200 条被漏掉', async () => {
+  const harness = await staticHarness();
+  try {
+    const { task, owner } = harness.runtime.createTask({ title: '检索', goal: 'g', ownerRole: '负责人', ownerBrief: 'b' });
+    const other = harness.runtime.createCollaborator(owner, '协作者', '协助');
+    harness.store.appendWorkerTurn({ id: 'early-search', workerId: owner.id, seq: 1, role: 'assistant', content: '旧证据 Ä%_\\', toolCalls: [{ id: 'c', name: 'fs_read', arguments: '{"path":"target-file"}' }], toolCallId: null, createdAt: nowIso() });
+    seedTurns(harness.store, owner.id, 240, { chars: 8, prefix: '无关' });
+    seedTurns(harness.store, other.workerId!, 1, { chars: 8, prefix: '私有 evidence' });
+    const { historyTools } = await import('../../src/tools/history.ts');
+    const tool = historyTools.find((item) => item.name === 'history_search')!;
+    const context = { host: harness.runtime, worker: owner, task, workDir: harness.config.workDir, materialsDir: harness.config.materialsDir, readRoot: harness.config.readRoot };
+    for (const query of ['ä%_\\', 'target-file']) {
+      const result = await tool.run({ query }, context);
+      assert.match(result.content, /turn#1/);
+    }
+    assert.match((await tool.run({ query: '私有 evidence' }, context)).content, /没有在自己历史/);
+    assert.match((await tool.run({ query: '旧证据', from_seq: 2 }, context)).content, /没有在自己历史/);
+    assert.match((await tool.run({ query: '旧证据', role: 'user' }, context)).content, /没有在自己历史/);
+  } finally { await harness.cleanup(); }
 });

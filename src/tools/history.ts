@@ -44,14 +44,7 @@ export const historyTools: ToolDefinition[] = [
       const toSeq = argOptionalNumber(args, 'to_seq') ?? Number.MAX_SAFE_INTEGER;
       const limit = Math.min(20, Math.max(1, argOptionalNumber(args, 'limit') ?? 8));
 
-      const needle = query.toLowerCase();
-      const hits = context.host
-        .searchWorkerTurns(context.worker.id, { fromSeq, toSeq, role, limit: 200 })
-        .filter((turn: WorkerTurn) => {
-          const haystack = `${turn.content ?? ''}${turn.toolCalls ? JSON.stringify(turn.toolCalls) : ''}`.toLowerCase();
-          return haystack.includes(needle);
-        })
-        .slice(0, limit);
+      const hits = context.host.searchWorkerTurns(context.worker.id, { fromSeq, toSeq, role, limit, query });
 
       if (hits.length === 0) {
         return { type: 'ok', content: `没有在自己历史里找到「${query}」。可以换关键词，或用 from_seq/to_seq 限定范围。` };

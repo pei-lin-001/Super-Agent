@@ -1081,6 +1081,7 @@ note: null,
     const latest = this.store.latestArtifactByName(task.id, safeName);
     const digest = createHash('sha256').update(bytes).digest('hex');
     if (latest && latest.sha256 === digest) {
+      this.verifyArtifactSnapshot(latest);
       this.store.appendEvent(task.id, worker.id, 'artifact.reused', `${safeName} v${latest.version}`);
       return { artifact: latest, reused: true };
     }
@@ -1124,6 +1125,7 @@ note: null,
     // 内容与最新版本完全相同时复用，不制造无意义的新版本；这不会改变检查状态。
     const digest = createHash('sha256').update(Buffer.from(content, 'utf8')).digest('hex');
     if (latest && latest.sha256 === digest) {
+      this.verifyArtifactSnapshot(latest);
       this.store.appendEvent(task.id, worker.id, 'artifact.reused', `${safeName} v${latest.version}`);
       return { artifact: latest, reused: true };
     }
@@ -1165,6 +1167,13 @@ note: null,
     return this.store.getArtifact(id);
   }
 
+  private verifyArtifactSnapshot(artifact: Artifact): void {
+    const absolute = resolveInside(this.config.workDir, artifact.path);
+    if (!existsSync(absolute)) throw new Error(`产物文件缺失：${artifact.name} v${artifact.version}，不能复用`);
+    const digest = createHash('sha256').update(readFileSync(absolute)).digest('hex');
+    if (digest !== artifact.sha256) throw new Error(`产物内容与登记不一致：${artifact.name} v${artifact.version}，不能复用`);
+  }
+
   /** 按版本读取产物内容，并校验登记时的指纹，防止文件被绕过改写。 */
   async readArtifactVersion(
     taskId: string,
@@ -1181,10 +1190,17 @@ note: null,
     }
     const absolute = resolveInside(this.config.workDir, artifact.path);
     if (!existsSync(absolute)) throw new Error(`产物文件缺失：${safeName} v${artifact.version}`);
-    const content = await readFile(absolute, 'utf8');
-    const digest = createHash('sha256').update(Buffer.from(content, 'utf8')).digest('hex');
+    const bytes = await readFile(absolute);
+    const digest = createHash('sha256').update(bytes).digest('hex');
     if (digest !== artifact.sha256) {
       throw new Error(`产物内容与登记不一致（${safeName} v${artifact.version}），拒绝按旧版本号读取`);
+    }
+    let content: string;
+    try {
+      content = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+      if (content.includes('\0')) throw new Error('二进制内容');
+    } catch {
+      throw new Error(`产物 ${safeName} v${artifact.version} 不是 UTF-8 文本，不能用 artifact_read 读取；图片可用 fs_view_image 查看`);
     }
     return { artifact, content };
   }
@@ -2364,7 +2380,7 @@ note: null,
 
   searchWorkerTurns(
     workerId: string,
-    options: { fromSeq: number; toSeq: number; role: string | null; limit: number },
+    options: { fromSeq: number; toSeq: number; role: string | null; limit: number; query?: string },
   ): WorkerTurn[] {
     return this.store.searchWorkerTurns(workerId, options);
   }

@@ -1,6 +1,6 @@
-import { existsSync } from 'node:fs';
+import { existsSync, lstatSync, realpathSync } from 'node:fs';
 import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
-import { basename, dirname, isAbsolute, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, relative, resolve } from 'node:path';
 import { assertInsideRoot, normalizeRelativePath, resolveInside, ToolError } from './paths.ts';
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateHead } from '../vendor/pi/truncate.ts';
 import {
@@ -25,6 +25,38 @@ export function taskDir(context: ToolContext): string {
   return resolve(context.workDir, context.task.id);
 }
 
+/** 所有文件写入入口共享同一任务目录及只读目录规则。 */
+export function resolveWritePath(context: ToolContext, logical: string): string {
+  const normalized = normalizeRelativePath(logical, '写入路径');
+  const root = taskDir(context);
+  const first = normalized.split('/')[0];
+  if (first === 'materials' || first === 'inputs') throw new ToolError(`${first} 目录只读`);
+  if (first === 'artifacts') throw new ToolError('产物目录由 artifact_save 管理，不能直接修改');
+  const absolute = resolveInside(root, normalized);
+  assertInsideRoot(root, absolute);
+  const rootReal = existsSync(root) ? realpathSync(root) : resolve(root);
+  let current = root;
+  for (const segment of normalized.split('/')) {
+    current = resolve(current, segment);
+    try {
+      const info = lstatSync(current);
+      if (info.isSymbolicLink()) {
+        let target: string;
+        try { target = realpathSync(current); } catch { throw new ToolError(`写入路径包含无效符号链接：${logical}`); }
+        const targetFirst = relative(rootReal, target).split(/[\\/]/)[0];
+        if (targetFirst === 'materials' || targetFirst === 'inputs' || targetFirst === 'artifacts') {
+          throw new ToolError(`写入路径指向只读或产物目录：${logical}`);
+        }
+      }
+      if (current === absolute && info.isFile() && info.nlink > 1) throw new ToolError(`不能直接写入有多个硬链接的文件：${logical}`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') break;
+      throw error;
+    }
+  }
+  return absolute;
+}
+
 /**
  * 逻辑路径 → 实际路径（只读）。
  *
@@ -41,8 +73,9 @@ export function taskDir(context: ToolContext): string {
  * shell 那条拦不住（proc_run 本来就没沙箱），这里至少堵住 fs_* 这一路。
  */
 function assertNotSecret(absolute: string): string {
-  const name = basename(absolute);
-  if (name === '.env' || name.startsWith('.env.')) {
+  const names = [basename(absolute), ...(existsSync(absolute) ? [basename(realpathSync(absolute))] : [])];
+  const name = names.find((item) => item === '.env' || item.startsWith('.env.'));
+  if (name) {
     throw new Error(
       `拒绝读取 ${name}：凭据文件不进入模型上下文。需要某个配置项时，请让程序读出非敏感字段，或由维护者说明取值。`,
     );
@@ -53,7 +86,9 @@ function assertNotSecret(absolute: string): string {
 export function resolveReadPath(context: ToolContext, logicalPath: string): string {
   if (logicalPath === 'materials' || logicalPath.startsWith('materials/')) {
     const rest = logicalPath.slice('materials'.length).replace(/^\/+/, '');
-    return assertNotSecret(resolveInside(context.materialsDir, rest));
+    const absolute = assertNotSecret(resolveInside(context.materialsDir, rest));
+    assertInsideRoot(context.materialsDir, absolute);
+    return absolute;
   }
   const trimmed = logicalPath.trim();
   if (isAbsolute(trimmed)) {
@@ -62,8 +97,13 @@ export function resolveReadPath(context: ToolContext, logicalPath: string): stri
     return absolute;
   }
   const inTask = assertNotSecret(resolveInside(taskDir(context), trimmed));
-  if (existsSync(inTask)) return inTask;
-  return assertNotSecret(resolveInside(context.readRoot, trimmed));
+  if (existsSync(inTask)) {
+    assertInsideRoot(taskDir(context), inTask);
+    return inTask;
+  }
+  const absolute = assertNotSecret(resolveInside(context.readRoot, trimmed));
+  assertInsideRoot(context.readRoot, absolute);
+  return absolute;
 }
 
 async function readTextFile(absolute: string): Promise<string> {
@@ -148,13 +188,16 @@ export const fileTools: ToolDefinition[] = [
         const absolute = resolveReadPath(context, logical);
         const text = await readTextFile(absolute);
         const all = text.split('\n');
+        if (text.endsWith('\n')) all.pop();
+        if (all.length === 0 || text === '') return ok('(空文件)');
         // 行号越界直接说清楚，不要返回空串让模型以为文件是空的。
         if (offset > all.length) {
           return ok(`（文件共 ${all.length} 行，offset=${offset} 超出末尾）`);
         }
-        const slice = all.slice(offset - 1, offset - 1 + limit).join('\n');
+        const selected = all.slice(offset - 1, offset - 1 + limit);
+        const slice = selected.join('\n');
         const clipped = truncateHead(slice, { maxLines: limit, maxBytes: DEFAULT_MAX_BYTES });
-        const lastLine = offset - 1 + clipped.outputLines;
+        const lastLine = offset - 1 + (clipped.truncated ? clipped.outputLines : selected.length);
         const parts: string[] = [clipped.content];
         if (clipped.firstLineExceedsLimit) {
           parts.push(`\n…（第 ${offset} 行就超过 ${formatSize(DEFAULT_MAX_BYTES)}，无法整行返回）`);
@@ -163,7 +206,7 @@ export const fileTools: ToolDefinition[] = [
             `\n…（本次按${clipped.truncatedBy === 'lines' ? '行数' : '字节数'}截断到第 ${lastLine} 行；继续请用 offset=${lastLine + 1}）`,
           );
         }
-        if (lastLine < all.length) {
+        if (!clipped.firstLineExceedsLimit && lastLine < all.length && !clipped.truncated) {
           parts.push(`\n…（文件共 ${all.length} 行；继续请用 offset=${lastLine + 1}）`);
         }
         return ok(parts.join(''));
@@ -210,20 +253,11 @@ export const fileTools: ToolDefinition[] = [
     async run(args, context) {
       const logical = argString(args, 'path');
       const normalized = normalizeRelativePath(logical, '写入路径');
-      if (normalized === 'materials' || normalized.startsWith('materials/')) {
-        throw new Error('materials 目录只读');
-      }
-      if (normalized === 'inputs' || normalized.startsWith('inputs/')) {
-        throw new Error('inputs 目录只读');
-      }
-      if (normalized === 'artifacts' || normalized.startsWith('artifacts/')) {
-        throw new Error('产物目录由 artifact_save 管理，不能用 fs_write 直接覆盖已登记的版本');
-      }
-      const content = argString({ ...args, content: args['content'] ?? '' }, 'content');
-      const root = taskDir(context);
-      const absolute = resolveInside(root, normalized);
+      const content = args['content'];
+      if (typeof content !== 'string') throw new ToolError('参数 content 必须是字符串');
+      const absolute = resolveWritePath(context, normalized);
       await mkdir(dirname(absolute), { recursive: true });
-      assertInsideRoot(root, dirname(absolute));
+      resolveWritePath(context, normalized);
       await writeFile(absolute, content, 'utf8');
       return ok(`已写入 ${normalized}（${Buffer.byteLength(content, 'utf8')} 字节）`);
     },
@@ -252,35 +286,48 @@ export const fileTools: ToolDefinition[] = [
       const results: string[] = [];
       let scanned = 0;
 
-      const walk = async (dir: string): Promise<void> => {
+      const scanFile = async (absolute: string, label: string): Promise<void> => {
+        const info = await stat(absolute);
+        if (!info.isFile() || info.size > MAX_READ_BYTES) return;
+        scanned += 1;
+        const text = await readFile(absolute, 'utf8');
+        text.split('\n').forEach((line, index) => {
+          if (results.length < MAX_SEARCH_RESULTS && regexp.test(line)) {
+            results.push(`${label}:${index + 1}: ${line.trim().slice(0, 200)}`);
+          }
+        });
+      };
+      const walk = async (dir: string, label: string): Promise<void> => {
         if (results.length >= MAX_SEARCH_RESULTS || scanned >= MAX_SEARCH_FILES) return;
         const entries = await readdir(dir, { withFileTypes: true });
         for (const entry of entries) {
           if (results.length >= MAX_SEARCH_RESULTS || scanned >= MAX_SEARCH_FILES) return;
           const absolute = resolve(dir, entry.name);
+          const entryLabel = label === '.' ? entry.name : `${label}/${entry.name}`;
           if (entry.isDirectory()) {
-            await walk(absolute);
+            await walk(absolute, entryLabel);
             continue;
           }
+          if (!entry.isFile()) continue;
+          if (entry.name === '.env' || entry.name.startsWith('.env.')) continue;
           const ext = entry.name.slice(entry.name.lastIndexOf('.'));
           if (!TEXT_EXTENSIONS.has(ext.toLowerCase())) continue;
-          const info = await stat(absolute);
-          if (info.size > MAX_READ_BYTES) continue;
-          scanned += 1;
-          const text = await readFile(absolute, 'utf8');
-          text.split('\n').forEach((line, index) => {
-            if (results.length < MAX_SEARCH_RESULTS && regexp.test(line)) {
-              results.push(`${basename(dir)}/${entry.name}:${index + 1}: ${line.trim().slice(0, 200)}`);
-            }
-          });
+          await scanFile(absolute, entryLabel);
         }
       };
 
-      await walk(start).catch((error: unknown) => {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
-        throw error;
-      });
-      return ok(results.length > 0 ? results.join('\n') : `未找到匹配 ${patternText}`);
+      let startInfo;
+      try {
+        startInfo = await stat(start);
+      } catch (error) {
+        throw new ToolError(`无法访问搜索路径 ${logical}：${(error as Error).message}`);
+      }
+      if (startInfo.isDirectory()) await walk(start, logical);
+      else if (startInfo.isFile()) await scanFile(start, logical);
+      else throw new ToolError(`搜索路径不是文件或目录：${logical}`);
+      const truncated = results.length >= MAX_SEARCH_RESULTS || scanned >= MAX_SEARCH_FILES;
+      const result = results.length > 0 ? results.join('\n') : `未找到匹配 ${patternText}`;
+      return ok(result + (truncated ? `\n…搜索达到 ${MAX_SEARCH_RESULTS} 条结果或 ${MAX_SEARCH_FILES} 个文件的上限，结果可能不完整` : ''));
     },
   },
 ];
