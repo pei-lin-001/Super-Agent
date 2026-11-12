@@ -476,7 +476,12 @@ export class Router {
     const scope: RunScope = { sessionKey, conversationId: context.conversationId ?? null };
     const conversationId = scope.conversationId;
     const inbox = this.runtime.store.listRouterInbox(sessionKey, conversationId);
-    if (userText === null && inbox.length === 0) return 'done';
+    // 维护者的消息也要能单独撑起一轮：没有用户输入、也没有 Worker 汇报时，
+    // 以前这里直接返回，导致「维护者发了消息但 Router 永远不跑」。
+    const hasMaintainerMessage = this.runtime.store
+      .listPendingIntercom('router', 6)
+      .some((message) => message.sessionKey === null || message.sessionKey === sessionKey);
+    if (userText === null && inbox.length === 0 && !hasMaintainerMessage) return 'done';
 
     const pending = inbox
       .map(
