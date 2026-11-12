@@ -1911,7 +1911,11 @@ note: null,
     if (!router || this.stopped) return;
     // 维护者发了消息：叫醒 Router 去处理。节流到 60 秒一次——
     // 不节流的话维护者每写一条都会触发一轮 Router，两边会互相抽起来。
-    const pendingFromMaintainer = this.store.listPendingIntercom('router', 1).length > 0;
+    // 没有会话归属的消息（CLI、或维护者不知道发给谁）不唤醒 Router：
+    // 唤醒了也没有收件对象，只会每 60 秒空转一次。
+    const pendingFromMaintainer = this.store
+      .listPendingIntercom('router', 6)
+      .some((message) => message.sessionKey !== null);
     if (pendingFromMaintainer && Date.now() - this.lastMaintainerPumpAt >= 60_000) {
       this.lastMaintainerPumpAt = Date.now();
       void this.router?.notify?.();
