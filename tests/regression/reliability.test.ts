@@ -783,3 +783,68 @@ test('fs_read 能读任务目录之外：仓库文件直接读，越界拒绝', 
     await harness.cleanup();
   }
 });
+
+test('消息：运行中到达的请求在无依赖等待时继续处理', async () => {
+  let release!: (result: ReturnType<typeof mockReply>) => void;
+  let signalStarted!: () => void;
+  const started = new Promise<void>((resolve) => { signalStarted = resolve; });
+  let calls = 0;
+  const harness = await createHarness({
+    worker: scripted({
+      负责人: () => mockReply({ toolCalls: [{ name: 'wait_for', arguments: { timeout_seconds: 30 } }] }),
+      协作者: () => {
+        calls += 1;
+        if (calls === 1) { signalStarted(); return new Promise((resolve) => { release = resolve; }); }
+        return mockReply({ text: '已处理' });
+      },
+    }),
+  });
+  try {
+    const { owner } = harness.runtime.createTask({ title: '到达竞态', goal: 'g', ownerRole: '负责人', ownerBrief: 'b' });
+    const peer = harness.runtime.createCollaborator(owner, '协作者', 'b');
+    harness.runtime.enqueue(peer.workerId!);
+    await started;
+    const request = harness.runtime.sendMessage({ from: owner, to: peer.workerId!, kind: 'request', intent: 'help', body: '新工作' });
+    assert.ok(request.ok);
+    release(mockReply({ text: '本轮结束' }));
+    for (let index = 0; index < 100 && calls < 2; index++) await new Promise((resolve) => setTimeout(resolve, 10));
+    await harness.runtime.waitForIdle(2000);
+    assert.equal(harness.store.getMessage(request.messageId!)!.status, 'consumed');
+    assert.equal(calls, 2, '只重新执行一次');
+    assert.equal(harness.store.listActiveWaitsForWorker(peer.workerId!).length, 0);
+    const next = harness.runtime.sendMessage({ from: owner, to: peer.workerId!, kind: 'request', intent: 'help', body: '等待后送达' });
+    assert.ok(next.ok);
+    for (let index = 0; index < 100 && calls < 3; index++) await new Promise((resolve) => setTimeout(resolve, 10));
+    await harness.runtime.waitForIdle(2000);
+    assert.equal(harness.store.getMessage(next.messageId!)!.status, 'consumed');
+    assert.equal(calls, 3, '等待后到达也只执行一次');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('消息：运行中的无关请求不解除已有依赖等待', async () => {
+  let release!: (result: ReturnType<typeof mockReply>) => void;
+  let signalStarted!: () => void;
+  const started = new Promise<void>((resolve) => { signalStarted = resolve; });
+  let calls = 0;
+  const harness = await createHarness({ worker: scripted({
+    负责人: () => mockReply({ toolCalls: [{ name: 'wait_for', arguments: { timeout_seconds: 30 } }] }),
+    协作者: () => { calls++; signalStarted(); return new Promise((resolve) => { release = resolve; }); },
+  }) });
+  try {
+    const { owner } = harness.runtime.createTask({ title: '依赖等待', goal: 'g', ownerRole: '负责人', ownerBrief: 'b' });
+    const peerId = harness.runtime.createCollaborator(owner, '协作者', 'b').workerId!;
+    harness.runtime.enqueue(peerId);
+    await started;
+    const peer = harness.store.getWorker(peerId)!;
+    const dependency = harness.runtime.registerWait(peer, { from: owner.id, replyTo: 'unrelated', kinds: ['reply'], timeoutMs: 60_000 });
+    const request = harness.runtime.sendMessage({ from: owner, to: peerId, kind: 'request', body: '无关请求' });
+    assert.ok(request.ok);
+    release(mockReply({ text: '等待依赖' }));
+    await harness.runtime.waitForIdle(2000);
+    assert.equal(calls, 1);
+    assert.equal(harness.store.getMessage(request.messageId!)!.status, 'delivered');
+    assert.equal(harness.store.listActiveWaitsForWorker(peerId)[0]?.id, dependency.waitId);
+  } finally { await harness.cleanup(); }
+});

@@ -1879,7 +1879,8 @@ note: null,
       this.emit({ type: 'worker.status', workerId, status: 'waiting' });
       const pending = this.store.listInbox(workerId);
       const activeWaits = this.store.listActiveWaitsForWorker(workerId);
-      if (pending.some((message) => activeWaits.some((wait) => this.noticeMatchesDependency(message, wait)))) this.enqueue(workerId);
+      if (pending.length > 0 && (activeWaits.length === 0 || pending.some((message) =>
+        activeWaits.some((wait) => this.noticeMatchesDependency(message, wait))))) this.enqueue(workerId);
       this.checkGroupDeadlock(worker.groupId);
       return;
     }
