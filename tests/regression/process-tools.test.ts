@@ -1,5 +1,5 @@
 import { strict as assert } from 'node:assert';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
 import { getEventListeners } from 'node:events';
@@ -159,6 +159,16 @@ test('重启只接受本次新实例的新心跳，旧心跳不算成功', async
   const f = await setup();
   const oldCwd = process.cwd();
   const pids: number[] = [];
+  const logPath = join(f.harness.config.workDir, '.runtime', 'main.log');
+  async function stopOwned(pid: number) {
+    await writeFile(logPath, 'awaiting exit');
+    try { process.kill(pid, 'SIGKILL'); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+    const deadline = Date.now() + 8000;
+    while (!(await readFile(logPath, 'utf8')).includes('exit=')) {
+      if (Date.now() > deadline) throw new Error(`子进程 ${pid} 的退出回调未完成`);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
   try {
     const runtimeDir = join(f.harness.config.workDir, '.runtime');
     const instancePath = join(runtimeDir, 'instance.json');
@@ -174,7 +184,7 @@ test('重启只接受本次新实例的新心跳，旧心跳不算成功', async
     assert.equal(stale.ok, false);
     assert.match(stale.message, /未看到新心跳/);
     assert.doesNotMatch(stale.message, /reset --hard/);
-    if (stale.pid) { process.kill(stale.pid, 'SIGKILL'); pids.pop(); }
+    if (stale.pid) { await stopOwned(stale.pid); pids.pop(); }
 
     const script = `import { writeFileSync } from 'node:fs';\n` +
       `writeFileSync(${JSON.stringify(instancePath)}, JSON.stringify({ pid: process.pid, startedAt: 'new-instance' }));\n` +
@@ -186,7 +196,7 @@ test('重启只接受本次新实例的新心跳，旧心跳不算成功', async
     assert.equal(fresh.ok, true, fresh.message);
     assert.match(fresh.message, /新心跳已写入/);
   } finally {
-    for (const pid of pids) { try { process.kill(pid, 'SIGKILL'); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; } }
+    for (const pid of pids) await stopOwned(pid);
     process.chdir(oldCwd);
     await f.harness.cleanup();
   }

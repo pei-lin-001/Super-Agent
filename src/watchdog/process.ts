@@ -133,7 +133,16 @@ export function spawnMain(
   child.stderr?.on('data', (chunk: Buffer) => {
     output += chunk.toString();
   });
+  const runningLogTimer = setTimeout(() => {
+    try {
+      writeFileSync(logPath, `${clockStamp()} running pid=${child.pid}\n${output}`, 'utf8');
+    } catch {
+      // 忽略写日志失败。
+    }
+  }, 2000);
+  runningLogTimer.unref?.();
   child.on('exit', (code) => {
+    clearTimeout(runningLogTimer);
     // 启动失败保留诊断，不丢弃输出。
     try {
       writeFileSync(logPath, `${clockStamp()} exit=${code}\n${output}`, 'utf8');
@@ -142,13 +151,7 @@ export function spawnMain(
     }
   });
   child.unref();
-  setTimeout(() => {
-    try {
-      writeFileSync(logPath, `${clockStamp()} running pid=${child.pid}\n${output}`, 'utf8');
-    } catch {
-      // 忽略写日志失败。
-    }
-  }, 2000).unref?.();
+
 
   recordRestart(config, {
     attemptedAt: new Date().toISOString(),
