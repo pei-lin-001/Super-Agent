@@ -2682,7 +2682,13 @@ note: null,
         this.enqueue(worker.id);
         continue;
       }
-      this.pushSystemNotice(worker.id, '等待已超时，没有收到匹配回复。请决定继续等待、自己推进，或向 Router 说明阻塞。');
+      const request = wait.matchReplyTo ? this.store.getMessage(wait.matchReplyTo) : null;
+      const target = request && request.kind === 'request' && request.fromId === worker.id && request.groupId === worker.groupId && request.toKind === 'worker'
+        ? this.store.getWorker(request.toId) : null;
+      const details = request && target && target.groupId === worker.groupId
+        ? `观察时间 ${new Date(now).toISOString()}；请求 ${request.id} 状态 ${request.status}；接收者 ${target.id} 状态 ${target.status}，有效等待 ${this.store.listActiveWaitsForWorker(target.id).length} 条。状态是当时的快照。`
+        : `观察时间 ${new Date(now).toISOString()}；请求或接收者状态不可确认。`;
+      this.pushSystemNotice(worker.id, `等待已超时，没有收到匹配回复。${details}请根据当前信息决定下一步。`);
       this.enqueue(worker.id);
     }
     const ttl = this.config.limits.messageTtlMinutes;

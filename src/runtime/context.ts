@@ -141,9 +141,9 @@ export function renderTaskFacts(input: {
   const lines = [
     `- 任务：${task.title}`,
     `- 共同目标：${task.goal}`,
-    `- 完成条件：${task.doneCriteria || '（由负责人判断，但必须产出可检查的产物）'}`,
+    `- 完成条件：${task.doneCriteria || '（由负责人根据目标判断；提交时须引用已保存的产物）'}`,
     `- 当前要求版本：${task.reviewEpoch}`,
-    `- 提交门槛：${task.requireReview ? '交付前必须取得同组检查通过' : '不强制检查'}`,
+    `- 提交门槛：${task.requireReview ? '每个最终提交产物须取得当前要求和版本下的同组检查通过' : '不强制检查'}`,
   ];
   if (latestUpdate) {
     lines.push(`- 最新补充要求（覆盖此前计划）：${latestUpdate.slice(0, 600)}`);

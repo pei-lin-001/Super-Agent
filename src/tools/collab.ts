@@ -74,7 +74,7 @@ export const collabTools: ToolDefinition[] = [
         refs: {
           type: 'array',
           items: { type: 'string' },
-          description: '相关产物 id 或任务目录内的文件路径',
+          description: '相关产物 id 或任务目录内的文件路径。正式检查时，每个产物 id 都是检查对象，同一回复的 outcome 会分别记到所有对象；仅供参考的文件可用路径',
         },
       },
       required: ['to', 'kind', 'body'],
@@ -154,7 +154,7 @@ export const collabTools: ToolDefinition[] = [
   {
     name: 'submit_result',
     description:
-      '任务负责人提交最终结果。程序会校验产物是否存在、检查是否覆盖最新版本、是否存在未处理的补充要求；校验不通过会退回并说明原因。',
+      '任务负责人提交最终结果。程序校验所提交产物的存在和指纹、未处理的补充要求；仅任务要求正式检查时，所提交产物还须有当前要求和版本下的 approved。',
     parameters: {
       type: 'object',
       properties: {

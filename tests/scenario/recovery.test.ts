@@ -183,3 +183,24 @@ test('重复发送同一去重键只落一条消息', async () => {
     await harness.cleanup();
   }
 });
+
+test('指定请求超时提示包含当前可核对的投递与接收者状态', async () => {
+  const h = await createHarness({ limits: { maxConcurrentRuns: 0 }, worker: () => mockReply({ text: 'unused' }) });
+  try {
+    const { task, owner } = h.runtime.createTask({ title: '超时快照', goal: 'g', ownerRole: '负责人', ownerBrief: 'b' });
+    const peer = h.runtime.createCollaborator(owner, '协作者', 'b');
+    const req = h.runtime.sendMessage({ from: owner, to: peer.workerId!, kind: 'request', body: '核对' });
+    assert.ok(req.ok);
+    h.runtime.registerWait(owner, { replyTo: req.messageId, timeoutMs: 1 });
+    h.store.setWorkerStatus(owner.id, 'waiting');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    h.runtime.tick();
+    const notice = h.store.listGroupMessages(task.groupId).find((message) => message.body.includes('等待已超时'))!;
+    assert.ok(notice.body.includes(req.messageId!));
+    assert.match(notice.body, /delivered/);
+    assert.ok(notice.body.includes(peer.workerId!));
+    assert.match(notice.body, /idle/);
+    assert.match(notice.body, /有效等待 0/);
+    assert.match(notice.body, /\d{4}-\d\d-\d\dT/);
+  } finally { await h.cleanup(); }
+});

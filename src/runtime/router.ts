@@ -30,7 +30,7 @@ const ROUTER_TOOLS: ToolSchema[] = [
         goal: { type: 'string', description: '给全组看的共同目标' },
         brief: { type: 'string', description: '背景材料、用户约束和输入位置；可调整的方法不要写成用户要求' },
         done_criteria: { type: 'string', description: '用户要求的结果与验收条件，不额外添加方法性门槛' },
-        require_review: { type: 'boolean', description: '是否必须经过同组检查才能交付' },
+        require_review: { type: 'boolean', description: '是否要求正式同组检查：默认 false；true 时每个最终提交产物都需要当前要求和版本下的 approved。可选求助或核对不必启用此门槛' },
         owner_role: { type: 'string', description: '负责人职责摘要' },
         owner_brief: { type: 'string', description: '负责人具体要做什么' },
         input_artifact_ids: { type: 'array', items: { type: 'string' }, description: '需作为输入的本会话既有产物 ID；用 read_task 查看具体版本，快照不继承检查结论' },
