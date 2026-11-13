@@ -215,7 +215,7 @@ Message: queued → delivered → consumed
   `rerunRequested`，本轮结束后再跑一次，因此既不会丢唤醒，也不会并发执行同一个 Worker。
 - Worker 调 `wait_for` 时写 `wait_record`、状态转 `waiting`、**立刻让出并发槽，期间零模型调用**。
 - 回复到达时程序匹配 `wait` 并把它放回队列；`update` / `stop` 会无视等待条件直接唤醒，保证互等时收件箱不被锁死。
-- 同组全部 Worker 都在等待且互相等待时，程序给最早等待者注入提示，打破闭环。
+- 当同组成员对具体请求的回复依赖形成闭环时，程序解除环内最早的一条等待并提示该成员；无需全组都等待。作业、提供方、用户或维护等待不会被误当作回复闭环。
 - 提供方（模型服务）暂时不可用时，Worker 转 `waiting` 并写入 `wait_record(reason='provider')`，
   60 秒后由 `tick()` 自动恢复——这个等待点是持久化的，重启后照样生效。
 - 每个 Worker 有独立的执行锁，同一 Worker 永远不会并发改上下文。

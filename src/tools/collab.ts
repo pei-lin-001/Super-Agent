@@ -18,12 +18,12 @@ export const collabTools: ToolDefinition[] = [
   {
     name: 'create_worker',
     description:
-      '为当前任务创建一个同层协作者（会继承同一个 groupId）。用于求助、核对、检查等。创建不产生上下级关系。',
+      '为当前任务创建一个空闲的同层协作者（会继承同一个 groupId）；收到消息后才开始工作。创建不产生上下级关系。',
     parameters: {
       type: 'object',
       properties: {
         role: { type: 'string', description: '一句话职责，例如「数据核对」' },
-        brief: { type: 'string', description: '具体工作、交付内容、边界，以及结果如何支持当前目标' },
+        brief: { type: 'string', description: '成员持续工作的背景，包括工作内容、交付内容、边界以及结果如何支持当前目标' },
         model: {
           type: 'string',
           description: '可选：协作者使用的模型别名，见当前可用模型目录；不填则沿用你自己的模型配置',
@@ -119,7 +119,7 @@ export const collabTools: ToolDefinition[] = [
         kinds: {
           type: 'array',
           items: { type: 'string' },
-          description: '接受的消息类型，默认任意',
+          description: '接受的消息类型，默认非 notice 消息',
         },
         timeout_seconds: { type: 'number', description: '超时秒数，默认取系统配置' },
       },
