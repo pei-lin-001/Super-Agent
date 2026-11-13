@@ -3,6 +3,7 @@ import { createServer } from 'node:http';
 import { link, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { assertInsideRoot } from '../../src/tools/paths.ts';
 import test from 'node:test';
 import { fileTools } from '../../src/tools/files.ts';
 import { editTools } from '../../src/tools/edit.ts';
@@ -107,5 +108,37 @@ test('notebook 截断会提示，联网长正文落盘且取消覆盖响应正�
     const pending = fetch.run({ url: `http://127.0.0.1:${port}/slow` }, { ...f.context, signal: controller.signal });
     setTimeout(() => controller.abort(), 50);
     await assert.rejects(async () => pending, /已取消/);
+  } finally { server.closeAllConnections(); await new Promise<void>((done) => server.close(() => done())); await f.close(); }
+});
+
+test('首次写入任务目录以及路径链接边界', async () => {
+  const f = await fixture();
+  const server = createServer((_req, res) => { res.setHeader('content-type', 'text/plain'); res.end('网络内容'); });
+  await new Promise<void>((done) => server.listen(0, '127.0.0.1', done));
+  try {
+    await rm(f.dir, { recursive: true });
+    await get(fileTools, 'fs_write').run({ path: 'first/out.txt', content: '首次文件' }, f.context);
+    assert.equal(await readFile(join(f.dir, 'first/out.txt'), 'utf8'), '首次文件');
+    await rm(f.dir, { recursive: true });
+    const port = (server.address() as { port: number }).port;
+    await get(netTools, 'net_fetch').run({ url: `http://127.0.0.1:${port}/`, save_to: 'download/out.txt' }, f.context);
+    assert.equal(await readFile(join(f.dir, 'download/out.txt'), 'utf8'), '网络内容');
+    for (const prefix of ['materials', 'inputs', 'artifacts']) {
+      await assert.rejects(async () => get(fileTools, 'fs_write').run({ path: `${prefix}/x`, content: 'x' }, f.context), /只读|产物目录/);
+    }
+    const outside = join(f.root, 'outside');
+    await mkdir(outside);
+    await symlink(outside, join(f.dir, 'escape'));
+    await assert.rejects(async () => get(fileTools, 'fs_write').run({ path: 'escape/x', content: 'x' }, f.context), /符号链接/);
+    await symlink(join(f.root, 'missing'), join(f.dir, 'dangling'));
+    await assert.rejects(async () => get(fileTools, 'fs_write').run({ path: 'dangling/x', content: 'x' }, f.context), /符号链接/);
+    assert.throws(() => assertInsideRoot(f.dir, join(f.root, 'task-other', 'x')), /目录之外/);
+    await symlink(f.root, join(f.root, 'parent-link'));
+    const linkedRoot = join(f.root, 'parent-link', 'new-task');
+    assert.doesNotThrow(() => assertInsideRoot(linkedRoot, join(linkedRoot, 'new', 'x')));
+    await symlink(outside, join(f.root, 'linked-task'));
+    assert.doesNotThrow(() => assertInsideRoot(join(f.root, 'linked-task'), join(f.root, 'linked-task', 'new')));
+    await symlink(f.root, join(outside, 'escape-back'));
+    assert.throws(() => assertInsideRoot(join(f.root, 'linked-task'), join(f.root, 'linked-task', 'escape-back', 'x')), /目录之外/);
   } finally { server.closeAllConnections(); await new Promise<void>((done) => server.close(() => done())); await f.close(); }
 });

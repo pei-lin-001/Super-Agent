@@ -267,7 +267,6 @@ test('doc_pdf 落盘：转换一次，之后用文件工具检索', async () => 
     // taskDir 是 workDir/<taskId>，和 fs_write 的位置一致。
     const taskRoot = join(dir, 'task_x');
     const materials = join(dir, 'materials');
-    mkdirSync(taskRoot, { recursive: true });
     mkdirSync(materials, { recursive: true });
     // 用系统自带 PDF 造一份：先生成文本再转 PDF 不可靠，改用 python 写最小 PDF。
     const pdf =

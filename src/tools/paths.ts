@@ -1,5 +1,5 @@
-import { existsSync, realpathSync } from 'node:fs';
-import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { lstatSync, realpathSync } from 'node:fs';
+import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 
 export class ToolError extends Error {
   constructor(message: string) {
@@ -38,24 +38,43 @@ export function resolveInside(root: string, relativePath: string): string {
   return absolute;
 }
 
-/**
- * 已存在的符号链接会把路径指到 root 之外。
- * 取最深的存在祖先做 realpath 校验，写入前调用即可。
- */
-export function assertInsideRoot(root: string, absolute: string): void {
-  const rootReal = existsSync(root) ? realpathSync(root) : resolve(root);
-  let probe = absolute;
-  for (let depth = 0; depth < 64; depth += 1) {
-    if (existsSync(probe)) {
-      const real = realpathSync(probe);
-      if (real !== rootReal && !real.startsWith(rootReal + sep)) {
-        throw new ToolError(`路径经符号链接指向任务目录之外：${absolute}`);
+/** 将不存在的后缀拼到最深存在祖先的真实路径，悬空链接必须报错。 */
+function realPathWithMissingSuffix(path: string): string {
+  let probe = resolve(path);
+  const suffix: string[] = [];
+  while (true) {
+    let exists: boolean;
+    try {
+      lstatSync(probe);
+      exists = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      exists = false;
+    }
+    if (exists) {
+      try {
+        return resolve(realpathSync(probe), ...suffix);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+          throw new ToolError(`路径包含无效符号链接或已失效：${probe}`);
+        }
+        throw error;
       }
-      return;
     }
     const parent = dirname(probe);
-    if (parent === probe) return;
+    if (parent === probe) throw new ToolError(`无法解析路径：${path}`);
+    suffix.unshift(basename(probe));
     probe = parent;
+  }
+}
+
+/** 校验已有路径及尚未创建的后缀均位于根目录的真实路径内。 */
+export function assertInsideRoot(root: string, absolute: string): void {
+  const rootReal = realPathWithMissingSuffix(root);
+  const targetReal = realPathWithMissingSuffix(absolute);
+  const rel = relative(rootReal, targetReal);
+  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new ToolError(`路径经符号链接指向任务目录之外：${absolute}`);
   }
 }
 
