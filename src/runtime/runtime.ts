@@ -389,7 +389,8 @@ note: null,
         }
         this.store.createTask(task);
         owner = this.createWorkerRecord({
-          groupId: workspaceId,
+          workspaceId,
+          currentTaskId: taskId,
           parentId: null,
           role: input.ownerRole,
           brief: input.ownerBrief,
@@ -559,7 +560,8 @@ note: null,
   }
 
   private createWorkerRecord(input: {
-    groupId: string;
+    workspaceId: string;
+    currentTaskId: string;
     parentId: string | null;
     role: string;
     brief: string;
@@ -575,7 +577,7 @@ note: null,
   }): Worker {
     // 四条限制。休眠成员不占并发槽，但会占「谁能被派活」的注意力，
     // 而且成员一多，Router 的表单就开始说不清谁在干什么。所以按空间人数卡。
-    const members = this.store.listGroupWorkers(input.groupId).filter(
+    const members = this.store.listGroupWorkers(input.workspaceId).filter(
       (worker) => !isTerminalWorker(worker.status),
     );
     if (members.length >= this.config.limits.maxWorkersPerGroup) {
@@ -590,13 +592,15 @@ note: null,
     }
     this.workerSequence = Math.max(this.workerSequence, members.length) + 1;
     const now = nowIso();
-    const workspaceId = this.store.getWorkspace(input.groupId) ? input.groupId : null;
+    if (!this.store.getWorkspace(input.workspaceId)) {
+      throw new Error(`工作空间不存在：${input.workspaceId}`);
+    }
     const worker: Worker = {
       id: newWorkerId(this.workerSequence),
-      groupId: input.groupId,
-      workspaceId: workspaceId ?? input.groupId,
-      // 负责人服务创建它的那个任务；协作者同样挂在当前活跃任务上。
-      currentTaskId: this.store.getTaskByGroup(input.groupId)?.id ?? null,
+      // 迁移期兼容字段：成员仍以 workspace id 作为 group_id。
+      groupId: input.workspaceId,
+      workspaceId: input.workspaceId,
+      currentTaskId: input.currentTaskId,
       parentId: input.parentId,
       role: input.role,
       brief: input.brief,
@@ -608,7 +612,7 @@ note: null,
       lastError: null,
     };
     this.store.createWorker(worker);
-    const task = this.store.getTaskByGroup(input.groupId);
+    const task = this.store.getTask(input.currentTaskId);
     this.store.appendEvent(task?.id ?? null, worker.id, 'worker.created', input.role);
     this.emit({ type: 'worker.created', workerId: worker.id, role: worker.role, parentId: worker.parentId });
     return worker;
@@ -621,13 +625,16 @@ note: null,
     options: { model?: string | null } = {},
   ): CreateCollaboratorResult {
     try {
+      const task = this.currentTaskForWorker(parent);
+      if (!task) return { ok: false, reason: '调用者当前没有可服务的任务' };
       // 不指定就沿用它创建者的模型配置；指定时必须真实存在，不回退默认。
       const alias = options.model ?? parent.model ?? this.config.defaultModelAlias;
       if (!this.models.has(alias)) {
         return { ok: false, reason: `未配置的模型别名：${alias}；可用别名：${this.models.list().map((item) => item.alias).join(', ')}` };
       }
       const worker = this.createWorkerRecord({
-        groupId: parent.groupId,
+        workspaceId: parent.workspaceId ?? parent.groupId,
+        currentTaskId: task.id,
         parentId: parent.id,
         role,
         brief,
@@ -647,6 +654,26 @@ note: null,
     return this.store.listGroupWorkers(groupId);
   }
 
+  /** 任务详情只展示currentTaskId确实指向本任务的成员，不能用workspace成员兜底。 */
+  listTaskWorkers(task: Task): Worker[] {
+    return this.store.listTaskWorkers(task.id);
+  }
+
+  /**
+   * Worker 当前任务只有一个权威来源：currentTaskId。
+   *
+   * worker.groupId 在迁移期仍保存 workspace id；复用 workspace 后，
+   * 用 groupId 反查任务会稳定命中该空间的旧任务，因此不能再作为当前任务依据。
+   */
+  private currentTaskForWorker(worker: Worker): Task | null {
+    const current = this.store.getWorker(worker.id) ?? worker;
+    if (!current.currentTaskId) return null;
+    const task = this.store.getTask(current.currentTaskId);
+    if (!task) return null;
+    if ((task.workspaceId ?? task.groupId) !== (current.workspaceId ?? current.groupId)) return null;
+    return task;
+  }
+
   // ---------------- 消息 ----------------
 
   /**
@@ -658,8 +685,8 @@ note: null,
   sendMessage(input: SendMessageInput): SendMessageResult {
     const from = this.store.getWorker(input.from.id);
     if (!from) return { ok: false, reason: '发送者不存在' };
-    const task = this.store.getTaskByGroup(from.groupId);
-    if (!task) return { ok: false, reason: '任务不存在' };
+    const task = this.currentTaskForWorker(from);
+    if (!task) return { ok: false, reason: '发送者当前没有任务' };
     if (isTerminalTask(task.status)) return { ok: false, reason: `任务已处于 ${task.status}，不能再发消息` };
 
     const intent = typeof input.intent === 'string' ? input.intent : null;
@@ -690,7 +717,7 @@ note: null,
       if (!input.replyTo) return { ok: false, reason: 'reply 必须带 reply_to' };
       origin = this.store.getMessage(input.replyTo);
       if (!origin) return { ok: false, reason: `被回复的消息不存在：${input.replyTo}` };
-      if (origin.groupId !== from.groupId || origin.taskId !== task.id) return { ok: false, reason: '请求不属于当前任务' };
+      if (origin.taskId !== task.id) return { ok: false, reason: '请求不属于当前任务' };
       if (origin.kind !== 'request') return { ok: false, reason: `只能回复 request，不能回复 ${origin.kind}` };
       if (origin.fromKind !== 'worker' || origin.toKind !== 'worker') return { ok: false, reason: '请求参与者无效' };
       const isRecipient = origin.toId === from.id && origin.fromId === input.to;
@@ -728,21 +755,23 @@ note: null,
       }
     }
 
-    const broadcast = input.to === 'group' || input.to === from.groupId;
+    const broadcast = input.to === 'group' || input.to === from.groupId || input.to === task.groupId;
     if (input.kind === 'notice' && broadcast) return { ok: false, reason: 'notice 必须指定具体接收者' };
     let recipients: Worker[];
     if (broadcast) {
       if (task.ownerWorkerId !== from.id) return { ok: false, reason: '只有任务负责人可以向全组广播' };
       if (intent === 'review') return { ok: false, reason: '检查请求必须指定具体的检查者，不能广播' };
       recipients = this.store
-        .listGroupWorkers(from.groupId)
+        .listTaskWorkers(task.id)
         .filter((worker) => worker.id !== from.id && !isTerminalWorker(worker.status));
       if (recipients.length === 0) return { ok: false, reason: '群组内没有其他可接收的 Worker' };
     } else {
       const target = this.store.getWorker(input.to);
       if (!target) return { ok: false, reason: `接收者不存在：${input.to}` };
       if (target.id === from.id) return { ok: false, reason: '不能给自己发消息' };
-      if (target.groupId !== from.groupId) return { ok: false, reason: '跨群组消息需要先由 Router 建立关联' };
+      if (this.currentTaskForWorker(target)?.id !== task.id) {
+        return { ok: false, reason: '接收者不属于发送者的当前任务' };
+      }
       if (isTerminalWorker(target.status)) return { ok: false, reason: `接收者 ${target.id} 已处于 ${target.status}` };
       recipients = [target];
     }
@@ -755,7 +784,7 @@ note: null,
     for (const recipient of recipients) {
       const dedupeKey = baseDedupe ? (broadcast ? `${baseDedupe}#${recipient.id}` : baseDedupe) : null;
       if (dedupeKey) {
-        const existing = this.store.findMessageByDedupeKey(from.groupId, dedupeKey);
+        const existing = this.store.findMessageByDedupeKey(task.groupId, dedupeKey);
         if (existing) {
           createdIds.push(existing.id);
           firstMessageId ??= existing.id;
@@ -833,7 +862,7 @@ note: null,
     if (input.outcome) payload['outcome'] = input.outcome;
     return {
       id: newMessageId(),
-      groupId: input.from.groupId,
+      groupId: input.task.groupId,
       taskId: input.task.id,
       fromKind: 'worker',
       fromId: input.from.id,
@@ -887,7 +916,10 @@ note: null,
 
   private onMessageDelivered(message: Message): void {
     if (message.toKind === 'group') {
-      for (const worker of this.store.listGroupWorkers(message.groupId)) {
+      const workers = message.taskId
+        ? this.store.listTaskWorkers(message.taskId)
+        : this.store.listGroupWorkers(message.groupId);
+      for (const worker of workers) {
         if (worker.status === 'waiting' && this.store.listActiveWaitsForWorker(worker.id).length === 0) {
           this.enqueue(worker.id);
         }
@@ -897,6 +929,7 @@ note: null,
     if (message.toKind !== 'worker') return;
     const target = this.store.getWorker(message.toId);
     if (!target || isTerminalWorker(target.status)) return;
+    if (!message.taskId || target.currentTaskId !== message.taskId) return;
 
     const waits = this.store.listActiveWaitsForWorker(target.id);
     const matched = waits.find((wait) => wait.reason === 'reply' && this.matchWait(message, wait));
@@ -924,13 +957,24 @@ note: null,
     }
   }
 
-  private noticeMatchesDependency(message: Message, wait: { workerId: string; reason: string; matchFrom: string | null; matchReplyTo: string | null }): boolean {
-    if (message.kind !== 'notice' || message.fromKind !== 'worker' || wait.reason !== 'reply' || !wait.matchReplyTo || message.replyTo !== wait.matchReplyTo) return false;
+  private noticeMatchesDependency(message: Message, wait: { workerId: string; groupId: string; reason: string; matchFrom: string | null; matchReplyTo: string | null }): boolean {
+    if (message.kind !== 'notice' || message.toKind !== 'worker' || message.toId !== wait.workerId ||
+        wait.reason !== 'reply' || !message.taskId || message.groupId !== wait.groupId) return false;
+    // Router notice 已经由其写入入口确认是该任务当前成员；用于用户问题答复/事实澄清时，
+    // 合法 reply 等待可以只带 from，甚至没有关联字段，仍应临时唤醒而不解除等待。
+    if (message.fromKind === 'router') return true;
+    if (message.fromKind !== 'worker' || !wait.matchReplyTo) return false;
     const request = this.store.getMessage(wait.matchReplyTo);
-    return Boolean(request && request.kind === 'request' && request.fromId === wait.workerId && request.toKind === 'worker' && request.toId === message.fromId && (!wait.matchFrom || wait.matchFrom === message.fromId));
+    if (!request || request.kind !== 'request' || request.taskId !== message.taskId ||
+        request.groupId !== message.groupId || request.fromId !== wait.workerId || request.toKind !== 'worker') {
+      return false;
+    }
+    if (message.replyTo !== wait.matchReplyTo || request.toId !== message.fromId) return false;
+    return !wait.matchFrom || wait.matchFrom === message.fromId;
   }
 
-  private matchWait(message: Message, wait: { matchFrom: string | null; matchReplyTo: string | null; matchKinds: MessageKind[] | null }): boolean {
+  private matchWait(message: Message, wait: { groupId: string; matchFrom: string | null; matchReplyTo: string | null; matchKinds: MessageKind[] | null }): boolean {
+    if (message.groupId !== wait.groupId) return false;
     if (message.kind === 'notice' && (!wait.matchKinds?.includes('notice') || wait.matchKinds.includes('reply'))) return false;
     if (wait.matchFrom && message.fromId !== wait.matchFrom) return false;
     if (wait.matchReplyTo && message.replyTo !== wait.matchReplyTo) return false;
@@ -939,16 +983,20 @@ note: null,
   }
 
   registerWait(worker: Worker, options: WaitOptions): WaitResult {
+    const task = this.currentTaskForWorker(worker);
+    if (!task) return { immediate: false, reason: 'Worker 当前没有可等待的任务' };
     const inbox = this.store.listInbox(worker.id);
     const already = inbox.some((message) =>
-      (options.reason ?? 'reply') === 'reply' && this.matchWait(message, {
+      (options.reason ?? 'reply') === 'reply' && message.taskId === task.id && this.matchWait(message, {
+        groupId: task.groupId,
         matchFrom: options.from ?? null,
         matchReplyTo: options.replyTo ?? null,
         matchKinds: options.kinds ?? null,
       }),
     );
     const request = options.replyTo ? this.store.getMessage(options.replyTo) : null;
-    const alreadyReplied = (options.reason ?? 'reply') === 'reply' && request?.kind === 'request' && request.fromId === worker.id && request.groupId === worker.groupId && (!options.from || options.from === request.toId) && (!options.kinds || options.kinds.includes('reply')) && this.store.hasReply(request.id);
+    if (request && request.taskId !== task.id) return { immediate: false, reason: '等待的消息不属于当前任务' };
+    const alreadyReplied = (options.reason ?? 'reply') === 'reply' && request?.kind === 'request' && request.fromId === worker.id && request.groupId === task.groupId && (!options.from || options.from === request.toId) && (!options.kinds || options.kinds.includes('reply')) && this.store.hasReply(request.id);
     if (already || alreadyReplied) return { immediate: true };
 
     this.store.clearWaitsForWorker(worker.id);
@@ -956,7 +1004,7 @@ note: null,
     this.store.createWait({
       id: waitId,
       workerId: worker.id,
-      groupId: worker.groupId,
+      groupId: task.groupId,
       reason: options.reason ?? 'reply',
       matchFrom: options.from ?? null,
       matchReplyTo: options.replyTo ?? null,
@@ -1040,12 +1088,14 @@ note: null,
   waitJob(worker: Worker, jobId: string, timeoutMs: number): { immediate: boolean; job: ProcessJob | null } {
     const job = this.store.getJob(jobId);
     if (!job) return { immediate: true, job: null };
+    const task = this.currentTaskForWorker(worker);
+    if (!task || job.taskId !== task.id) return { immediate: true, job: null };
     if (job.status !== 'running') return { immediate: true, job };
     this.store.clearWaitsForWorker(worker.id);
     this.store.createWait({
       id: newWaitId(),
       workerId: worker.id,
-      groupId: worker.groupId,
+      groupId: task.groupId,
       reason: 'job',
       matchFrom: null,
       matchReplyTo: null,
@@ -1060,7 +1110,7 @@ note: null,
 
   /** 把任务目录里的真实文件按字节登记为产物。 */
   importArtifact(worker: Worker, name: string, sourcePath: string): { artifact: Artifact; reused: boolean } {
-    const task = this.store.getTaskByGroup(worker.groupId);
+    const task = this.currentTaskForWorker(worker);
     if (!task) throw new Error('任务不存在');
     if (isTerminalTask(task.status)) throw new Error(`任务已处于 ${task.status}，不能再保存产物`);
     const root = resolve(this.config.workDir, task.id);
@@ -1111,7 +1161,7 @@ note: null,
    * 文件写成功但登记失败时删掉文件，不留下"看起来成功"的状态。
    */
   saveArtifact(worker: Worker, name: string, content: string): { artifact: Artifact; reused: boolean } {
-    const task = this.store.getTaskByGroup(worker.groupId);
+    const task = this.currentTaskForWorker(worker);
     if (!task) throw new Error('任务不存在');
     if (isTerminalTask(task.status)) throw new Error(`任务已处于 ${task.status}，不能再保存产物`);
     const safeName = normalizeRelativePath(name, '产物文件名');
@@ -1215,7 +1265,7 @@ note: null,
    * 检查旧版本、检查别的文件、结论不是通过、或者检查后又改了内容，都拿不到放行。
    */
   async submitResult(worker: Worker, summary: string, artifactNames: string[]): Promise<SubmitResult> {
-    const task = this.store.getTaskByGroup(worker.groupId);
+    const task = this.currentTaskForWorker(worker);
     if (!task) return { ok: false, reason: '任务不存在' };
     if (isTerminalTask(task.status)) return { ok: false, reason: `任务已处于 ${task.status}` };
     if (task.ownerWorkerId !== worker.id) return { ok: false, reason: '只有任务负责人可以提交最终结果' };
@@ -1308,7 +1358,7 @@ note: null,
     this.store.appendEvent(task.id, worker.id, 'task.completed', summary.slice(0, 200));
     this.emit({ type: 'task.status', taskId: task.id, status: 'completed', reason: summary });
     // 协作者必须一起收敛：任务已完成，还在跑的协作者不能继续占着执行槽改业务。
-    this.convergeGroup(task.groupId, '任务已完成，协作终止');
+    this.convergeTaskMembers(task.id, '任务已完成，协作终止');
     this.router?.notify();
     return { ok: true, artifactIds };
   }
@@ -1343,7 +1393,7 @@ note: null,
     reason: string;
     refs: string[];
   }): { ok: boolean; id: string; reason?: string } {
-    const task = this.store.getTaskByGroup(input.worker.groupId);
+    const task = this.currentTaskForWorker(input.worker);
     if (!task) return { ok: false, id: '', reason: '任务不存在' };
     if (isTerminalTask(task.status)) {
       return { ok: false, id: '', reason: `任务已是终态（${task.status}），不需要重启生效` };
@@ -1367,7 +1417,7 @@ note: null,
   }
 
   report(worker: Worker, kind: 'progress' | 'fail' | 'question', body: string, refs?: MessageRefs): ReportResult {
-    const task = this.store.getTaskByGroup(worker.groupId);
+    const task = this.currentTaskForWorker(worker);
     if (!task) return { ok: false, reason: '任务不存在' };
     const message: Message = {
       id: newMessageId(),
@@ -1409,16 +1459,21 @@ note: null,
 
   sendRouterMessage(input: {
     taskId: string;
-    kind: 'update' | 'stop';
+    kind: 'notice' | 'update' | 'stop';
     workerId: string;
     body: string;
   }): { ok: boolean; messageId?: string; reason?: string } {
+    if (!['notice', 'update', 'stop'].includes(input.kind)) {
+      return { ok: false, reason: `未知消息类型：${String(input.kind)}` };
+    }
     const task = this.store.getTask(input.taskId);
     if (!task) return { ok: false, reason: '任务不存在' };
     if (isTerminalTask(task.status)) return { ok: false, reason: `任务已 ${task.status}，不接受新的指令` };
     const worker = this.store.getWorker(input.workerId);
     if (!worker) return { ok: false, reason: 'Worker 不存在' };
-    if (worker.groupId !== task.groupId) return { ok: false, reason: 'Worker 不属于该任务' };
+    if (this.currentTaskForWorker(worker)?.id !== task.id) {
+      return { ok: false, reason: 'Worker 不是该任务的当前成员' };
+    }
     if (isTerminalWorker(worker.status)) return { ok: false, reason: `Worker 已处于 ${worker.status}` };
 
     const message: Message = {
@@ -1464,7 +1519,7 @@ note: null,
     this.store.appendEvent(taskId, null, 'task.cancelled', reason);
     this.emit({ type: 'task.status', taskId, status: 'cancelled', reason });
     this.stopTaskJobs(taskId, `任务已取消：${reason}`);
-    this.closeGroup(task.groupId, `任务已取消：${reason}`);
+    this.closeTaskMembers(task.id, `任务已取消：${reason}`);
     this.router?.notify();
     return true;
   }
@@ -1506,20 +1561,11 @@ note: null,
       consumedAt: null,
       error: null,
     });
-    this.closeGroup(task.groupId, `任务失败：${reason}`);
+    this.closeTaskMembers(task.id, `任务失败：${reason}`);
     this.router?.notify();
     return true;
   }
 
-  /**
-   * 任务终结后收敛组内协作者。
-   *
-   * - 已经拿到真实结果的保留原状态（done / failed）；
-   * - 还在执行或等待的，进入 cancelled 并写明原因；
-   * - 取消它们正在进行的模型请求，阻止后续工具调用落地。
-   *
-   * 这不改变任务本身的结果：任务状态在调用前就已经定了。
-   */
   /**
    * 归档长期不用的休眠成员。
    *
@@ -1533,6 +1579,7 @@ note: null,
     for (const worker of this.store.listAllDormantWorkers()) {
       if (Date.parse(worker.updatedAt) > cutoff) continue;
       this.store.setWorkerStatus(worker.id, 'done', `超过 ${days} 天未唤醒，归档`);
+      this.store.setWorkerCurrentTask(worker.id, null);
       archived += 1;
     }
     return archived;
@@ -1547,9 +1594,12 @@ note: null,
    *
    * 真正销毁交给归档流程（长期不用的 dormant 转 done），不在这里做。
    */
-  private convergeGroup(workspaceId: string, reason: string): void {
-    for (const worker of this.store.listGroupWorkers(workspaceId)) {
-      if (isTerminalWorker(worker.status)) continue;
+  private convergeTaskMembers(taskId: string, reason: string): void {
+    for (const worker of this.store.listTaskWorkers(taskId)) {
+      if (isTerminalWorker(worker.status)) {
+        this.store.setWorkerCurrentTask(worker.id, null);
+        continue;
+      }
       this.store.clearWaitsForWorker(worker.id);
       this.runs.get(worker.id)?.revoke('任务已结束');
       this.store.setWorkerStatus(worker.id, 'dormant', reason);
@@ -1613,17 +1663,21 @@ note: null,
     return true;
   }
 
-  private closeGroup(groupId: string, reason: string, exceptWorkerId?: string): void {
-    for (const worker of this.store.listGroupWorkers(groupId)) {
-      if (worker.id === exceptWorkerId) continue;
-      if (isTerminalWorker(worker.status)) continue;
-      // 休眠成员不属于这个任务正在进行的工作：工作空间跨任务存在之后，
-      // 一次任务失败不该把上一个任务留下的待命成员一起销毁。
-      if (isDormantWorker(worker.status)) continue;
+  private closeTaskMembers(taskId: string, reason: string): void {
+    for (const worker of this.store.listTaskWorkers(taskId)) {
+      if (isTerminalWorker(worker.status)) {
+        this.store.setWorkerCurrentTask(worker.id, null);
+        continue;
+      }
+      if (isDormantWorker(worker.status)) {
+        this.store.setWorkerCurrentTask(worker.id, null);
+        continue;
+      }
       this.store.clearWaitsForWorker(worker.id);
       // 正在运行的 Worker 会在下一个检查点自行退出，这里只处理空闲/等待中的。
       if (worker.status === 'running') continue;
       this.store.setWorkerStatus(worker.id, 'cancelled', reason);
+      this.store.setWorkerCurrentTask(worker.id, null);
       this.emit({ type: 'worker.status', workerId: worker.id, status: 'cancelled' });
     }
   }
@@ -1636,7 +1690,7 @@ note: null,
    */
   enqueue(workerId: string): void {
     const target = this.store.getWorker(workerId);
-    const targetTask = target ? this.store.getTaskByGroup(target.groupId) : null;
+    const targetTask = target ? this.currentTaskForWorker(target) : null;
     if (targetTask && Number(targetTask.maintenance ?? 0) === 1) return;
     if (this.stopped) return;
     const worker = this.store.getWorker(workerId);
@@ -1709,13 +1763,14 @@ note: null,
   private async runWorkerBody(workerId: string): Promise<void> {
     let worker = this.store.getWorker(workerId);
     if (!worker || isInactiveWorker(worker.status)) return;
-    let task = this.store.getTaskByGroup(worker.groupId);
+    let task = this.currentTaskForWorker(worker);
     if (!task) {
       await this.failWorker(workerId, '任务不存在');
       return;
     }
     if (isTerminalTask(task.status)) {
       this.store.setWorkerStatus(workerId, 'cancelled', '任务已结束');
+      this.store.setWorkerCurrentTask(workerId, null);
       return;
     }
 
@@ -1838,14 +1893,13 @@ note: null,
       },
       runTool: async (call: { id: string; name: string; arguments: string }) => {
         const current = this.store.getWorker(workerId);
-        const ownerGroupId = this.store.getWorker(workerId)?.groupId;
-        const budgetTask = ownerGroupId ? this.store.getTaskByGroup(ownerGroupId) : null;
+        const budgetTask = current ? this.currentTaskForWorker(current) : null;
         if (current && budgetTask) this.noteBudget(current, budgetTask);
         const before = this.canRun(workerId, epoch);
         if (!before.ok) {
           return { outcome: { type: 'failed', content: `未执行：${before.reason}` }, terminate: true };
         }
-        const liveTask = ownerGroupId ? this.store.getTaskByGroup(ownerGroupId) : null;
+        const liveTask = current ? this.currentTaskForWorker(current) : null;
         if (liveTask && Number(liveTask.maintenance ?? 0) === 1) {
           return { outcome: { type: 'failed', content: '未执行：任务处于维护挂起' }, terminate: true };
         }
@@ -1862,7 +1916,7 @@ note: null,
     });
 
     worker = this.store.getWorker(workerId) ?? worker;
-    task = this.store.getTaskByGroup(worker.groupId) ?? task;
+    task = this.currentTaskForWorker(worker) ?? task;
 
     if (result.stop === 'cancelled') {
       this.store.appendEvent(task.id, workerId, 'run.stale', `第 ${result.steps} 步后停止：${result.reason ?? '执行被取消'}`);
@@ -1881,7 +1935,7 @@ note: null,
       const activeWaits = this.store.listActiveWaitsForWorker(workerId);
       if (pending.length > 0 && (activeWaits.length === 0 || pending.some((message) =>
         activeWaits.some((wait) => this.noticeMatchesDependency(message, wait))))) this.enqueue(workerId);
-      this.checkGroupDeadlock(worker.groupId);
+      this.checkGroupDeadlock(task.groupId);
       return;
     }
     if (result.stop === 'finish') return;
@@ -1984,7 +2038,7 @@ note: null,
         if (isTerminalTask(task.status)) return { ok: false, message: `任务已 ${task.status}` };
         this.store.setMaintenance(taskId, true);
         // 推进代次：挂起之前发出的模型响应从此不再有执行资格。
-        this.store.bumpGroupEpoch(task.groupId);
+        this.store.bumpTaskWorkerEpochs(task.id);
         this.store.appendEvent(taskId, null, 'task.maintenance', str('reason') || '维护挂起');
         for (const job of this.store.listRunningJobs(taskId)) {
           this.store.appendEvent(taskId, job.workerId, 'job.kept', `${job.id} 维护挂起期间保留运行`);
@@ -1997,7 +2051,7 @@ note: null,
         if (!task) return { ok: false, message: `任务不存在：${taskId}` };
         this.store.setMaintenance(taskId, false);
         this.store.appendEvent(taskId, null, 'task.resumed', str('reason') || '维护恢复');
-        for (const worker of this.store.listGroupWorkers(task.groupId)) {
+        for (const worker of this.store.listTaskWorkers(task.id)) {
           if (isTerminalWorker(worker.status)) continue;
           // 只解除维护造成的阻塞；provider / job / reply / user 等待保持原义。
           for (const wait of this.store.listActiveWaitsForWorker(worker.id)) {
@@ -2070,7 +2124,7 @@ note: null,
     const worker = this.store.getWorker(workerId);
     if (!worker) return { ok: false, reason: 'Worker 不存在', terminal: true };
     if (isTerminalWorker(worker.status)) return { ok: false, reason: `Worker 已 ${worker.status}`, terminal: true };
-    const task = this.store.getTaskByGroup(worker.groupId);
+    const task = this.currentTaskForWorker(worker);
     if (!task) return { ok: false, reason: '任务不存在', terminal: true };
     if (isTerminalTask(task.status)) return { ok: false, reason: `任务已 ${task.status}`, terminal: true };
     if (Number(task.maintenance ?? 0) === 1) return { ok: false, reason: '任务处于维护挂起', terminal: false };
@@ -2086,11 +2140,12 @@ note: null,
     const worker = this.store.getWorker(workerId);
     if (!worker || isTerminalWorker(worker.status)) return;
     if (worker.status !== 'running') return;
-    const task = this.store.getTaskByGroup(worker.groupId);
+    const task = this.currentTaskForWorker(worker);
     if (this.stopped) return;
     if (task && isTerminalTask(task.status)) {
       // 任务已经结束：仍在执行的协作者要收敛，不能一直挂在 running。
       this.store.setWorkerStatus(workerId, 'cancelled', `任务已 ${task.status}，协作终止`);
+      this.store.setWorkerCurrentTask(workerId, null);
       return;
     }
     if (task && Number(task.maintenance ?? 0) === 1) {
@@ -2108,7 +2163,7 @@ note: null,
 
   /** 迟到响应：只记程序事件，不伪造工具结果，也不冒充成功。 */
   private recordStaleResult(worker: Worker, result: { text: string | null; toolCalls: ToolCall[] }, reason: string): void {
-    const task = this.store.getTaskByGroup(worker.groupId);
+    const task = this.currentTaskForWorker(worker);
     // 不写成 tool 消息：没有对应调用的 tool 结果会让下一次请求结构不合法。
     // 这些调用从未派发，因此是"未执行"，不是"结果未知"。
     this.store.appendWorkerTurn({
@@ -2167,7 +2222,7 @@ note: null,
 
   private latestUpdateFor(task: Task): string | null {
     const updates = this.store
-      .listGroupMessages(task.groupId, 200)
+      .listTaskMessages(task.id, 200)
       .filter((message) => message.kind === 'update')
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
     return updates.at(-1)?.body ?? null;
@@ -2207,7 +2262,7 @@ note: null,
     await this.maybeRefreshNote(worker, task);
 
     const plan = this.planFor(worker);
-    const collaborators = this.store.listGroupWorkers(task.groupId).map((item) => {
+    const collaborators = this.listTaskWorkers(task).map((item) => {
       const wait = this.store.listActiveWaitsForWorker(item.id)[0];
       const recent = this.store.listRecentWorkerMessages(task.id, worker.id, item.id).map((message) => {
         const refs = [...(message.refs?.files ?? []), ...(message.refs?.artifacts ?? []).map((ref) => ref.artifactId)];
@@ -2417,7 +2472,7 @@ note: null,
   private toolContext(workerId: string): ToolContext {
     const worker = this.store.getWorker(workerId);
     if (!worker) throw new Error(`Worker 不存在：${workerId}`);
-    const task = this.store.getTaskByGroup(worker.groupId);
+    const task = this.currentTaskForWorker(worker);
     if (!task) throw new Error('任务不存在');
     return {
       host: this,
@@ -2473,10 +2528,10 @@ note: null,
   private pushSystemNotice(workerId: string, body: string, options: { wake?: 'none' | 'force' } = {}): void {
     const worker = this.store.getWorker(workerId);
     if (!worker) return;
-    const task = this.store.getTaskByGroup(worker.groupId);
+    const task = this.currentTaskForWorker(worker);
     this.store.insertMessage({
       id: newMessageId(),
-      groupId: worker.groupId,
+      groupId: task?.groupId ?? worker.groupId,
       taskId: task?.id ?? null,
       fromKind: 'system',
       fromId: 'system',
@@ -2540,7 +2595,7 @@ note: null,
     this.store.createWait({
       id: newWaitId(),
       workerId,
-      groupId: worker.groupId,
+      groupId: this.currentTaskForWorker(worker)?.groupId ?? worker.groupId,
       reason: 'provider',
       matchFrom: null,
       matchReplyTo: null,
@@ -2562,10 +2617,11 @@ note: null,
   private settleCancelledRun(workerId: string, reason: string): void {
     const worker = this.store.getWorker(workerId);
     if (!worker || isInactiveWorker(worker.status)) return;
-    const task = this.store.getTaskByGroup(worker.groupId);
+    const task = this.currentTaskForWorker(worker);
     if (task) this.store.appendEvent(task.id, workerId, 'run.cancelled', reason);
     if (!task || isTerminalTask(task.status)) {
       this.store.setWorkerStatus(workerId, task ? 'done' : 'cancelled', task ? '任务已结束' : '任务不存在');
+      this.store.setWorkerCurrentTask(workerId, null);
       return;
     }
     if (this.stopped) {
@@ -2581,10 +2637,10 @@ note: null,
     if (!worker || isTerminalWorker(worker.status)) return;
     this.runs.get(workerId)?.revoke('Worker 失败');
     this.store.setWorkerStatus(workerId, 'failed', reason);
-    this.store.appendEvent(this.store.getTaskByGroup(worker.groupId)?.id ?? null, workerId, 'worker.failed', reason);
+    const task = this.currentTaskForWorker(worker);
+    this.store.appendEvent(task?.id ?? null, workerId, 'worker.failed', reason);
     this.emit({ type: 'worker.status', workerId, status: 'failed' });
     this.emit({ type: 'error', text: `Worker ${workerId} 失败：${reason}` });
-    const task = this.store.getTaskByGroup(worker.groupId);
     if (!task) return;
     if (task.ownerWorkerId === workerId) {
       await this.failTask(task.id, `负责人失败：${reason}`);
@@ -2600,7 +2656,9 @@ note: null,
   }
 
   private checkGroupDeadlock(groupId: string): void {
-    const workers = this.store.listGroupWorkers(groupId).filter((worker) => !isInactiveWorker(worker.status));
+    const task = this.store.getTaskByGroup(groupId);
+    if (!task) return;
+    const workers = this.store.listTaskWorkers(task.id).filter((worker) => !isInactiveWorker(worker.status));
     const byId = new Map(workers.map((worker) => [worker.id, worker]));
     const edges = new Map<string, { target: string; waitId: string; createdAt: string }>();
     for (const worker of workers) {
@@ -2682,10 +2740,12 @@ note: null,
         this.enqueue(worker.id);
         continue;
       }
+      const task = this.currentTaskForWorker(worker);
       const request = wait.matchReplyTo ? this.store.getMessage(wait.matchReplyTo) : null;
-      const target = request && request.kind === 'request' && request.fromId === worker.id && request.groupId === worker.groupId && request.toKind === 'worker'
+      const target = task && request && request.kind === 'request' && request.taskId === task.id &&
+        request.fromId === worker.id && request.groupId === task.groupId && request.toKind === 'worker'
         ? this.store.getWorker(request.toId) : null;
-      const details = request && target && target.groupId === worker.groupId
+      const details = task && request && target && this.currentTaskForWorker(target)?.id === task.id
         ? `观察时间 ${new Date(now).toISOString()}；请求 ${request.id} 状态 ${request.status}；接收者 ${target.id} 状态 ${target.status}，有效等待 ${this.store.listActiveWaitsForWorker(target.id).length} 条。状态是当时的快照。`
         : `观察时间 ${new Date(now).toISOString()}；请求或接收者状态不可确认。`;
       this.pushSystemNotice(worker.id, `等待已超时，没有收到匹配回复。${details}请根据当前信息决定下一步。`);
@@ -2769,9 +2829,10 @@ note: null,
     for (const worker of this.store.listWorkers()) {
       // 休眠成员的任务早就结束了，这正是它休眠的原因；恢复流程不该碰它。
       if (isInactiveWorker(worker.status)) continue;
-      const task = this.store.getTaskByGroup(worker.groupId);
+      const task = this.currentTaskForWorker(worker);
       if (!task || isTerminalTask(task.status)) {
         if (worker.status !== 'cancelled') this.store.setWorkerStatus(worker.id, 'cancelled', '任务已结束');
+        this.store.setWorkerCurrentTask(worker.id, null);
         continue;
       }
 

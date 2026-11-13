@@ -99,12 +99,18 @@ test('成员限制：任务完成后成员休眠，同职责可按需创建', as
     assert.equal(dormant.length, 1, '任务结束后成员应当休眠而不是消失');
     assert.equal(dormant[0]!.currentTaskId, null, '休眠时不该还挂着任务');
 
+    const next = harness.runtime.createTask({
+      ...brief,
+      title: '下一个任务',
+      goal: 'g',
+      workspaceId: task.groupId,
+    });
     // 同职责可能有不同工作或独立判断，不应按名字拒绝
-    const dup = harness.runtime.createCollaborator(owner, brief.ownerRole, '再做一遍');
+    const dup = harness.runtime.createCollaborator(next.owner, brief.ownerRole, '再做一遍');
     assert.equal(dup.ok, true, dup.reason);
 
     // 不同职责可以
-    const other = harness.runtime.createCollaborator(owner, '独立检查', '核对产物');
+    const other = harness.runtime.createCollaborator(next.owner, '独立检查', '核对产物');
     assert.equal(other.ok, true, `不同职责应当放行（${other.reason ?? ''}）`);
   } finally {
     await harness.cleanup();

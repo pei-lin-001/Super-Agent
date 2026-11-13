@@ -67,7 +67,7 @@ export async function startRepl(options: ReplOptions): Promise<void> {
   });
 
   const printTask = (task: Task): void => {
-    const workers = runtime.listGroupWorkers(task.groupId);
+    const workers = runtime.listTaskWorkers(task);
     write(
       [
         `任务 ${task.id}｜${task.title}`,
@@ -111,7 +111,7 @@ export async function startRepl(options: ReplOptions): Promise<void> {
           write(
             tasks
               .map((task) => {
-                const workers = runtime.listGroupWorkers(task.groupId);
+                const workers = runtime.listTaskWorkers(task);
                 return `${pad(task.id, 14)} ${pad(task.status, 10)} 负责人=${task.ownerWorkerId ?? '-'} Worker=${workers.length}  ${task.title}`;
               })
               .join('\n'),
@@ -126,13 +126,13 @@ export async function startRepl(options: ReplOptions): Promise<void> {
           return true;
         }
         printTask(task);
-        printMessages(runtime.store.listGroupMessages(task.groupId, 200).slice(-8), '最近消息');
+        printMessages(runtime.store.listTaskMessages(task.id, 200).slice(-8), '最近消息');
         return true;
       }
       case 'workers': {
         const task = argument ? runtime.store.getTask(argument) : null;
         const workers: Worker[] = task
-          ? runtime.listGroupWorkers(task.groupId)
+          ? runtime.listTaskWorkers(task)
           : runtime.store.listWorkers();
         if (workers.length === 0) {
           write('（暂无 Worker）');
@@ -163,7 +163,7 @@ export async function startRepl(options: ReplOptions): Promise<void> {
           return true;
         }
         printTask(task);
-        printMessages(runtime.store.listGroupMessages(task.groupId, 500), '完整消息链');
+        printMessages(runtime.store.listTaskMessages(task.id, 500), '完整消息链');
         const events = runtime.store.listEvents(task.id, 200);
         write(
           ['事件时间线：', ...events.map((event) => `  ${event.createdAt} ${pad(event.type, 18)} ${event.detail ?? ''}`)].join('\n'),

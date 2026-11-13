@@ -281,7 +281,10 @@ export class WatchdogSession {
     lines.push(`# ${task.title}（${task.id}）状态 ${task.status}｜要求版本 ${task.reviewEpoch}`);
     lines.push(`目标：${task.goal}`);
     lines.push(`完成条件：${task.doneCriteria || '(未填写)'}`);
-    for (const worker of store.listGroupWorkers(task.groupId)) {
+    lines.push(`历史负责人：${task.ownerWorkerId ?? '无'}`);
+    const workers = store.listTaskWorkers(task.id);
+    if (workers.length === 0) lines.push('当前任务成员：无');
+    for (const worker of workers) {
       lines.push(`\n## Worker ${worker.id}（${worker.role}）${worker.status}｜${worker.stepCount} 步`);
       const waits = store.listActiveWaitsForWorker(worker.id);
       for (const wait of waits) lines.push(`  等待 ${wait.reason}${wait.matchReplyTo ? ` 请求:${wait.matchReplyTo}` : ''}${wait.matchFrom ? ` 来源:${wait.matchFrom}` : ''}${wait.matchJob ? ` 作业:${wait.matchJob}` : ''}`);

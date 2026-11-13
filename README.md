@@ -67,14 +67,27 @@
 
 表：`task` `worker` `message` `artifact` `wait_record` `review` `worker_turn` `router_turn` `event`。
 
-任务与群组 1:1：
+`workspace` 是长期容器；`task.groupId` 仍是单次任务的可见性边界，而成员的 `group_id`
+在迁移期保存 workspace id。判断成员“当前服务哪项任务”只看非空 `current_task_id`，
+不能用 `worker.group_id` 反查任务：
 
 ```ts
-Task   { id, groupId, title, goal, brief, doneCriteria, requireReview, ownerWorkerId, status, ... }
-Worker { id, groupId, parentId?, role, brief, status, stepCount, model, lastError? }
+Workspace { id, title, brief, sessionKey?, conversationId?, status, ... }
+Task      { id, groupId, workspaceId, title, goal, brief, doneCriteria, requireReview, ownerWorkerId, status, ... }
+Worker    { id, groupId, workspaceId, currentTaskId?, parentId?, role, brief, status, stepCount, model, lastError? }
 Message{ id, groupId, taskId?, fromKind, fromId, toKind, toId, kind, body, payload?, replyTo?,
          refs?, dedupeKey?, status, createdAt, deliveredAt?, consumedAt? }
 ```
+
+创建任务和协作者时程序显式写入 `currentTaskId`；收件箱、消息投递、等待唤醒、工具上下文、
+产物、提交、关闭和暂停都按这个字段校验任务归属。休眠成员的 `currentTaskId` 明确为 `NULL`。
+任务进入终态时会清除成员归属；仍在运行的成员在下一个执行检查点收敛后再清除。
+旧库只有在成员可运行、`current_task_id IS NULL` 且所在组恰有一个活跃任务时才做兼容回填。
+已有非空但错误的归属不会被“最近任务”或创建时间自动猜测修正；这类旧运行需要显式诊断，
+跨 workspace 的 `currentTaskId` 会被运行时拒绝。
+
+迁移边界：workspace 回填仍按 `task.group_id` 执行 `INSERT ... SELECT`。若旧库里多个任务已经
+复用同一 group 且 workspace 行缺失，这次回填可能额外留下一个空 workspace；本轮未做旧数据重分配。
 
 ### 状态
 
@@ -104,7 +117,7 @@ Message: queued → delivered → consumed
 | `result` | Worker→Router | 交付（程序在提交校验通过后生成） |
 | `request` | Worker→Worker | `intent=help` 普通求助；`intent=review` 正式检查 |
 | `reply` | Worker→Worker | 答复，必须带 `reply_to`；回复正式检查必须带 `outcome` |
-| `notice` | 系统或 Worker→Worker | 系统提示，或同组成员间点对点的进度与关键反馈 |
+| `notice` | Router/系统/Worker→Worker | 系统提示、Router 的事实或澄清，或当前任务成员间点对点的进度与关键反馈 |
 
 消息支持 `dedupe_key`：同组内重复提交相同键只落一条，用于安全重试。
 
@@ -128,14 +141,16 @@ Message: queued → delivered → consumed
 
 正式检查请求在投递前就会被校验：`intent=review` 必须带 `refs.artifacts`，且每条都必须是**本任务**已登记的产物 id。
 只写 `refs.files: ["report.md"]` 这种路径不算检查对象，请求当场拒绝、不投递、不产生空检查记录。
-错误信息会直接告诉模型先用 `artifact_save` 保存，再把 `art_xxx` 放进 `refs`。
+错误信息会直接告诉模型先用 `artifact_save` 或 `artifact_import` 登记，再把 `art_xxx` 放进 `refs`。
 
 - 只有 `intent=review` 的 request 才产生检查记录；`intent=help` 只是求助。
 - 检查记录以「一次请求 × 一份产物」为粒度；一次请求中的每个产物 ID 都是检查对象，同一回复的结论分别写入各条记录。仅作为背景的文件可用路径引用。
 - `require_review` 默认关闭；开启时仅对最终提交的每个产物要求当前版本及要求下的有效 `approved`，普通求助和自愿核对不依赖该门槛。
 - 回复检查必须给 `outcome`：`approved` / `changes_required` / `inconclusive`。程序只认 `approved`，
   不解析自然语言里的"通过"。
-- 同组成员可点对点发送 `notice`；关联请求时，只有请求的发送者和接收者可互发，`reply_to` 指向该请求。通知不带 `outcome`，不代替唯一的正式 `reply`，也不产生检查结论。等待特定请求答复的发送者收到接收者的关联通知时会被唤醒，但原等待仍有效；其他通知在下次运行时可见。`wait_for` 默认匹配非 `notice` 消息；显式用 `kinds` 等待 `notice` 且不包含 `reply` 时，通知可结束该次事件等待。
+- 当前任务的成员可以跨创建来源直接点对点发送 `notice`。Peer notice 关联请求时，`reply_to` 指向该请求，只有请求双方可使用；它不带 `outcome`，不代替唯一的正式 `reply`，也不产生检查结论。等待特定请求答复的发送者收到关联通知时会被临时唤醒，但原等待仍有效。
+- Router 可用 `send_to_worker(kind=notice)` 向当前任务成员传递事实、证据、澄清或维护答复；它不修改任务 brief，也不抬升要求版本。Router notice 可临时唤醒任意 `reason='reply'` 的等待，包括只带 `from` 或没有关联字段的等待，但不会解除等待；非 reply 等待不会被它唤醒。
+- `wait_for` 默认匹配非 `notice` 消息；显式用 `kinds` 等待 `notice` 且不包含 `reply` 时，notice 可结束该次事件等待。
 - 检查旧版本、检查别的文件、结论不是通过、检查后又改了内容，都不能放行。
 - 用户补充要求（Router 的 `update`）会让要求版本 `epoch` 加一，旧结论立即失效。
 - 检查通过后如果没有再改产物，可以直接提交，不需要重复检查。
@@ -216,6 +231,9 @@ Message: queued → delivered → consumed
 - Worker 调 `wait_for` 时写 `wait_record`、状态转 `waiting`、**立刻让出并发槽，期间零模型调用**。
 - 指定请求的等待超时后，通知附上观察时间、可确认的请求投递状态、接收者状态及其有效等待数量；这是当时快照，不代表故障判断。
 - 回复到达时程序匹配 `wait` 并把它放回队列；`update` / `stop` 会无视等待条件直接唤醒，保证互等时收件箱不被锁死。
+- Router notice 对 reply 等待只做一次临时唤醒，等待记录和真正 reply 的匹配保持不变。
+- 当前实现每个 Worker 同时只保留一个 `wait_record`。已有 reply 等待期间到达的普通 peer
+  `request` 会留在精确过滤后的当前任务收件箱，等这次等待结束后的下一轮可见；它不会并行替换或打断原等待。需要多依赖并存时应另开设计，不能把它误说成已经支持。
 - 当同组成员对具体请求的回复依赖形成闭环时，程序解除环内最早的一条等待并提示该成员；无需全组都等待。作业、提供方、用户或维护等待不会被误当作回复闭环。
 - 提供方（模型服务）暂时不可用时，Worker 转 `waiting` 并写入 `wait_record(reason='provider')`，
   60 秒后由 `tick()` 自动恢复——这个等待点是持久化的，重启后照样生效。
@@ -534,7 +552,8 @@ Router 与 Watchdog 的内部消息保存在数据库中：新消息会尝试唤
 
 ### 挂起在执行边界生效
 
-`pause_task` 会推进群组的**运行代次**（`worker.run_epoch`）。每次模型请求返回、每个工具调用之前都会核对代次：
+`pause_task` 会推进**当前任务成员**的运行代次（`worker.run_epoch`），不会影响同一 workspace
+中其他活跃任务的成员。每次模型请求返回、每个工具调用之前都会核对代次：
 
 - 挂起之后返回的响应 → 不执行任何工具，留一条「结果未知」记录（不冒充未执行，也不冒充成功）；
 - 排队中的 Worker 受 `maintenance` 约束；
@@ -952,6 +971,7 @@ pnpm accept:channel         # 进程级验收：本地假平台，真实启动 d
 ## 13. 已知限制
 
 - 长任务默认**不会**因为步数被中断（`MAX_STEPS_PER_WORKER` / `MAX_STEPS_PER_GROUP` 默认 0，只写 `budget.*` 事件）；显式设成 >0 才恢复"到点判死"。代价是跑飞的任务只能靠人停。
+- `MAX_STEPS_PER_GROUP` 的提醒仍按成员的 `group_id`（迁移期即 workspace）汇总；复用 workspace 时可能把相邻任务步数算进来。它只写提醒事件，不改变执行资格。
 - 单条工具结果超过 8000 字符会被截断并提示用 `offset` 续读；模型不一定照着做。
 - 外部副作用不保证精确一次。写文件类工具用 `dedupe_key` 与版本号降低重复风险，但这不等于事务回滚。
 - `requireReview` 需要 Router 在建任务时显式声明；程序不解析自然语言里的"要检查"。
@@ -972,6 +992,7 @@ pnpm accept:channel         # 进程级验收：本地假平台，真实启动 d
   （实测 49KB→约 500 token，288KB 与 1MB 都是 1056 token），所以撑爆的不是 token
   而是上传体积。
 - 微信 `context_token` 是回复上下文而非长期推送凭据，缺它时不保证主动推送能送达。
+- 本轮新增的多路径协作测试使用确定性脚本化 mock、真实 Runtime/SQLite 和实际工具链；没有调用付费真实模型。它只证明这些通路能被实际工具串通，不证明真实模型会自主选择，也不验证某个强模型的实际效果；模型别名路由由单独的模型回归覆盖。
 
 ## 14. 恢复范围（明确边界）
 

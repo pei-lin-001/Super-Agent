@@ -349,3 +349,271 @@ test('协作：自主创建协作者、直接沟通、检查引发修改、旧�
     await harness.cleanup();
   }
 });
+
+test('多样协作通路：模拟模型经实际工具走通跨创建来源互通、notice 与同级求助', async () => {
+  let investigator = '';
+  let evidenceWorker = '';
+  let judge = '';
+  let ownerWorker = '';
+  let ownerRequest = '';
+  let investigationRequest = '';
+  let judgeRequest = '';
+
+  const owner = (step: number, request: ChatRequest) => {
+    switch (step) {
+      case 0:
+        return mockReply({
+          toolCalls: [{
+            name: 'create_worker',
+            arguments: { role: '调查负责人', brief: '组织证据与独立判断，最后给出可交付结论' },
+          }],
+        });
+      case 1:
+        investigator = firstMatch(/已创建协作者 (w\d+_[0-9a-f]+)/, toolResult(request));
+        return mockReply({
+          toolCalls: [{
+            name: 'message_send',
+            arguments: {
+              to: investigator,
+              kind: 'request',
+              intent: 'help',
+              body: '请调查问题，必要时自行找证据与同级判断，最后给我可交付结论。',
+            },
+          }],
+        });
+      case 2:
+        ownerRequest = firstMatch(/已投递消息 (msg_[0-9a-f]+)/, toolResult(request));
+        return mockReply({
+          toolCalls: [{
+            name: 'wait_for',
+            arguments: { from: investigator, kinds: ['reply'], timeout_seconds: 5 },
+          }],
+        });
+      case 3: {
+        const inbox = inboxOf(request);
+        assert.match(inbox, /B 的补充证据/, '负责人应实际收到 B 的直接 notice');
+        assert.match(inbox, /A 汇总结论/, '负责人应实际收到 A 的正式回复');
+        return mockReply({
+          toolCalls: [{
+            name: 'artifact_save',
+            arguments: {
+              name: 'delivery.md',
+              content: '# 交付\n\n结论来自 A 汇总，并采用 B 的补充证据，经 C 同级判断。\n',
+            },
+          }],
+        });
+      }
+      case 4:
+        return mockReply({
+          toolCalls: [{
+            name: 'submit_result',
+            arguments: { summary: '已消费协作者信息并交付', artifacts: ['delivery.md'] },
+          }],
+        });
+      default:
+        return mockReply({ text: '已交付。' });
+    }
+  };
+
+  const investigatorScript = (step: number, request: ChatRequest) => {
+    switch (step) {
+      case 0:
+        ownerWorker = firstMatch(/来自 (w\d+_[0-9a-f]+)/, inboxOf(request));
+        return mockReply({
+          toolCalls: [{
+            name: 'create_worker',
+            arguments: { role: '证据 B', brief: '独立找一条能改变结论的证据，并直接同步给当前任务的相关成员' },
+          }],
+        });
+      case 1:
+        evidenceWorker = firstMatch(/已创建协作者 (w\d+_[0-9a-f]+)/, toolResult(request));
+        return mockReply({
+          toolCalls: [{
+            name: 'message_send',
+            arguments: {
+              to: evidenceWorker,
+              kind: 'request',
+              intent: 'help',
+              body: '请找一条能改变结论的证据，先用 notice 同步，再正式回复我。',
+            },
+          }],
+        });
+      case 2:
+        investigationRequest = firstMatch(/已投递消息 (msg_[0-9a-f]+)/, toolResult(request));
+        return mockReply({
+          toolCalls: [{
+            name: 'wait_for',
+            arguments: { from: evidenceWorker, kinds: ['reply'], timeout_seconds: 5 },
+          }],
+        });
+      case 3: {
+        const inbox = inboxOf(request);
+        assert.match(inbox, /给 A 的临时证据/, 'A 应收到 B 的直接 notice');
+        assert.match(inbox, /B 正式证据结论/, 'A 应收到 B 的正式 reply');
+        return mockReply({
+          toolCalls: [{
+            name: 'create_worker',
+            arguments: { role: '同级判断 C', brief: '独立判断证据如何影响结论，给出简洁回复' },
+          }],
+        });
+      }
+      case 4:
+        judge = firstMatch(/已创建协作者 (w\d+_[0-9a-f]+)/, toolResult(request));
+        return mockReply({
+          toolCalls: [{
+            name: 'message_send',
+            arguments: {
+              to: judge,
+              kind: 'request',
+              intent: 'help',
+              body: '请独立判断 B 的证据是否支持当前结论，并说明限制。',
+            },
+          }],
+        });
+      case 5:
+        judgeRequest = firstMatch(/已投递消息 (msg_[0-9a-f]+)/, toolResult(request));
+        return mockReply({
+          toolCalls: [{
+            name: 'wait_for',
+            arguments: { from: judge, kinds: ['reply'], timeout_seconds: 5 },
+          }],
+        });
+      case 6: {
+        assert.match(inboxOf(request), /C 同级判断/, 'A 应实际收到 C 的同级回复');
+        return mockReply({
+          toolCalls: [{
+            name: 'message_send',
+            arguments: {
+              to: ownerWorker,
+              kind: 'reply',
+              reply_to: ownerRequest,
+              body: 'A 汇总结论：B 的证据成立，C 的判断支持交付。',
+            },
+          }],
+        });
+      }
+      default:
+        return mockReply({ text: '调查完成。' });
+    }
+  };
+
+  const evidence = (step: number, request: ChatRequest) => {
+    if (step > 0) return mockReply({ text: '证据已同步。' });
+    const inbox = inboxOf(request);
+    const requestId = firstMatch(/\[(msg_[0-9a-f]+)\]/, inbox);
+    const requester = firstMatch(/来自 (w\d+_[0-9a-f]+)/, inbox);
+    const ownerId = firstMatch(/- (w\d+_[0-9a-f]+)｜总负责人/, allText(request));
+    return mockReply({
+      toolCalls: [
+        {
+          name: 'message_send',
+          arguments: {
+            to: ownerId,
+            kind: 'notice',
+            body: 'B 的补充证据：直接通知负责人和 A，不代替正式回复。',
+          },
+        },
+        {
+          name: 'message_send',
+          arguments: {
+            to: requester,
+            kind: 'notice',
+            reply_to: requestId,
+            body: '给 A 的临时证据：先同步，正式回复随后。',
+          },
+        },
+        {
+          name: 'message_send',
+          arguments: {
+            to: requester,
+            kind: 'reply',
+            reply_to: requestId,
+            body: 'B 正式证据结论：材料支持当前方向。',
+          },
+        },
+      ],
+    });
+  };
+
+  const judgeScript = (step: number, request: ChatRequest) => {
+    if (step > 0) return mockReply({ text: '判断已回复。' });
+    const inbox = inboxOf(request);
+    return mockReply({
+      toolCalls: [{
+        name: 'message_send',
+        arguments: {
+          to: firstMatch(/来自 (w\d+_[0-9a-f]+)/, inbox),
+          kind: 'reply',
+          reply_to: firstMatch(/\[(msg_[0-9a-f]+)\]/, inbox),
+          body: 'C 同级判断：证据支持交付；结论仍应保留材料覆盖范围这一限制。',
+        },
+      }],
+    });
+  };
+
+  let routerStep = 0;
+  const router: MockHandler = () => {
+    if (routerStep++ > 0) return mockReply({ text: '任务已建立。' });
+    return mockReply({
+      toolCalls: [{
+        name: 'create_task',
+        arguments: {
+          title: '多样协作通路',
+          goal: '通过实际工具通路形成有证据的交付',
+          brief: '验证创建、notice、同级求助和回复能否串联',
+          done_criteria: '负责人消费协作者信息并交付',
+          owner_role: '总负责人',
+          owner_brief: '按问题需要开展协作',
+        },
+      }],
+    });
+  };
+
+  const harness = await createHarness({
+    router,
+    worker: scripted({
+      总负责人: owner,
+      调查负责人: investigatorScript,
+      '证据 B': evidence,
+      '同级判断 C': judgeScript,
+    }),
+  });
+  try {
+    await harness.router.handleUserMessage('请自主组织调查并交付');
+    await harness.runtime.waitForIdle(15_000);
+
+    const task = harness.store.listTasks()[0]!;
+    const workers = harness.store.listGroupWorkers(task.groupId);
+    const messages = harness.store.listTaskMessages(task.id);
+    assert.equal(
+      harness.store.getTask(task.id)?.status,
+      'completed',
+      [
+        harness.store.getTask(task.id)?.closeReason ?? '',
+        ...workers.map((worker) => `${worker.role}:${worker.status}:${worker.brief}`),
+        ...messages.map((message) => `${message.kind}:${message.fromId}->${message.toId}:${message.status}:${message.body.slice(0, 80)}`),
+        ...(investigator
+          ? harness.store.listWorkerTurns(investigator, 100)
+            .map((turn) => `A turn#${turn.seq}:${turn.role}:${(turn.content ?? '').slice(0, 160)}`)
+          : []),
+      ].join('\n'),
+    );
+    assert.equal(workers.length, 4, '应有负责人、A、B、C 四名成员');
+    assert.ok(workers.every((worker) => worker.groupId === task.groupId));
+    assert.equal(new Set([investigator, evidenceWorker, judge]).size, 3);
+
+    const notices = messages.filter((message) => message.kind === 'notice');
+    assert.equal(notices.filter((message) => message.fromId === evidenceWorker && message.toId === investigator).length, 1);
+    assert.equal(notices.filter((message) => message.fromId === evidenceWorker && message.toId === task.ownerWorkerId).length, 1);
+    assert.equal(messages.filter((message) => message.kind === 'request' && message.fromId === investigator && message.toId === judge).length, 1);
+    assert.equal(messages.filter((message) => message.kind === 'reply' && message.replyTo === judgeRequest).length, 1);
+    assert.equal(messages.filter((message) => message.kind === 'reply' && message.replyTo === ownerRequest).length, 1);
+    assert.equal(messages.filter((message) => message.replyTo === investigationRequest && message.kind === 'reply').length, 1);
+    assert.ok(notices.every((message) => message.status === 'consumed'), 'B 的直接 notice 应被实际读到');
+    assert.equal(harness.store.listArtifacts(task.id).length, 1);
+    assert.ok(workers.find((worker) => worker.id === investigator)?.model);
+    assert.equal(workers.find((worker) => worker.id === judge)?.status, 'dormant');
+  } finally {
+    await harness.cleanup();
+  }
+});

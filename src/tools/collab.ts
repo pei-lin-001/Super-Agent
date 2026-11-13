@@ -154,7 +154,7 @@ export const collabTools: ToolDefinition[] = [
   {
     name: 'submit_result',
     description:
-      '任务负责人提交最终结果。程序校验所提交产物的存在和指纹、未处理的补充要求；仅任务要求正式检查时，所提交产物还须有当前要求和版本下的 approved。',
+      '任务负责人提交最终结果。程序校验所提交产物已经通过 artifact_save 或 artifact_import 登记、文件指纹一致，并检查未处理的补充要求；仅任务要求正式检查时，所提交产物还须有当前要求和版本下的 approved。',
     parameters: {
       type: 'object',
       properties: {
@@ -231,7 +231,7 @@ export const collabTools: ToolDefinition[] = [
     description:
       '向 Watchdog 提维护申请。目前只有 kind=restart：你改的代码需要主系统重启才能生效时用。' +
       'Watchdog 是独立进程，会核验当前版本、范围、命令与结果位置，按缺口和风险复查并决定做不做。' +
-      '调用前必须先 artifact_save 落盘：重启会中断你，成果不能只存在上下文里。' +
+      '调用前必须先把成果登记为产物（artifact_save、artifact_import，或编辑后重新 import）：重启会中断你，成果不能只存在上下文里。' +
       '只给可核对的东西：commit、改了哪些文件、跑过什么命令，不要写"已完成""测试通过"这类结论。',
     parameters: {
       type: 'object',

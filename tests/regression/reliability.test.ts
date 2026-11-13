@@ -705,7 +705,8 @@ test('取消：任务结束后到达的回复被拒绝，不会让任务复活',
       body: '迟到的回复',
     });
     assert.equal(late.ok, false);
-    assert.match(late.reason ?? '', /已处于 cancelled/);
+    assert.match(late.reason ?? '', /当前没有任务/, '任务终止后成员已解除当前任务归属');
+    assert.equal(harness.store.getWorker(helper.workerId!)?.currentTaskId, null);
     assert.equal(harness.store.getTask(task.id)!.status, 'cancelled');
     assert.equal(toolResult({ messages: [] } as unknown as ChatRequest), null);
   } finally {

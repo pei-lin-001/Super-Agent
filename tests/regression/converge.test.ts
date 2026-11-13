@@ -140,19 +140,11 @@ test('负责人完成、协作者仍在等待时：任务终结后协作者收�
       ownerBrief: '完成交付',
     });
     // 协作者在负责人完成之前就已经在等模型响应——这才是要覆盖的场景
-    const collaborator = h.store.createWorker({
-      id: 'w2_late',
-      groupId: task.groupId,
-      parentId: owner.id,
-      role: '协作者',
-      brief: '会迟到',
-      status: 'queued',
-      model: null,
-      stepCount: 0,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      lastError: null,
-    });
+    const created = h.runtime.createCollaborator(owner, '协作者', '会迟到');
+    assert.equal(created.ok, true, created.reason);
+    const collaborator = h.store.getWorker(created.workerId!)!;
+    assert.equal(collaborator.currentTaskId, task.id, '协作者必须绑定当前任务');
+    h.store.setWorkerStatus(collaborator.id, 'queued');
     h.runtime.enqueue(collaborator.id);
     assert.ok(await waitFor(() => holds > 0, 10_000), '协作者必须真的发出了模型请求');
     assert.equal(h.store.getWorker(collaborator.id)?.status, 'running', '完成之前协作者确实在执行');

@@ -45,14 +45,17 @@ const ROUTER_TOOLS: ToolSchema[] = [
   },
   {
     name: 'send_to_worker',
-    description: '向某个 Worker 补充要求（update）或要求停止（stop）。消息会直接进入它的收件箱。',
+    description:
+      '向某个当前任务的 Worker 发送 notice、补充要求（update）或停止指令（stop）。' +
+      'notice 用于事实、证据、无需改变要求的澄清或维护答复，不改变任务要求与检查版本；' +
+      'update 只用于确实新增或改变要求，会使旧检查失效。',
     parameters: {
       type: 'object',
       properties: {
         task_id: { type: 'string' },
         worker_id: { type: 'string' },
-        kind: { type: 'string', enum: ['update', 'stop'] },
-        body: { type: 'string', description: '补充要求或停止原因' },
+        kind: { type: 'string', enum: ['notice', 'update', 'stop'] },
+        body: { type: 'string', description: '通知内容、补充要求或停止原因' },
       },
       required: ['task_id', 'worker_id', 'kind', 'body'],
     },
@@ -925,7 +928,7 @@ export class Router {
           const result = this.runtime.sendRouterMessage({
             taskId: allowed.task.id,
             workerId: text(args['worker_id'], 'worker_id'),
-            kind: text(args['kind'], 'kind') as 'update' | 'stop',
+            kind: text(args['kind'], 'kind') as 'notice' | 'update' | 'stop',
             body: text(args['body'], 'body'),
           });
           return result.ok ? `已投递消息 ${result.messageId}` : `投递失败：${result.reason}`;
@@ -1109,8 +1112,9 @@ export class Router {
             );
           if (!allowed.ok) return allowed.message;
           const task = allowed.task;
-          const workers = this.runtime.listGroupWorkers(task.groupId);
-          const recent = this.runtime.store.listGroupMessages(task.groupId, 20).slice(-10);
+          const workers = this.runtime.listTaskWorkers(task);
+          const recent = this.runtime.store.listTaskMessages(task.id, 20).slice(-10);
+          const owner = task.ownerWorkerId ? this.runtime.store.getWorker(task.ownerWorkerId) : null;
           const lines = [
             `任务 ${task.id}｜${task.title}｜状态 ${task.status}`,
             `目标：${task.goal}`,
@@ -1118,8 +1122,12 @@ export class Router {
             `要求检查：${task.requireReview ? '是' : '否'}`,
             `已登记产物：`,
             ...this.runtime.store.listArtifacts(task.id).map((artifact) => `  - ${artifact.id}｜${artifact.name}｜v${artifact.version}｜sha256 ${artifact.sha256}`),
-            `Worker：`,
+            `当前任务成员：`,
             ...workers.map((worker) => `  - ${worker.id}｜${worker.role}｜${worker.status}｜步数 ${worker.stepCount}`),
+            ...(workers.length === 0 ? ['  - （无）'] : []),
+            ...(owner && !workers.some((worker) => worker.id === owner.id)
+              ? [`历史负责人：${owner.id}｜${owner.role}｜${owner.status}`]
+              : []),
             `最近消息：`,
             ...recent.map((message) => `  - [${message.id}] ${message.fromId}→${message.toId} ${message.kind} ${message.status}：${message.body.slice(0, 120)}`),
           ];
@@ -1238,19 +1246,18 @@ export class Router {
         const workers = this.runtime.store.listGroupWorkers(space.id);
         const active = workers.filter((worker) => !isTerminalWorker(worker.status) && !isDormantWorker(worker.status));
         const dormantCount = workers.filter((worker) => isDormantWorker(worker.status)).length;
-        const latestResult = [...this.runtime.store.listGroupMessages(space.id, 200)]
+        // 空间总览看全空间成员是合理的；消息结论仍必须归到具体任务，避免旧任务结果串到新任务。
+        const latestTask = this.runtime.store.latestTaskForWorkspace(space.id);
+        const latestResult = [...(latestTask ? this.runtime.store.listTaskMessages(latestTask.id, 200) : [])]
           .reverse()
           .find((message) => message.kind === 'result');
         return {
           id: space.id,
           title: space.title,
           status: space.status,
-          currentTask: (() => {
-            // 任务完成后成员休眠、currentTaskId 归空，所以这里取「最近一条任务」，
-            // 而不是「谁现在挂在这个任务上」——Router 要靠它认产物归谁。
-            const task = this.runtime.store.latestTaskForWorkspace(space.id);
-            return task ? { id: task.id, title: task.title, status: task.status } : null;
-          })(),
+          // 任务完成后成员休眠、currentTaskId 归空，所以空间卡片取「最近一条任务」
+          // 帮 Router 认产物归谁；成员列表仍展示整个 workspace。
+          currentTask: latestTask ? { id: latestTask.id, title: latestTask.title, status: latestTask.status } : null,
           active: active.slice(0, 6).map((worker) => ({
             workerId: worker.id,
             role: worker.role,

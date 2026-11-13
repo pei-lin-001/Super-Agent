@@ -349,7 +349,8 @@ export class Store {
         FROM task t
        WHERE NOT EXISTS (SELECT 1 FROM workspace w WHERE w.id = t.group_id)
     `);
-    // 成员的当前任务：取它所在组里最早的活跃任务，没有就为空（休眠）。
+    // 老库补 current_task_id：只处理确实需要调度、且所在组只有一项活跃任务的成员。
+    // dormant/done/failed/cancelled 的 null 是明确语义，不能因为同组还有任务就补回。
     this.db.exec(`
       UPDATE worker
          SET current_task_id = (
@@ -359,6 +360,12 @@ export class Store {
             ORDER BY t.created_at ASC LIMIT 1
          )
        WHERE current_task_id IS NULL
+         AND status NOT IN ('dormant','done','failed','cancelled')
+         AND (
+           SELECT COUNT(*) FROM task t2
+            WHERE t2.group_id = worker.group_id
+              AND t2.status NOT IN ('completed','cancelled','failed')
+         ) = 1
     `);
     // 索引必须建在补列之后：老库里这两列还不存在，先建索引会直接报 no such column。
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_router_turn_session ON router_turn(session_key, created_at)');
@@ -632,6 +639,14 @@ export class Store {
     return this.all('SELECT * FROM worker WHERE group_id = ? ORDER BY created_at ASC', groupId).map(mapWorker);
   }
 
+  /** 当前确实在为某项任务工作的成员；跨任务复用 workspace 时按 current_task_id 取。 */
+  listTaskWorkers(taskId: string): Worker[] {
+    return this.all(
+      'SELECT * FROM worker WHERE current_task_id = ? ORDER BY created_at ASC',
+      taskId,
+    ).map(mapWorker);
+  }
+
   /**
    * 数据库里排队中的业务 Worker（可能由另一个进程创建，需要本进程接管调度）。
    * 维护挂起的是任务（task.maintenance），不是 Worker 自己的字段。
@@ -639,7 +654,7 @@ export class Store {
   listQueuedWorkers(): Worker[] {
     return this.all(
       `SELECT w.* FROM worker w
-         LEFT JOIN task t ON t.id = w.group_id
+         LEFT JOIN task t ON t.id = w.current_task_id
         WHERE w.status = 'queued' AND COALESCE(t.maintenance, 0) = 0
         ORDER BY w.created_at ASC`,
     ).map(mapWorker);
@@ -750,14 +765,17 @@ export class Store {
   /** 某 Worker 未消费的收件箱（组内点对点 + 广播）。 */
   listInbox(workerId: string): Message[] {
     const worker = this.getWorker(workerId);
-    if (!worker) return [];
+    if (!worker?.currentTaskId) return [];
+    const task = this.getTask(worker.currentTaskId);
+    if (!task) return [];
     return this.all(
       `SELECT * FROM message
         WHERE status IN ('queued','delivered')
+          AND task_id = ?
           AND ((to_kind = 'worker' AND to_id = ?)
                OR (to_kind = 'group' AND group_id = ?))
         ORDER BY created_at ASC`,
-      workerId, worker.groupId,
+      task.id, workerId, task.groupId,
     ).map(mapMessage);
   }
 
@@ -842,6 +860,19 @@ export class Store {
     ).map(mapMessage);
   }
 
+  /** 同一 workspace 可能承担多项任务，任务详情必须按 task_id 取消息。 */
+  listTaskMessages(taskId: string, limit = 200): Message[] {
+    // 先倒序取最近 N 条，再在内存里翻回时间顺序。派生表不暴露 rowid，
+    // 不能在外层继续按 rowid 排序；同一时间戳仍按插入顺序稳定返回。
+    return this.all(
+      `SELECT * FROM message
+        WHERE task_id = ?
+        ORDER BY created_at DESC, rowid DESC
+        LIMIT ?`,
+      taskId, limit,
+    ).map(mapMessage).reverse();
+  }
+
   listMessagesForWorker(workerId: string, limit = 100): Message[] {
     return this.all(
       `SELECT * FROM message
@@ -907,8 +938,9 @@ export class Store {
     return num(this.get('SELECT run_epoch FROM worker WHERE id = ?', workerId)?.['run_epoch'] ?? 0);
   }
 
-  bumpGroupEpoch(groupId: string): void {
-    for (const worker of this.listGroupWorkers(groupId)) this.bumpWorkerEpoch(worker.id);
+  /** 只让当前服务该任务的成员失效，不能波及其他任务共用同一 workspace 的成员。 */
+  bumpTaskWorkerEpochs(taskId: string): void {
+    for (const worker of this.listTaskWorkers(taskId)) this.bumpWorkerEpoch(worker.id);
   }
 
   private closed = false;

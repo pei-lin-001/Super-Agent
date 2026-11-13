@@ -17,6 +17,7 @@ export interface Observation {
     maintenance: number;
     reviewEpoch: number;
     requireReview: boolean;
+    ownerWorkerId: string | null;
     workers: { id: string; role: string; status: string; steps: number; lastError: string | null; waits: string[] }[];
     artifacts: { name: string; version: number; bytes: number }[];
     pendingReviews: number;
@@ -108,7 +109,7 @@ export function observe(store: Store, config: Config): Observation {
   const instance = readInstance(config);
   const mainAlive = instance !== null && isPidAlive(instance.pid);
   const tasks = store.listTasks().map((task) => {
-    const workers = store.listGroupWorkers(task.groupId);
+    const workers = store.listTaskWorkers(task.id);
     const artifacts = store.listArtifacts(task.id);
     const reviews = store.listReviews(task.id);
     const events = store.listEvents(task.id, 8);
@@ -141,6 +142,7 @@ export function observe(store: Store, config: Config): Observation {
       maintenance: Number(task.maintenance ?? 0),
       reviewEpoch: task.reviewEpoch,
       requireReview: task.requireReview,
+      ownerWorkerId: task.ownerWorkerId,
       workers: workers.map((worker) => ({
         id: worker.id,
         role: worker.role,
@@ -181,7 +183,10 @@ export function renderObservation(observation: Observation): string {
       `Worker：` +
         task.workers
           .map((worker) => `${worker.id}(${worker.role}) ${worker.status}/${worker.steps}步${worker.waits.length ? ` 等待:${worker.waits.join(',')}` : ''}${worker.lastError ? ` 错误:${worker.lastError}` : ''}`)
-          .join('；'),
+          .join('；') + (task.workers.length === 0 ? '（无当前成员）' : '') +
+        (task.ownerWorkerId && !task.workers.some((worker) => worker.id === task.ownerWorkerId)
+          ? `｜历史负责人 ${task.ownerWorkerId}`
+          : ''),
     );
     lines.push(
       `产物：${task.artifacts.length === 0 ? '无' : task.artifacts.map((item) => `${item.name} v${item.version}`).join('、')}｜` +
