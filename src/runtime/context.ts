@@ -1,4 +1,4 @@
-import type { Artifact, Review, Task, Worker, WorkerTurn } from '../domain/types.ts';
+import type { ActorKind, Artifact, Review, Task, Worker, WorkerTurn } from '../domain/types.ts';
 import type { Store } from '../storage/store.ts';
 
 /** 按字符数估算长度：这是字符数，不是 token，也不是费用。 */
@@ -136,8 +136,13 @@ export function renderTaskFacts(input: {
   task: Task;
   isOwner: boolean;
   latestUpdate: string | null;
+  assignedInstructions?: {
+    body: string;
+    fromKind: ActorKind;
+    fromId: string;
+  }[];
 }): string {
-  const { task, isOwner, latestUpdate } = input;
+  const { task, isOwner, latestUpdate, assignedInstructions } = input;
   const lines = [
     `- 任务：${task.title}`,
     `- 共同目标：${task.goal}`,
@@ -146,7 +151,19 @@ export function renderTaskFacts(input: {
     `- 提交门槛：${task.requireReview ? '每个最终提交产物须取得当前要求和版本下的同组检查通过' : '不强制检查'}`,
   ];
   if (latestUpdate) {
-    lines.push(`- 最新补充要求（覆盖此前计划）：${latestUpdate.slice(0, 600)}`);
+    lines.push(`- 最新任务级补充要求（来自 Router/用户，已抬升要求版本）：${latestUpdate.slice(0, 600)}`);
+  }
+  for (const instruction of assignedInstructions ?? []) {
+    const source =
+      instruction.fromKind === 'worker'
+        ? `Worker ${instruction.fromId}`
+        : instruction.fromKind === 'router'
+          ? 'Router'
+          : instruction.fromKind;
+    lines.push(
+      `- 指派给你的工作指示（来自 ${source}；只适用于指定接收者，不是任务级要求，不改要求版本）：` +
+        instruction.body.slice(0, 600),
+    );
   }
   if (isOwner) {
     lines.push('- 你的角色：负责人。满足完成条件后必须调用 submit_result 交付。');

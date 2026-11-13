@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { Config } from '../config.ts';
 import { beijingTime, clockStamp } from '../domain/ids.ts';
-import { isPidAlive, looksLikeOurProcess, readInstance } from './observer.ts';
+import { identifyProcess, readInstance, type ProcessIdentity } from './observer.ts';
 
 export type MainState = 'absent' | 'exited' | 'unverified' | 'alive' | 'unresponsive';
 
@@ -12,44 +12,139 @@ export interface MainHealth {
   pid: number | null;
   detail: string;
   heartbeatAgeMs: number | null;
+  /** 身份探测结论；null 表示还没有可探测的有效 PID。 */
+  identity: ProcessIdentity | null;
+  /** 仅凭新鲜且 PID 一致的心跳推断出的存活状态，不能授权停止或启动进程。 */
+  degraded: boolean;
 }
 
 const MIN_VALID_PID = 2;
+const HEARTBEAT_FRESH_MS = 30_000;
+const HEARTBEAT_FUTURE_SKEW_MS = 5_000;
 
 export function isValidPid(pid: unknown): pid is number {
   return typeof pid === 'number' && Number.isInteger(pid) && pid >= MIN_VALID_PID;
 }
 
-/** 主系统健康：区分不存在、已退出、身份无法确认、活着但主循环无响应。 */
-export function mainHealth(config: Config): MainHealth {
+interface HeartbeatFile {
+  exists: boolean;
+  at: number | null;
+  pid: number | null;
+  parseError: boolean;
+}
+
+/** 进程探测依赖只用于测试注入；生产路径全部使用真实系统调用。 */
+export interface MainProcessDeps {
+  isAlive?: (pid: number) => boolean;
+  identify?: (pid: number, marker: string) => ProcessIdentity;
+  kill?: (pid: number, signal: 'SIGTERM' | 'SIGKILL') => void;
+}
+
+/** EPERM 表示进程存在但没有信号权限，不能当成进程已退出。 */
+function isPidPresent(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+function readHeartbeat(path: string): HeartbeatFile {
+  if (!existsSync(path)) return { exists: false, at: null, pid: null, parseError: false };
+  try {
+    const value = JSON.parse(readFileSync(path, 'utf8')) as { at?: unknown; pid?: unknown };
+    return {
+      exists: true,
+      at: typeof value.at === 'number' && Number.isFinite(value.at) ? value.at : null,
+      pid: typeof value.pid === 'number' ? value.pid : null,
+      parseError: false,
+    };
+  } catch {
+    return { exists: true, at: null, pid: null, parseError: true };
+  }
+}
+
+function makeHealth(
+  state: MainState,
+  pid: number | null,
+  detail: string,
+  heartbeatAgeMs: number | null = null,
+  identity: ProcessIdentity | null = null,
+  degraded = false,
+): MainHealth {
+  return { state, pid, detail, heartbeatAgeMs, identity, degraded };
+}
+
+/**
+ * 主系统健康：mismatch 表示已确认 PID 被复用，unknown 表示探测能力不可用。
+ *
+ * unknown 只有在心跳新鲜且 PID 一致时降级为可观察的 alive。该降级证据
+ * 不能用于停止或启动进程。
+ */
+export function mainHealth(config: Config, deps: Pick<MainProcessDeps, 'isAlive' | 'identify'> = {}): MainHealth {
+  const isAlive = deps.isAlive ?? isPidPresent;
+  const identify = deps.identify ?? identifyProcess;
   const instance = readInstance(config) as { pid?: unknown; stopped?: boolean; heartbeat?: string } | null;
-  if (!instance) return { state: 'absent', pid: null, detail: '没有实例文件', heartbeatAgeMs: null };
-  if (instance.stopped === true) return { state: 'exited', pid: null, detail: '实例文件标记为已停机', heartbeatAgeMs: null };
+  if (!instance) return makeHealth('absent', null, '没有实例文件');
+  if (instance.stopped === true) return makeHealth('exited', null, '实例文件标记为已停机');
   if (!isValidPid(instance.pid)) {
-    return { state: 'unverified', pid: null, detail: `实例文件里的 pid 不合法：${String(instance.pid)}`, heartbeatAgeMs: null };
+    return makeHealth('unverified', null, `实例文件里的 pid 不合法：${String(instance.pid)}`);
   }
   const pid = instance.pid;
-  if (!isPidAlive(pid)) return { state: 'exited', pid, detail: `进程 ${pid} 已不存在`, heartbeatAgeMs: null };
-  if (!looksLikeOurProcess(pid, 'src/main.ts')) {
-    return { state: 'unverified', pid, detail: `pid ${pid} 的命令行不符合本项目，可能是 PID 复用`, heartbeatAgeMs: null };
-  }
+  if (!isAlive(pid)) return makeHealth('exited', pid, `进程 ${pid} 已不存在`);
+
   const heartbeatPath = instance.heartbeat ?? join(config.workDir, '.runtime', 'heartbeat.json');
-  if (!existsSync(heartbeatPath)) {
-    return { state: 'alive', pid, detail: '进程存活，但没有心跳文件，无法确认调度是否在转', heartbeatAgeMs: null };
-  }
+  const heartbeat = readHeartbeat(heartbeatPath);
+  const age = heartbeat.at === null ? null : Date.now() - heartbeat.at;
+
+  let identity: ProcessIdentity;
   try {
-    const beat = JSON.parse(readFileSync(heartbeatPath, 'utf8')) as { at?: number; pid?: number };
-    const age = typeof beat.at === 'number' ? Date.now() - beat.at : null;
-    if (beat.pid !== pid) {
-      return { state: 'unverified', pid, detail: '心跳文件属于另一个进程', heartbeatAgeMs: age };
-    }
-    if (age !== null && age > 30_000) {
-      return { state: 'unresponsive', pid, detail: `进程存活但心跳已 ${Math.round(age / 1000)} 秒未更新`, heartbeatAgeMs: age };
-    }
-    return { state: 'alive', pid, detail: `运行中（心跳 ${age === null ? '未知' : `${Math.round(age / 1000)} 秒前`}）`, heartbeatAgeMs: age };
+    identity = identify(pid, 'src/main.ts');
   } catch {
-    return { state: 'alive', pid, detail: '心跳文件无法解析', heartbeatAgeMs: null };
+    identity = 'unknown';
   }
+
+  if (identity === 'mismatch') {
+    return makeHealth('unverified', pid, `pid ${pid} 已确认不是本项目的 src/main.ts 进程，可能是 PID 复用`, age, identity);
+  }
+  if (identity === 'unknown') {
+    const weakEvidence =
+      heartbeat.pid === pid &&
+      age !== null &&
+      age >= -HEARTBEAT_FUTURE_SKEW_MS &&
+      age <= HEARTBEAT_FRESH_MS;
+    if (weakEvidence) {
+      return makeHealth(
+        'alive',
+        pid,
+        `运行中（降级判定：身份探测不可用，心跳 ${Math.round((age ?? 0) / 1000)} 秒前且 pid ${pid} 一致；只用于观察）`,
+        age,
+        identity,
+        true,
+      );
+    }
+    return makeHealth(
+      'unverified', pid,
+      `进程 ${pid} 存在，但身份探测不可用（命令行不可读或权限不足）；不能据此认定 PID 复用`,
+      age,
+      identity,
+    );
+  }
+
+  if (!heartbeat.exists) {
+    return makeHealth('alive', pid, '进程存活，但没有心跳文件，无法确认调度是否在转', null, identity);
+  }
+  if (heartbeat.parseError) {
+    return makeHealth('alive', pid, '进程存活，但心跳文件无法解析', null, identity);
+  }
+  if (heartbeat.pid !== pid) {
+    return makeHealth('unverified', pid, '心跳文件属于另一个进程', age, identity);
+  }
+  if (age !== null && age > HEARTBEAT_FRESH_MS) {
+    return makeHealth('unresponsive', pid, `进程存活但心跳已 ${Math.round(age / 1000)} 秒未更新`, age, identity);
+  }
+  return makeHealth('alive', pid, `运行中（心跳 ${age === null ? '未知' : `${Math.round(age / 1000)} 秒前`}）`, age, identity);
 }
 
 export interface RestartRecord {
@@ -94,33 +189,45 @@ export interface SpawnResult {
 /**
  * 受控拉起：只在前置条件都满足时启动，并保留诊断输出位置。
  *
- * `allowRunning` 只给「计划重启」用：调用方已经确认主系统退出了（或刚把它停掉），
- * 这里的 alive 检查会看到上一次的实例文件，属于正常现象。
- * 崩溃拉起（默认）仍然拒绝在活着的时候重复启动。
+ * `allowRunning` 仅为兼容旧调用保留，不能让仍被强证据确认存活的进程绕过守卫。
+ * 计划重启必须先让 stopMain 确认原进程已退出，才能走到这里。
  */
 export function spawnMain(
   config: Config,
   options: { cooldownMs: number; allowRunning?: boolean },
+  deps: Pick<MainProcessDeps, 'isAlive' | 'identify'> & { spawn?: typeof spawn } = {},
 ): SpawnResult {
-  const health = mainHealth(config);
-  if (!options.allowRunning && (health.state === 'alive' || health.state === 'unresponsive')) {
-    return { ok: false, message: `主系统仍存在（${health.state}：${health.detail}），不重复启动`, pid: health.pid };
+  const health = mainHealth(config, deps);
+  const refuse = (message: string, pid: number | null): SpawnResult => {
+    recordRestart(config, {
+      attemptedAt: new Date().toISOString(),
+      outcome: 'refused',
+      detail: message,
+      pid,
+    });
+    return { ok: false, message, pid };
+  };
+  if (health.degraded) {
+    return refuse(`只有弱证据（心跳推断），不能授权启动第二个主进程：${health.detail}`, health.pid);
   }
   if (health.state === 'unverified') {
-    return { ok: false, message: `无法确认进程身份，保守跳过：${health.detail}`, pid: health.pid };
+    return refuse(`无法确认进程身份，保守跳过：${health.detail}`, health.pid);
+  }
+  if (health.state === 'alive' || health.state === 'unresponsive') {
+    return refuse(`主系统仍存在（${health.state}：${health.detail}），不重复启动`, health.pid);
   }
   const age = lastRestartAgeMs(config);
   if (age !== null && age < options.cooldownMs) {
-    return {
-      ok: false,
-      message: `距上次启动尝试仅 ${Math.round(age / 1000)} 秒（冷却 ${Math.round(options.cooldownMs / 1000)} 秒），本次不重复拉起`,
-      pid: null,
-    };
+    return refuse(
+      `距上次启动尝试仅 ${Math.round(age / 1000)} 秒（冷却 ${Math.round(options.cooldownMs / 1000)} 秒），本次不重复拉起`,
+      null,
+    );
   }
 
   const logPath = join(config.workDir, '.runtime', 'main.log');
   mkdirSync(dirname(logPath), { recursive: true });
-  const child = spawn(process.execPath, ['--env-file-if-exists=.env.local', 'src/main.ts', '--daemon'], {
+  const launch = deps.spawn ?? spawn;
+  const child = launch(process.execPath, ['--env-file-if-exists=.env.local', 'src/main.ts', '--daemon'], {
     cwd: process.cwd(),
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -176,45 +283,94 @@ export interface RestartOutcome {
   message: string;
 }
 
-/** 等到主系统真的退出；超时就强杀，不无限等。 */
-async function stopMain(config: Config, timeoutMs: number): Promise<{ stopped: boolean; message: string }> {
-  const health = mainHealth(config);
+function stopRefusal(health: MainHealth): string | null {
+  if (health.degraded) {
+    return `主系统身份只有弱证据，不能授权终止进程：${health.detail}`;
+  }
+  if (health.identity === 'mismatch') {
+    return `无法确认主系统身份：PID 已确认被其他进程复用，不发送终止信号：${health.detail}`;
+  }
+  if (health.identity === 'unknown') {
+    return `无法确认主系统身份：身份探测不可用，不能判断是否已发生 PID 复用，不发送终止信号：${health.detail}`;
+  }
+  if (health.identity !== 'match' || health.state === 'unverified') {
+    return `无法确认主系统身份，不发送终止信号：${health.detail}`;
+  }
+  if (health.pid === null || !isValidPid(health.pid)) {
+    return `无法确认主系统 pid，不发送终止信号：${health.detail}`;
+  }
+  return null;
+}
+
+/** 等到主系统真的退出；超时就强杀，不无限等。依赖仅供可控回归测试。 */
+export async function stopMain(
+  config: Config,
+  timeoutMs: number,
+  deps: MainProcessDeps = {},
+): Promise<{ stopped: boolean; message: string }> {
+  const isAlive = deps.isAlive ?? isPidPresent;
+  const kill = deps.kill ?? ((pid: number, signal: 'SIGTERM' | 'SIGKILL') => {
+    process.kill(pid, signal);
+  });
+  const health = mainHealth(config, deps);
   if (health.state === 'exited' || health.state === 'absent') {
     return { stopped: true, message: '主系统本就不在运行' };
   }
-  if (health.state === 'unverified') {
-    return { stopped: false, message: `无法确认主系统身份（${health.detail}），不贸然杀进程` };
-  }
-  if (health.pid === null || !isValidPid(health.pid)) {
-    return { stopped: false, message: `无法确认主系统 pid（${health.detail}），不贸然杀进程` };
-  }
+  const initialRefusal = stopRefusal(health);
+  if (initialRefusal) return { stopped: false, message: initialRefusal };
   const pid = health.pid;
+  if (pid === null) return { stopped: false, message: `无法确认主系统 pid：${health.detail}` };
   try {
-    process.kill(pid, 'SIGTERM');
+    kill(pid, 'SIGTERM');
   } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ESRCH') {
+      return { stopped: true, message: `主系统 ${pid} 在发送 SIGTERM 前已退出` };
+    }
     return { stopped: false, message: `发送 SIGTERM 失败：${(error as Error).message}` };
   }
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (!isPidAlive(pid)) return { stopped: true, message: `主系统 ${pid} 已按 SIGTERM 退出` };
+    const observed = readInstance(config) as { pid?: unknown } | null;
+    if (isValidPid(observed?.pid) && observed.pid !== pid) {
+      return {
+        stopped: false,
+        message: `等待停机时实例 PID 已从 ${pid} 变为 ${observed.pid}，为避免停止或重复拉起新实例，本次中止`,
+      };
+    }
+    if (!isAlive(pid)) return { stopped: true, message: `主系统 ${pid} 已按 SIGTERM 退出` };
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
-  const current = mainHealth(config);
-  if (current.pid !== pid || (current.state !== 'alive' && current.state !== 'unresponsive')) {
-    return { stopped: false, message: `主系统身份已变化或无法确认（${current.detail}），不发送 SIGKILL` };
+  if (!isAlive(pid)) return { stopped: true, message: `主系统 ${pid} 已按 SIGTERM 退出` };
+  const current = mainHealth(config, deps);
+  if (current.pid !== pid) {
+    return {
+      stopped: false,
+      message: `等待停机时实例 PID 已从 ${pid} 变为 ${current.pid ?? '未知'}，不发送 SIGKILL`,
+    };
+  }
+  const currentRefusal = stopRefusal(current);
+  if (currentRefusal) {
+    return { stopped: false, message: `SIGTERM 超时后复查未通过，不发送 SIGKILL：${currentRefusal}` };
   }
   // 优雅停机等不到就只能强杀：SIGTERM 已经给过机会了。
   try {
-    process.kill(pid, 'SIGKILL');
-  } catch {
-    // 进程可能刚好退出，忽略。
+    kill(pid, 'SIGKILL');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ESRCH') {
+      return { stopped: true, message: `主系统 ${pid} 在发送 SIGKILL 前已退出` };
+    }
+    return { stopped: false, message: `发送 SIGKILL 失败：${(error as Error).message}` };
   }
   const hardDeadline = Date.now() + 5_000;
   while (Date.now() < hardDeadline) {
-    if (!isPidAlive(pid)) return { stopped: true, message: `主系统 ${pid} 在超时后被 SIGKILL 终止` };
+    if (!isAlive(pid)) return { stopped: true, message: `主系统 ${pid} 在超时后被 SIGKILL 终止` };
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
-  return { stopped: false, message: `主系统 ${pid} 在 SIGKILL 后仍未退出，放弃本次重启` };
+  const afterKill = mainHealth(config, deps);
+  return {
+    stopped: false,
+    message: `主系统 ${pid} 在 SIGKILL 后仍未退出，放弃本次重启（当前 ${afterKill.state}：${afterKill.detail}）`,
+  };
 }
 
 /** 等新进程写出心跳；这是「起没起来」唯一不依赖主系统自述的判据。 */

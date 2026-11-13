@@ -4,9 +4,163 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { createHarness } from '../helpers.ts';
 import { mockReply, MockModel } from '../../src/model/mock.ts';
-import { observe } from '../../src/watchdog/observer.ts';
+import {
+  decideModelReview,
+  observe,
+  type ModelReviewGateState,
+} from '../../src/watchdog/observer.ts';
 import { createReviewState, renderReviewContext } from '../../src/watchdog/review-state.ts';
 import { WatchdogSession } from '../../src/watchdog/session.ts';
+
+test('Watchdog 语义巡检 gate：本地 tick 不调模型，活跃/空闲按各自间隔触发', () => {
+  const now = Date.parse('2026-11-13T08:00:00.000Z');
+  const state: ModelReviewGateState = {
+    incidentSignature: null,
+    incidentReviewedAt: 0,
+    dueIssueAttempts: {},
+    routerMessageBatch: null,
+    routerMessageFailedAt: 0,
+  };
+  const check = (input: {
+    active: boolean;
+    lastModelReviewAt: number;
+    at?: number;
+  }) => decideModelReview({
+    now: input.at ?? now,
+    active: input.active,
+    lastModelReviewAt: input.lastModelReviewAt,
+    baselineAt: '2026-11-13T08:00:00.000Z',
+    activeIntervalMs: 600_000,
+    idleIntervalMs: 1_800_000,
+    pendingRouterMessages: 0,
+    dueIssues: [],
+    health: { state: 'alive', pid: 42, identity: 'match' },
+    state,
+  });
+
+  for (let elapsed = 10_000; elapsed < 600_000; elapsed += 10_000) {
+    assert.equal(check({ active: true, lastModelReviewAt: now, at: now + elapsed }).run, false);
+  }
+  const activeDue = check({ active: true, lastModelReviewAt: now, at: now + 600_000 });
+  assert.equal(activeDue.run, true);
+  assert.match(activeDue.reason, /活跃任务/);
+
+  for (let elapsed = 10_000; elapsed < 1_800_000; elapsed += 10_000) {
+    assert.equal(check({ active: false, lastModelReviewAt: now, at: now + elapsed }).run, false);
+  }
+  const idleDue = check({ active: false, lastModelReviewAt: now, at: now + 1_800_000 });
+  assert.equal(idleDue.run, true);
+  assert.match(idleDue.reason, /空闲/);
+});
+
+test('Watchdog 语义巡检 gate：事件和严重健康事实去重，恢复后可再次触发', () => {
+  const now = Date.parse('2026-11-13T08:00:00.000Z');
+  const state: ModelReviewGateState = {
+    incidentSignature: null,
+    incidentReviewedAt: 0,
+    dueIssueAttempts: {},
+    routerMessageBatch: null,
+    routerMessageFailedAt: 0,
+  };
+  const base = {
+    now,
+    active: false,
+    lastModelReviewAt: now - 10_000,
+    baselineAt: '2026-11-13T08:00:00.000Z',
+    activeIntervalMs: 600_000,
+    idleIntervalMs: 1_800_000,
+    dueIssues: [],
+    state,
+  };
+
+  const routerMessage = decideModelReview({
+    ...base,
+    pendingRouterMessages: 1,
+    health: { state: 'alive', pid: 42, identity: 'match' },
+  });
+  assert.equal(routerMessage.run, true, '显式 Router 消息应立即触发');
+
+  const dueIssue = decideModelReview({
+    ...base,
+    pendingRouterMessages: 0,
+    dueIssues: [{ id: 'wdi_due', checkAfter: new Date(now - 1_000).toISOString() }],
+    health: { state: 'alive', pid: 42, identity: 'match' },
+  });
+  assert.equal(dueIssue.run, true);
+  assert.deepEqual(dueIssue.dueIssueKeys, ['wdi_due@' + new Date(now - 1_000).toISOString()]);
+  state.dueIssueAttempts[dueIssue.dueIssueKeys[0]!] = now;
+  assert.equal(decideModelReview({
+    ...base,
+    now: now + 10_000,
+    pendingRouterMessages: 0,
+    dueIssues: [{ id: 'wdi_due', checkAfter: new Date(now - 1_000).toISOString() }],
+    health: { state: 'alive', pid: 42, identity: 'match' },
+  }).run, false, '同一个到期事件不能在每次健康 tick 重试');
+
+  const incident = decideModelReview({
+    ...base,
+    pendingRouterMessages: 0,
+    health: { state: 'unresponsive', pid: 42, identity: 'match' },
+  });
+  assert.equal(incident.run, true);
+  assert.equal(incident.incidentSignature, 'unresponsive:42');
+  state.incidentSignature = incident.incidentSignature;
+  state.incidentReviewedAt = now;
+  assert.equal(decideModelReview({
+    ...base,
+    now: now + 10_000,
+    pendingRouterMessages: 0,
+    health: { state: 'unresponsive', pid: 42, identity: 'match' },
+  }).run, false, '相同健康事实不能每 10 秒触发');
+
+  // 主循环在健康恢复后会清空 incident 签名；同一 PID 再次故障应重新触发。
+  state.incidentSignature = null;
+  state.incidentReviewedAt = 0;
+  assert.equal(decideModelReview({
+    ...base,
+    now: now + 20_000,
+    pendingRouterMessages: 0,
+    health: { state: 'unresponsive', pid: 42, identity: 'match' },
+  }).run, true);
+
+  const unverified = decideModelReview({
+    ...base,
+    now: now + 30_000,
+    pendingRouterMessages: 0,
+    health: { state: 'unverified', pid: 42, identity: 'mismatch' },
+  });
+  assert.equal(unverified.run, false, 'PID 身份探测异常只能降级观察，不能形成模型风暴');
+  assert.match(unverified.healthNote ?? '', /PID 已确认不匹配/);
+
+  state.routerMessageBatch = 'ic_failed';
+  state.routerMessageFailedAt = now + 40_000;
+  const backoff = decideModelReview({
+    ...base,
+    now: now + 50_000,
+    pendingRouterMessages: 1,
+    pendingRouterBatch: 'ic_failed',
+    routerFailureBackoffMs: 60_000,
+    health: { state: 'alive', pid: 42, identity: 'match' },
+  });
+  assert.equal(backoff.run, false, '同一批 Router 消息失败后不能在每次 10 秒 tick 重试');
+  assert.match(backoff.reason, /正在退避/);
+  assert.equal(decideModelReview({
+    ...base,
+    now: now + 100_001,
+    pendingRouterMessages: 1,
+    pendingRouterBatch: 'ic_failed',
+    routerFailureBackoffMs: 60_000,
+    health: { state: 'alive', pid: 42, identity: 'match' },
+  }).run, true, '退避到期后应重新处理');
+  assert.equal(decideModelReview({
+    ...base,
+    now: now + 50_000,
+    pendingRouterMessages: 1,
+    pendingRouterBatch: 'ic_new',
+    routerFailureBackoffMs: 60_000,
+    health: { state: 'alive', pid: 42, identity: 'match' },
+  }).run, true, '新批次 Router 消息应立即突破旧批次退避');
+});
 
 test('Watchdog 首次巡检明确为初始快照，纯步数增长不进入 delta', async () => {
   const harness = await createHarness({
@@ -74,7 +228,7 @@ test('Watchdog 当前任务始终展示作业事实，作业变化继续进入 d
     const currentBlock = unchangedText.split('## 当前非终态任务')[1]!.split('## 终态任务')[0]!;
     assert.match(unchangedDelta, /未检测到 task\/worker\/wait\/job\/artifact\/review 事实状态变化/);
     assert.ok(
-      currentBlock.includes(`当前作业：${job.id}(${job.command}) running|exit=-`),
+      currentBlock.includes(`作业重点：${job.id}(${job.command}) running|exit=-`),
       '作业没有发生事实变化时，当前任务块仍应保留它的身份和状态',
     );
 
@@ -86,12 +240,9 @@ test('Watchdog 当前任务始终展示作业事实，作业变化继续进入 d
     changedJob.endedAt = changed.generatedAt;
     const changedText = renderReviewContext(changed, state, []);
     const changedDelta = changedText.split('## 当前非终态任务')[0]!;
-    assert.ok(
-      changedDelta.includes(
-        `作业 ${job.id}：running|exit=-|${job.command} → exited|exit=0|${job.command}`,
-      ),
-      '作业状态和退出码变化仍应进入事实 delta',
-    );
+    assert.match(changedDelta, new RegExp(`任务 ${task.id} 作业：变化 ${job.id}`));
+    assert.doesNotMatch(changedDelta, /running\|exit=-\|.*→ exited\|exit=0\|/);
+    assert.match(changedText, new RegExp(`${job.id}\\(${job.command}\\) exited\\|exit=0`));
   } finally {
     await harness.cleanup();
   }
@@ -168,8 +319,7 @@ test('Watchdog delta 保留维护/要求变化，并按 review id 区分同一�
     const rendered = renderReviewContext(after, state, []);
     assert.match(rendered, /维护挂起：否 → 是/);
     assert.match(rendered, /要求版本：0 → 1/);
-    assert.match(rendered, /检查新增 review_reviewer_a/);
-    assert.match(rendered, /检查新增 review_reviewer_b/);
+    assert.match(rendered, /检查：新增 review_reviewer_a、review_reviewer_b/);
   } finally {
     await harness.cleanup();
   }
@@ -267,9 +417,15 @@ test('Watchdog 周期巡检不重放旧长历史，完整结论可按 id 读取�
     assert.match(restoredPrompt, /OLD_FULL_INSPECTION_MARKER/, 'read_inspection 应按 id 返回完整结论');
     assert.equal(harness.store.getWatchdogConclusion(inspection.id)?.content, oldFullConclusion);
 
-    let manualPrompt = '';
+    let manualSummaryPrompt = '';
+    let manualAnswerPrompt = '';
     const manualModel = new MockModel(({ request }) => {
-      manualPrompt = request.messages.map((message) => message.content ?? '').join('\n');
+      const system = request.messages.find((message) => message.role === 'system')?.content ?? '';
+      if (system.includes('Maintain a traceable note of the Super-Agent maintenance session')) {
+        manualSummaryPrompt = request.messages.map((message) => message.content ?? '').join('\n');
+        return mockReply({ text: '累计摘要：旧巡检结论可按 id 查回，不能把压缩当作原结论不存在。' });
+      }
+      manualAnswerPrompt = request.messages.map((message) => message.content ?? '').join('\n');
       return mockReply({ text: '人工提问答复' });
     });
     await (new WatchdogSession({
@@ -278,7 +434,9 @@ test('Watchdog 周期巡检不重放旧长历史，完整结论可按 id 读取�
       model: manualModel,
       modelName: 'mock',
     })).ask('人工追问');
-    assert.match(manualPrompt, /OLD_FULL_INSPECTION_MARKER/, '人工 ask 仍应保留维护对话历史');
+    assert.match(manualSummaryPrompt, /OLD_FULL_INSPECTION_MARKER/, '被移出近期窗口的全文应进入累计摘要，而不是无痕消失');
+    assert.match(manualAnswerPrompt, /累计摘要：旧巡检结论可按 id 查回/, '人工 ask 应读取更新后的累计摘要');
+    assert.match(manualAnswerPrompt, /UNANSWERED_ROUTER_MARKER/, '近期问答组仍应进入人工 ask');
   } finally {
     await harness.cleanup();
   }
@@ -309,6 +467,224 @@ test('Watchdog 基线 JSON 损坏时降级为初始快照并继续巡检', async
     assert.match(prompt, /基线警告：上轮巡检基线无法解析/);
     assert.match(prompt, /本次是初始快照（没有可用基线）/);
     assert.equal(result.summary, '已按当前快照继续巡检');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('Watchdog delta 忽略 message/job/artifact 噪声，保留 task/worker/run 决策事件', async () => {
+  const harness = await createHarness({
+    worker: () => mockReply({ text: 'ok' }),
+    limits: { maxConcurrentRuns: 0 },
+  });
+  try {
+    const { task, owner } = harness.runtime.createTask({
+      title: '事件过滤',
+      goal: 'g',
+      ownerRole: '负责人',
+      ownerBrief: 'b',
+    });
+    const before = observe(harness.store, harness.config);
+    const state = createReviewState(before, null);
+    for (let index = 0; index < 6; index += 1) {
+      harness.store.appendEvent(task.id, owner.id, 'message.updated', `NOISE_MESSAGE_${index}`);
+      harness.store.appendEvent(task.id, owner.id, 'job.progress', `NOISE_JOB_${index}`);
+    }
+    harness.store.appendEvent(task.id, owner.id, 'task.paused', 'DECISION_TASK');
+    harness.store.appendEvent(task.id, owner.id, 'worker.failed', 'DECISION_WORKER');
+    harness.store.appendEvent(task.id, owner.id, 'run.failed', 'DECISION_RUN');
+
+    const after = observe(harness.store, harness.config);
+    const rendered = renderReviewContext(after, state, []);
+    const delta = rendered.split('## 当前非终态任务')[0]!;
+    const observedEvents = after.tasks.find((item) => item.id === task.id)!.eventDetails;
+    for (const event of observedEvents) {
+      if (event.type.startsWith('message.') || event.type.startsWith('job.')) {
+        assert.doesNotMatch(delta, new RegExp(event.id), `${event.type} 不应进入 delta`);
+      } else {
+        assert.match(delta, new RegExp(event.id), `${event.type} 应作为决策事件保留`);
+      }
+    }
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('Watchdog 当前快照限制任务与运行中作业展开数，并显示准确省略数量', async () => {
+  const harness = await createHarness({
+    worker: () => mockReply({ text: 'ok' }),
+    limits: { maxConcurrentRuns: 0, maxTotalWorkers: 100 },
+  });
+  try {
+    for (let index = 0; index < 25; index += 1) {
+      harness.runtime.createTask({
+        title: `批量任务-${index}`,
+        goal: 'g',
+        ownerRole: '负责人',
+        ownerBrief: 'b',
+      });
+    }
+    const observation = observe(harness.store, harness.config);
+    const target = observation.tasks[0]!;
+    target.runningJobs = 25;
+    target.jobs = Array.from({ length: 6 }, (_, index) => ({
+      id: `job_bulk_${index}`,
+      command: `command-${index}`,
+      status: 'running',
+      exitCode: null,
+      endedAt: null,
+    }));
+    const rendered = renderReviewContext(observation, createReviewState(observation, null), []);
+    assert.equal(
+      rendered.split('详情可按需：inspect_task(').length - 1,
+      20,
+      '当前快照只展开 20 个非终态任务',
+    );
+    assert.match(rendered, /另有 5 个非终态任务未展开/);
+    assert.match(rendered, /另有 0 个重点作业和 19 个运行中作业未展开/);
+    assert.match(rendered, /运行中总数为 25/);
+    assert.doesNotMatch(rendered, /可按作业 id 用 inspect_task/);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('Watchdog 任务聚焦明确标注正式结果截断和较早检查省略', async () => {
+  const harness = await createHarness({
+    worker: () => mockReply({ text: 'ok' }),
+    limits: { maxConcurrentRuns: 0 },
+  });
+  try {
+    const { task, owner } = harness.runtime.createTask({
+      title: '截断提示',
+      goal: 'g',
+      ownerRole: '负责人',
+      ownerBrief: 'b',
+    });
+    const artifact = harness.runtime.saveArtifact(owner, 'report.md', '正文').artifact;
+    const now = new Date().toISOString();
+    for (let index = 0; index < 10; index += 1) {
+      harness.store.createReview({
+        id: `review_bulk_${index}`,
+        taskId: task.id,
+        artifactId: artifact.id,
+        artifactVersion: artifact.version,
+        artifactSha256: artifact.sha256,
+        epoch: task.reviewEpoch,
+        requestedBy: owner.id,
+        reviewerId: `reviewer_${index}`,
+        requestMessageId: `msg_review_${index}`,
+        replyMessageId: null,
+        outcome: 'pending',
+        createdAt: now,
+      });
+    }
+    harness.store.insertMessage({
+      id: 'msg_long_result',
+      groupId: task.groupId,
+      taskId: task.id,
+      fromKind: 'worker',
+      fromId: owner.id,
+      toKind: 'router',
+      toId: 'router',
+      kind: 'result',
+      body: `RESULT_START${'x'.repeat(3_500)}RESULT_END`,
+      payload: null,
+      replyTo: null,
+      refs: null,
+      dedupeKey: null,
+      broadcastId: null,
+      status: 'queued',
+      createdAt: now,
+      deliveredAt: null,
+      consumedAt: null,
+      error: null,
+    });
+    for (let index = 0; index < 3; index += 1) {
+      harness.store.insertJob({
+        id: `job_focus_${index}`,
+        taskId: task.id,
+        workerId: owner.id,
+        command: `command-${index}`,
+        args: [],
+        cwd: harness.config.workDir,
+        pid: null,
+        status: 'exited',
+        exitCode: 0,
+        signal: null,
+        stdoutPath: '',
+        stderrPath: '',
+        timeoutMs: 1_000,
+        startedAt: now,
+        endedAt: now,
+        error: null,
+      });
+    }
+    let prompt = '';
+    let toolOutput = '';
+    let step = 0;
+    await new WatchdogSession({
+      store: harness.store,
+      config: harness.config,
+      model: new MockModel(({ request }) => {
+        if (step++ === 0) {
+          prompt = request.messages.map((message) => message.content ?? '').join('\n');
+          return mockReply({
+            toolCalls: [{
+              name: 'inspect_task',
+              arguments: { task_id: task.id, result_id: 'msg_long_result' },
+            }],
+          });
+        }
+        toolOutput = request.messages
+          .filter((message) => message.role === 'tool')
+          .map((message) => message.content ?? '')
+          .join('\n');
+        return mockReply({ text: '已核对' });
+      }),
+      modelName: 'mock',
+    }).ask('检查任务', { taskId: task.id, history: false });
+
+    assert.match(prompt, /RESULT_START/);
+    assert.doesNotMatch(prompt, /RESULT_END/);
+    assert.match(prompt, /正式结果正文已截断/);
+    assert.match(prompt, /另有 2 条较早检查未展开/);
+    assert.match(prompt, /运行中作业 0 个，已全部展开；另有 2 个较早结束的非重点作业未展开/);
+    assert.doesNotMatch(prompt, /可按作业 id 用 inspect_task/);
+    assert.match(toolOutput, /RESULT_END/, 'inspect_task 应按 result_id 返回正式结果全文');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('Watchdog 人工问答和周期巡检都明确当前实例数据库、工作目录与 cwd', async () => {
+  const harness = await createHarness({
+    worker: () => mockReply({ text: 'ok' }),
+    limits: { maxConcurrentRuns: 0 },
+  });
+  try {
+    const prompts: string[] = [];
+    const model = new MockModel(({ request }) => {
+      prompts.push(request.messages.map((message) => message.content ?? '').join('\n'));
+      return mockReply({ text: '范围已核对' });
+    });
+    const session = new WatchdogSession({
+      store: harness.store,
+      config: harness.config,
+      model,
+      modelName: 'mock',
+    });
+    await session.ask('核对维护范围', { history: false });
+    await session.runOnce(10);
+
+    assert.equal(prompts.length, 2);
+    for (const prompt of prompts) {
+      assert.match(prompt, /## 当前实例范围（程序事实）/);
+      assert.ok(prompt.includes(`- 数据库：${harness.config.dbPath}`));
+      assert.ok(prompt.includes(`- 工作目录：${harness.config.workDir}`));
+      assert.ok(prompt.includes(`- 进程 cwd：${process.cwd()}`));
+      assert.match(prompt, /其他路径读到的事实属于外部证据，不能拼成当前实例状态/);
+    }
   } finally {
     await harness.cleanup();
   }

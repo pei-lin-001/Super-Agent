@@ -23,7 +23,6 @@ import { assertInsideRoot, resolveInside } from '../tools/paths.ts';
 import { fileTools } from '../tools/files.ts';
 import { runWorkerTurn } from '../runtime/pi-worker.ts';
 import type { ToolContext, ToolDefinition, ToolOutcome } from '../tools/types.ts';
-import { planWindow } from '../runtime/window.ts';
 import { observationPrompt, WATCHDOG_SYSTEM } from './prompts.ts';
 import { createReviewState, renderReviewContext, type ReviewState } from './review-state.ts';
 
@@ -34,6 +33,113 @@ import { createReviewState, renderReviewContext, type ReviewState } from './revi
  */
 const MAX_WATCHDOG_STEPS = 40;
 
+interface DialogueTurnRow {
+  row: number;
+  role: 'user' | 'assistant';
+  content: string;
+  piMessage?: import('@earendil-works/pi-ai').AssistantMessage;
+}
+
+type DialogueTurn = Pick<DialogueTurnRow, 'row' | 'role' | 'content'>;
+
+/**
+ * 纯文本保守估算：ASCII 约 4 字符 1 token，非 ASCII 按 1 字符 1 token。
+ * 中英混排会被高估而不是沿用旧实现的全段 chars/4 低估。
+ */
+function estimateDialogueTokens(text: string): number {
+  let asciiChars = 0;
+  let nonAsciiChars = 0;
+  for (const char of text) {
+    if (char.codePointAt(0)! <= 0x7f) asciiChars += 1;
+    else nonAsciiChars += 1;
+  }
+  return Math.ceil(asciiChars / 4 + nonAsciiChars);
+}
+
+/**
+ * 以 user 消息为组起点，确保裁剪不会留下孤立的 assistant 回复。
+ * 首条 assistant（例如后台巡检结论前没有 user）单独作为可摘要旧事实。
+ */
+function groupDialogue(turns: DialogueTurnRow[]): {
+  groups: DialogueTurnRow[][];
+  leading: DialogueTurnRow[];
+} {
+  const groups: DialogueTurnRow[][] = [];
+  const leading: DialogueTurnRow[] = [];
+  let current: DialogueTurnRow[] = [];
+  for (const turn of turns) {
+    if (turn.role === 'user') {
+      if (current.length > 0) groups.push(current);
+      current = [turn];
+    } else if (current.length > 0) {
+      current.push(turn);
+    } else {
+      leading.push(turn);
+    }
+  }
+  if (current.length > 0) groups.push(current);
+  return { groups, leading };
+}
+
+/**
+ * 摘要模型单次只处理 noteInputChars 范围内的新增问答。
+ *
+ * 正常情况按整条消息装箱；单条消息本身就超过上限时再切段，避免再次出现
+ * “为了适配一次请求而永久截掉后半段”。所有分段共享原 row 编号，便于追查。
+ */
+function chunkDialogueTurns(turns: DialogueTurn[], maxChars: number): DialogueTurn[][] {
+  const limit = Math.max(1, maxChars);
+  const chunks: DialogueTurn[][] = [];
+  let current: DialogueTurn[] = [];
+  let currentChars = 0;
+  const flush = (): void => {
+    if (current.length > 0) chunks.push(current);
+    current = [];
+    currentChars = 0;
+  };
+
+  for (const turn of turns) {
+    if (turn.content.length > limit) {
+      flush();
+      for (let offset = 0; offset < turn.content.length; offset += limit) {
+        chunks.push([{ ...turn, content: turn.content.slice(offset, offset + limit) }]);
+      }
+      continue;
+    }
+    if (currentChars > 0 && currentChars + turn.content.length > limit) flush();
+    current.push(turn);
+    currentChars += turn.content.length;
+  }
+  flush();
+  return chunks;
+}
+
+/**
+ * 按 rowid 分页读完水位线后的全部问答。
+ *
+ * Store 的单页上限保护普通调用，但维护会话不能在 400 条后只看历史前缀；
+ * runNote 已按 noteInputChars 分批处理，所以这里需要完整读取再做组级裁剪。
+ */
+function listAllWdDialogueSince(
+  store: Store,
+  afterRow: number,
+): ReturnType<Store['listWdDialogueSince']> {
+  const pageSize = 400;
+  const turns: ReturnType<Store['listWdDialogueSince']> = [];
+  let cursor = afterRow;
+  while (true) {
+    const page = store.listWdDialogueSince(cursor, pageSize);
+    turns.push(...page);
+    if (page.length < pageSize) break;
+    const next = page.at(-1)!.row;
+    if (next <= cursor) {
+      throw new Error(`wd_turn 分页没有前进：cursor=${cursor}, next=${next}`);
+    }
+    cursor = next;
+  }
+  return turns;
+}
+
 const WD_TOOLS: ToolSchema[] = [
   // 读文件不再自己造：直接用 Worker 那套 fs_*（行语义、2000 行/50KB 截断、能读仓库根）。
   // 维护专用的 run_command / job_output 保留——它们的作业 scope=watchdog，
@@ -41,40 +147,50 @@ const WD_TOOLS: ToolSchema[] = [
   // 只取只读的：fs_write 会把文件写进 work/__watchdog__/，维护者不该有写权限。
   ...fileTools
     .filter((tool) => tool.name !== 'fs_write')
-    .map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters })),
+    .map((tool) => ({
+      name: tool.name,
+      description: ({
+        fs_list: '列出目录；路径规则同 fs_read。',
+        fs_read: '读取文本；支持任务、仓库、绝对路径与 materials/ 只读材料；上限 2000 行或 50KB，超过用 offset。',
+        fs_view_image: '查看本地 png/jpeg/gif/webp 图片；一次一张并计入本轮上下文。',
+        fs_search: '在任务、材料和仓库可读路径按正则搜索文本；报告覆盖与跳过范围。',
+      } as Record<string, string>)[tool.name] ?? tool.description,
+      parameters: tool.parameters,
+    })),
   {
     name: 'inspect_task',
-    description: '读取一个任务的详细证据：Worker 分支、最近消息、最近工具调用与结果、作业、产物与检查。',
+    description: '读取任务成员、消息、历史、作业、产物和检查；result_id/review_id 返回正式结果全文和旧检查回复。',
     parameters: {
       type: 'object',
       properties: {
         task_id: { type: 'string' },
-        worker_id: { type: 'string', description: '只读某个 Worker 的历史' },
-        limit: { type: 'number', description: '返回条数，默认 15' },
+        result_id: { type: 'string' },
+        review_id: { type: 'string' },
+        worker_id: { type: 'string' },
+        limit: { type: 'number' },
       },
       required: ['task_id'],
     },
   },
   {
     name: 'read_history',
-    description: '读取某个 Worker 的近期原始历史（含工具调用与结果），用于判断是否在原地打转。',
+    description: '读取 Worker 近期原始历史，含工具调用与结果。',
     parameters: {
       type: 'object',
       properties: {
         worker_id: { type: 'string' },
-        limit: { type: 'number', description: '默认 20 条' },
+        limit: { type: 'number' },
       },
       required: ['worker_id'],
     },
   },
   {
     name: 'read_inspection',
-    description:
-      '读取维护者上轮或指定巡检的完整自然语言结论。当前观察摘要里丢失的条件和判断依据应从这里按 inspection_id 查回。',
+    description: '按 inspection_id 读取巡检结论全文；省略则取最近一条。',
     parameters: {
       type: 'object',
       properties: {
-        inspection_id: { type: 'string', description: '巡检结论 id；省略表示最近一条维护者结论' },
+        inspection_id: { type: 'string' },
       },
       required: [],
     },
@@ -82,16 +198,15 @@ const WD_TOOLS: ToolSchema[] = [
   {
     name: 'maintain',
     description:
-      '执行维护动作。action 取值：pause_task / resume_task / nudge_worker / set_override / rollback_override / restart_main。' +
-      '动作走主系统维护接口，不直接改业务数据。',
+      '通过主系统维护接口执行 pause_task / resume_task / nudge_worker / set_override / rollback_override / restart_main；不直接改业务数据。',
     parameters: {
       type: 'object',
       properties: {
         action: { type: 'string' },
         task_id: { type: 'string' },
         worker_id: { type: 'string' },
-        text: { type: 'string', description: '给 Worker 的纠偏信息或挂起原因' },
-        key: { type: 'string', description: '覆盖项，例如 worker.check_rules' },
+        text: { type: 'string' },
+        key: { type: 'string' },
         content: { type: 'string' },
         reason: { type: 'string' },
         version: { type: 'number' },
@@ -101,37 +216,35 @@ const WD_TOOLS: ToolSchema[] = [
   },
   {
     name: 'check_main',
-    description: '读取主系统当前健康状态：不存在 / 已退出 / 身份无法确认 / 活着但主循环无响应。',
+    description: '检查主系统存活、身份和主循环。',
     parameters: { type: 'object', properties: {}, required: [] },
   },
   {
     name: 'command_status',
-    description: '查询维护命令的回执：pending（还没被主系统消费）、done（已执行）、failed（执行失败）及原因。',
+    description: '查询维护命令回执及原因。',
     parameters: {
       type: 'object',
-      properties: { command_id: { type: 'string', description: '不填则返回最近 10 条' } },
+      properties: { command_id: { type: 'string' } },
       required: [],
     },
   },
   {
     name: 'run_command',
-    description:
-      '在工作目录内执行一条命令（程序 + 参数数组，不经过 shell），用于查看进程、磁盘、日志等。' +
-      '超时上限 60 秒；这是维护者自己的作业，与业务作业分开管理。',
+    description: '在工作目录内以程序+参数数组运行命令；无 shell，超时上限 60 秒，作业独立。',
     parameters: {
       type: 'object',
       properties: {
-        command: { type: 'string', description: '程序名，例如 ps、ls、df' },
+        command: { type: 'string' },
         args: { type: 'array', items: { type: 'string' } },
-        cwd: { type: 'string', description: '相对工作目录的子路径，默认工作目录根' },
-        timeout_seconds: { type: 'number', description: '默认 30，上限 60' },
+        cwd: { type: 'string' },
+        timeout_seconds: { type: 'number' },
       },
       required: ['command'],
     },
   },
   {
     name: 'job_output',
-    description: '读取维护者自己启动的命令输出。',
+    description: '读取维护者命令输出。',
     parameters: {
       type: 'object',
       properties: { job_id: { type: 'string' } },
@@ -141,43 +254,44 @@ const WD_TOOLS: ToolSchema[] = [
   {
     name: 'notify_router',
     description:
-      '保存一条无会话归属的维护通报，供管理入口查看。' +
-      '适合：你刚重启过主系统、你挂起/恢复了某个任务、你发现某个 Worker 在原地打转。' +
-      '用户看不到你，所有面向用户的表达都必须经过 Router——不要试图直接找用户。',
+      '向 Router 发送维护通报；已知 task_id 按来源会话定向，否则留管理入口。面向用户的表达必须经过 Router；urgency=low 不额外唤醒。',
     parameters: {
       type: 'object',
       properties: {
-        text: { type: 'string', description: '要说的事：发生了什么、影响是什么、用户可能需要知道什么' },
-        urgency: { type: 'string', enum: ['low', 'normal'], description: 'low 不会额外唤醒 Router' },
+        text: { type: 'string' },
+        task_id: { type: 'string' },
+        urgency: { type: 'string', enum: ['low', 'normal'] },
       },
       required: ['text'],
     },
   },
   {
     name: 'ask_router',
-    description:
-      '问 Router 一件只有它知道的事。没有明确会话归属时，问题留在管理入口等待查看，不会发送到任意聊天。',
+    description: '向 Router 提问；已知 task_id 定向来源会话，否则留管理入口。',
     parameters: {
       type: 'object',
-      properties: { question: { type: 'string', description: '具体问题，一次一件' } },
+      properties: {
+        question: { type: 'string' },
+        task_id: { type: 'string' },
+      },
       required: ['question'],
     },
   },
   {
     name: 'reply_intercom',
-    description: '回复 Router 之前发来的问题或请求。用消息 id 指认，一次回复一条。',
+    description: '按消息 id 回复 Router 的提问或请求。',
     parameters: {
       type: 'object',
       properties: {
-        message_id: { type: 'string', description: 'intercom 消息 id，形如 ic_xxxxxxxx' },
-        body: { type: 'string', description: '回答内容，讲事实和依据，不要写"已处理"这类空话' },
+        message_id: { type: 'string' },
+        body: { type: 'string' },
       },
       required: ['message_id', 'body'],
     },
   },
   {
     name: 'record',
-    description: '记录或关闭一个未解决事件。issue_id 为空表示新建；status=closed 表示已确认恢复。',
+    description: '新建或关闭未解决事件；status=closed 表示确认恢复。',
     parameters: {
       type: 'object',
       properties: {
@@ -186,7 +300,7 @@ const WD_TOOLS: ToolSchema[] = [
         title: { type: 'string' },
         status: { type: 'string', enum: ['open', 'closed'] },
         note: { type: 'string' },
-        check_after_minutes: { type: 'number', description: '多少分钟后再复查' },
+        check_after_minutes: { type: 'number' },
       },
       required: ['title'],
     },
@@ -204,11 +318,31 @@ function renderRouterMessages(store: Store): string {
   if (pending.length === 0) return '';
   const lines = pending.map((message) => {
     const kind = message.kind === 'question' ? '提问（需要回复）' : message.kind === 'request' ? '请求（需要判断）' : '通报';
-    return `- [${message.id}] ${kind}｜${message.body}${message.replyTo ? `｜回复：${message.replyTo}` : ''}${message.refs?.length ? `｜引用：${message.refs.join('、')}` : ''}`;
+    return `- [${message.id}] ${kind}｜${message.body}` +
+      `${message.taskId ? `｜任务：${message.taskId}` : ''}` +
+      `｜路由：${message.routeKnown ? '已关联来源会话' : '未关联，等待管理入口'}` +
+      `${message.replyTo ? `｜回复：${message.replyTo}` : ''}` +
+      `${message.refs?.length ? `｜引用：${message.refs.join('、')}` : ''}`;
   });
   lines.push('');
   lines.push('提问和请求请用 reply_intercom 回复（带上消息 id）；通报不需要回复。');
   return lines.join('\n');
+}
+
+/**
+ * 当前进程维护的是哪个实例，必须是程序事实，不能靠模型从路径猜。
+ *
+ * 文件工具允许读取整个仓库；其他目录中的日志、实例文件或数据库可能属于
+ * 另一个实例，只能作为外部证据，不能拼成本轮观察或维护对象的当前状态。
+ */
+function renderInstanceScope(config: Config): string {
+  return [
+    '## 当前实例范围（程序事实）',
+    `- 数据库：${config.dbPath}`,
+    `- 工作目录：${config.workDir}`,
+    `- 进程 cwd：${process.cwd()}`,
+    '- 本轮的观察、健康判断和维护控制只绑定上述配置；其他路径读到的事实属于外部证据，不能拼成当前实例状态。',
+  ].join('\n');
 }
 
 export interface WatchdogDeps {
@@ -219,7 +353,14 @@ export interface WatchdogDeps {
   /** 主系统重启：由外部提供，避免这里直接绑死进程管理细节。 */
   restartMain?: () => Promise<{ ok: boolean; message: string }>;
   /** 主系统健康：区分不存在、退出、身份不明、无响应。 */
-  health?: () => { state: string; pid: number | null; detail: string; heartbeatAgeMs: number | null };
+  health?: () => {
+    state: string;
+    pid: number | null;
+    detail: string;
+    heartbeatAgeMs: number | null;
+    identity?: string | null;
+    degraded?: boolean;
+  };
   /** 读取 Watchdog 自己的运行配置（含在线调整的巡检间隔）。 */
   runtimeConfig?: { intervalMs: number };
   /**
@@ -238,6 +379,19 @@ export interface WatchdogResult {
   acted: boolean;
   summary: string;
   steps: number;
+}
+
+export interface WatchdogAskOptions {
+  /**
+   * 人工问答默认保留短近期历史。维护申请等定向任务应传 false，
+   * 只用任务授权、当前状态和本次问题建立独立上下文。
+   *
+   * false 只影响本轮输入；问答仍会写入 wd_turn，之后的人工 ask 在压缩时
+   * 可能把这批问答纳入累计摘要。
+   */
+  history?: boolean;
+  /** 已知任务时聚焦该任务，并让本轮 Router 消息默认关联它。 */
+  taskId?: string | null;
 }
 
 function reviewStatePath(config: Config): string {
@@ -307,6 +461,14 @@ function saveReviewState(config: Config, state: ReviewState): void {
   }
 }
 
+/** 最近一次已落盘语义巡检时间；重启后据此避免再次立即做完整巡检。 */
+export function latestReviewTimestamp(config: Config): number | null {
+  const { state } = loadReviewState(config);
+  if (!state) return null;
+  const value = Date.parse(state.baseline.generatedAt);
+  return Number.isFinite(value) ? value : null;
+}
+
 export class WatchdogSession {
   private readonly deps: WatchdogDeps;
 
@@ -364,47 +526,149 @@ export class WatchdogSession {
     }
   }
 
-  private describeTask(taskId: string, limit: number): string {
+  /**
+   * 定向维护只带原任务授权与当前状态，不继承整段维护问答。
+   *
+   * result 是负责人提交的正式报告，正文有助于判断原目标是否被覆盖；
+   * 它仍只是报告，不能替代独立验证。
+   */
+  private taskFocus(taskId: string): string {
     const store = this.deps.store;
     const task = store.getTask(taskId);
     if (!task) return `任务不存在：${taskId}`;
     const lines: string[] = [];
     lines.push(`# ${task.title}（${task.id}）状态 ${task.status}｜要求版本 ${task.reviewEpoch}`);
+    lines.push(`维护状态：${task.maintenance === 1 ? '已挂起' : '正常调度'}｜负责人 ${task.ownerWorkerId ?? '-'}`);
     lines.push(`目标：${task.goal}`);
+    lines.push(`原始任务说明/授权：${task.brief || '(未填写)'}`);
     lines.push(`完成条件：${task.doneCriteria || '(未填写)'}`);
-    lines.push(`历史负责人：${task.ownerWorkerId ?? '无'}`);
+    const messages = store.listTaskMessages(task.id, 200);
+    const result = messages.filter((message) => message.kind === 'result').at(-1);
+    if (result) {
+      const refs = result.refs?.artifacts?.map((artifact) =>
+        `${artifact.name} v${artifact.version}(${artifact.artifactId})`,
+      ) ?? [];
+      lines.push(
+        `最新正式结果 [${result.id}｜${result.createdAt}]：由负责人 ${result.fromId} 提交；` +
+          '这只是负责人报告，不等于独立验证原目标。',
+      );
+      const body = result.body || '(空)';
+      lines.push(body.slice(0, 3_000));
+      if (body.length > 3_000) {
+        lines.push(
+          `（正式结果正文已截断 ${body.length - 3_000} 字符；` +
+            `完整内容用 inspect_task(task_id="${task.id}", result_id="${result.id}") 查回）`,
+        );
+      }
+      if (refs.length > 0) lines.push(`结果引用产物：${refs.join('、')}`);
+    } else {
+      lines.push('最新正式结果：无');
+    }
     const workers = store.listTaskWorkers(task.id);
     if (workers.length === 0) lines.push('当前任务成员：无');
     for (const worker of workers) {
-      lines.push(`\n## Worker ${worker.id}（${worker.role}）${worker.status}｜${worker.stepCount} 步`);
+      lines.push(
+        `Worker ${worker.id}（${worker.role}）${worker.status}｜${worker.stepCount} 步` +
+          `${worker.lastError ? `｜错误 ${worker.lastError}` : ''}`,
+      );
       const waits = store.listActiveWaitsForWorker(worker.id);
-      for (const wait of waits) lines.push(`  等待 ${wait.reason}${wait.matchReplyTo ? ` 请求:${wait.matchReplyTo}` : ''}${wait.matchFrom ? ` 来源:${wait.matchFrom}` : ''}${wait.matchJob ? ` 作业:${wait.matchJob}` : ''}`);
-      const turns = store.listWorkerTurns(worker.id, limit);
-      for (const turn of turns.slice(-limit)) {
-        const calls = turn.toolCalls ? ` 调用:${(turn.toolCalls as { name: string }[]).map((call) => call.name).join(',')}` : '';
-        const body = (turn.content ?? '').replace(/\s+/g, ' ').slice(0, 200);
-        lines.push(`  turn#${turn.seq} ${turn.role}${calls} ${body}`);
+      for (const wait of waits) {
+        lines.push(
+          `  等待 ${wait.reason}${wait.matchReplyTo ? ` 请求:${wait.matchReplyTo}` : ''}` +
+            `${wait.matchFrom ? ` 来源:${wait.matchFrom}` : ''}${wait.matchJob ? ` 作业:${wait.matchJob}` : ''}` +
+            `｜截止 ${wait.deadlineAt}`,
+        );
       }
     }
-    // 产物与检查是判断"有没有真的交付"的直接证据，必须出现在观察结果里。
     const artifacts = store.listArtifacts(task.id);
+    const latest = artifacts.reduce((map, artifact) => {
+      const current = map.get(artifact.name);
+      if (!current || artifact.version > current.version) map.set(artifact.name, artifact);
+      return map;
+    }, new Map<string, typeof artifacts[number]>());
     lines.push(
-      `产物：${artifacts.length === 0 ? '无' : artifacts.map((item) => `${item.name} v${item.version}`).join('、')}`,
+      `产物：${artifacts.length === 0
+        ? '无'
+        : [...latest.values()].map((item) => `${item.name} v${item.version}(${item.id})`).join('、')}`,
     );
     const reviews = store.listReviews(task.id);
     if (reviews.length > 0) {
-      lines.push('## 检查');
-      for (const review of reviews.slice(-5)) {
+      lines.push('当前检查：');
+      for (const review of reviews.slice(-8)) {
         const artifact = artifacts.find((item) => item.id === review.artifactId);
         const latest = artifact && !artifacts.some((item) => item.name === artifact.name && item.version > artifact.version);
         const current = latest && artifact.sha256 === review.artifactSha256 && review.epoch === task.reviewEpoch;
-        lines.push(`  ${review.artifactId ?? '-'} ${review.outcome} 要求版本 ${review.epoch}｜${current ? '当前产物及要求' : '历史/失效记录'}`);
+        lines.push(
+          `  ${review.id}｜${artifact?.name ?? '-'} v${review.artifactVersion}｜${review.outcome}` +
+            `｜${current ? '当前产物及要求' : '历史/失效记录'}`,
+        );
+      }
+      if (reviews.length > 8) {
+        lines.push(
+          `  另有 ${reviews.length - 8} 条较早检查未展开；` +
+            `可按 review id 用 inspect_task(task_id="${task.id}", review_id="...") 查回。`,
+        );
       }
     }
-    const jobs = store.listJobs(task.id).slice(-8);
+    const jobs = store.listJobs(task.id);
+    const runningJobs = jobs.filter((job) => job.status === 'running');
+    const focusedJobs = [
+      ...runningJobs,
+      ...jobs.filter((job) => job.status !== 'running' && job.exitCode !== 0).slice(-2),
+      ...jobs.filter((job) => job.status !== 'running').slice(-1),
+    ].filter((job, index, values) => values.findIndex((item) => item.id === job.id) === index);
     if (jobs.length > 0) {
-      lines.push('\n## 作业');
-      for (const job of jobs) lines.push(`  ${job.id} ${job.status} exit=${job.exitCode ?? '-'} ${job.command}`);
+      lines.push('作业重点：');
+      for (const job of focusedJobs) lines.push(`  ${job.id} ${job.status} exit=${job.exitCode ?? '-'} ${job.command}`);
+      if (jobs.length > focusedJobs.length) {
+        lines.push(
+          `  运行中作业 ${runningJobs.length} 个，已全部展开；` +
+            `另有 ${jobs.length - focusedJobs.length} 个较早结束的非重点作业未展开。`,
+        );
+      }
+    }
+    return lines.join('\n');
+  }
+
+  private describeTask(
+    taskId: string,
+    limit: number,
+    resultId: string | null = null,
+    reviewId: string | null = null,
+  ): string {
+    const store = this.deps.store;
+    const task = store.getTask(taskId);
+    if (!task) return `任务不存在：${taskId}`;
+    if (resultId) {
+      const message = store.getMessage(resultId);
+      if (!message || message.taskId !== task.id || message.kind !== 'result') {
+        return `任务 ${task.id} 中找不到正式结果 ${resultId}`;
+      }
+      return `# 正式结果全文 ${message.id}｜${message.createdAt}\n${message.body || '(空)'}`;
+    }
+    if (reviewId) {
+      const review = store.listReviews(task.id).find((item) => item.id === reviewId);
+      if (!review) return `任务 ${task.id} 中找不到检查 ${reviewId}`;
+      const reply = review.replyMessageId ? store.getMessage(review.replyMessageId) : null;
+      return [
+        `# 检查 ${review.id}｜产物 ${review.artifactId} v${review.artifactVersion}｜${review.outcome}`,
+        `要求版本 ${review.epoch}｜请求消息 ${review.requestMessageId}｜回复消息 ${review.replyMessageId ?? '-'}`,
+        reply ? `回复正文：\n${reply.body || '(空)'}` : '（还没有检查回复正文）',
+      ].join('\n');
+    }
+    const lines = this.taskFocus(taskId).split('\n');
+    lines.push('', '## 需进一步调查的 Worker 历史');
+    const workers = store.listTaskWorkers(task.id);
+    if (workers.length === 0) lines.push('无当前成员');
+    for (const worker of workers) {
+      const turns = store.listWorkerTurns(worker.id, limit);
+      for (const turn of turns.slice(-limit)) {
+        const calls = turn.toolCalls
+          ? ` 调用:${(turn.toolCalls as { name: string }[]).map((call) => call.name).join(',')}`
+          : '';
+        const body = (turn.content ?? '').replace(/\s+/g, ' ').slice(0, 200);
+        lines.push(`  ${worker.id} turn#${turn.seq} ${turn.role}${calls} ${body}`);
+      }
     }
     return lines.join('\n');
   }
@@ -440,25 +704,35 @@ export class WatchdogSession {
     const note = this.deps.store.latestWatchdogNote();
     // 只取问答：wd_turn 里的 tool 记录是给人看的摘要，没有 toolCallId，
     // 塞进请求会变成「没有归属的工具结果」，提供方直接拒绝。
-    const turns = this.deps.store
-      .listWdDialogueSince(note?.coveredRow ?? 0)
-      .filter((turn) => turn.role === 'user' || turn.role === 'assistant');
-    const plan = planWindow({
-      items: turns.map((turn) => ({ turn, chars: turn.content.length })),
-      keepRecentTokens: limits.routerKeepRecentTokens,
-      contextWindowTokens: limits.contextWindowTokens,
-      reserveTokens: limits.routerReserveTokens,
-      // 真实 usage 当基准。之前只用 chars/4 全量估算，中文低估 2.3 倍，
-      // 400k 字符被当成 10 万 token，阈值 15 万永远够不到，上下文一路涨到 23 万。
-      measuredTokens: this.deps.store.measureContextTokens({ purpose: 'watchdog' }),
-    });
-    const kept = plan.kept.map((item) => item.turn);
-    const dropped = plan.dropped.map((item) => item.turn);
+    const turns = listAllWdDialogueSince(this.deps.store, note?.coveredRow ?? 0);
+    const grouped = groupDialogue(turns);
+    const groupLimit = Math.max(1, limits.watchdogHistoryGroups);
+    const recentGroups = grouped.groups.slice(-groupLimit);
+    const olderGroups = grouped.groups.slice(0, Math.max(0, grouped.groups.length - groupLimit));
+
+    // 从最新问答组向前装箱。一组只要超出剩余预算就整组退出近期历史，
+    // 不会留下一个只有提问、没有回答的半组。
+    const keepRecentTokens = Math.max(1, limits.watchdogKeepRecentTokens);
+    let firstKeptGroup = recentGroups.length;
+    let keptTokens = 0;
+    for (let index = recentGroups.length - 1; index >= 0; index -= 1) {
+      const groupTokens = recentGroups[index]!
+        .reduce((sum, turn) => sum + estimateDialogueTokens(turn.content), 0);
+      if (keptTokens + groupTokens > keepRecentTokens) break;
+      keptTokens += groupTokens;
+      firstKeptGroup = index;
+    }
+    const kept = recentGroups.slice(firstKeptGroup).flat();
+    const dropped = [
+      ...grouped.leading,
+      ...olderGroups.flat(),
+      ...recentGroups.slice(0, firstKeptGroup).flat(),
+    ].sort((left, right) => left.row - right.row);
     return {
       history: kept.map((item): ChatMessage => ({ role: item.role, content: item.content, ...(item.piMessage ? { piMessage: item.piMessage } : {}) })),
       note: note?.content ?? null,
       toSummarize:
-        plan.shouldCompact && dropped.length > 0
+        dropped.length > 0
           ? { turns: dropped, fromRow: dropped[0]!.row, toRow: dropped[dropped.length - 1]!.row }
           : null,
     };
@@ -472,38 +746,70 @@ export class WatchdogSession {
     toRow: number;
   }): Promise<string | null> {
     const { store, model, modelName, config } = this.deps;
-    try {
-      const result = await new RecordingModel(model, store, 'watchdog', { sessionId: null }).chat({
-        model: modelName,
-        messages: [
-          {
-            role: 'system',
-            content: 'Maintain a traceable note of the Super-Agent maintenance session for future Watchdog context. Preserve evidence and uncertainty without inventing facts or continuing the conversation.',
-          },
-          {
-            role: 'user',
-            content: `# Previous note\n${input.previous ?? '(first note)'}\n\n` +
-              `# New conversation\n${input.turns.map((turn) => `[${turn.role === 'user' ? 'Maintainer' : 'Watchdog'}] ${turn.content}`).join('\n\n')}\n\n` +
-              `Maintain current observations, evidence and its scope, actions and results, unresolved issues and conditions for rechecking. Update superseded decisions and retain uncertainty. Output only the note, at most ${config.limits.routerNoteMaxChars} characters.`,
-          },
-        ],
-        tools: [],
-        reasoningEffort: 'low',
+    const maxChars = Math.max(
+      1_000,
+      Math.min(
+        config.limits.routerNoteMaxChars,
+        config.limits.noteMaxChars,
+        config.limits.watchdogKeepRecentTokens,
+      ),
+    );
+    const chunks = chunkDialogueTurns(input.turns, config.limits.noteInputChars);
+    if (chunks.length === 0) return null;
+    let completedChunks = 0;
+    const recordFailure = (reason: string): null => {
+      store.appendWdAction({
+        id: `wda_${randomBytes(4).toString('hex')}`,
+        issueId: null,
+        action: 'note_compact_failed',
+        reason: '维护会话早期历史压缩失败',
+        expected: '更新可追溯的累计摘要并推进覆盖水位',
+        result:
+          `范围 row ${input.fromRow}-${input.toRow}，${input.turns.length} 条问答；` +
+          `已完成 ${completedChunks}/${chunks.length} 批；原因：${reason.slice(0, 500)}`,
       });
-      const content = (result.text ?? '').trim();
-      if (content === '') return null;
+      return null;
+    };
+    try {
+      let previous = input.previous;
+      for (const chunk of chunks) {
+        const result = await new RecordingModel(model, store, 'watchdog', { sessionId: null }).chat({
+          model: modelName,
+          messages: [
+            {
+              role: 'system',
+              content: 'Maintain a traceable note of the Super-Agent maintenance session for future Watchdog context. Preserve evidence and uncertainty without inventing facts or continuing the conversation.',
+            },
+            {
+              role: 'user',
+              content: `# Previous note\n${previous ?? '(first note)'}\n\n` +
+                `# New conversation\n${chunk.map((turn) => `[${turn.role === 'user' ? 'Maintainer' : 'Watchdog'}] ${turn.content}`).join('\n\n')}\n\n` +
+                `Maintain current observations, evidence and its scope, actions and results, unresolved issues and conditions for rechecking. ` +
+                  `Keep the note complete enough to replace every summarized turn. Update superseded decisions and retain uncertainty. ` +
+                  `Output only the note, at most ${maxChars} characters.`,
+            },
+          ],
+          tools: [],
+          reasoningEffort: 'low',
+        });
+        const content = (result.text ?? '').trim();
+        if (content === '') return recordFailure('摘要模型返回空内容');
+        previous = content;
+        completedChunks += 1;
+      }
+      if (!previous) return recordFailure('没有可保存的累计摘要');
       store.insertWatchdogNote({
         id: `wdn_${randomBytes(4).toString('hex')}`,
         fromRow: input.fromRow,
         toRow: input.toRow,
         coveredRow: input.toRow,
-        content,
+        content: previous,
         sourceTurns: input.turns.length,
         sourceChars: input.turns.reduce((sum, turn) => sum + turn.content.length, 0),
       });
-      return content;
-    } catch {
-      return null;
+      return previous;
+    } catch (error) {
+      return recordFailure((error as Error).message);
     }
   }
 
@@ -514,14 +820,31 @@ export class WatchdogSession {
    * 否则刚被压掉的那几条会同时出现在摘要和原文里。
    */
   private async contextForTurn(): Promise<{ system: string; history: ChatMessage[] }> {
-    const { note, toSummarize } = this.dialogueHistory();
+    const { history, note, toSummarize } = this.dialogueHistory();
     let merged = note;
-    if (toSummarize) merged = (await this.runNote({ previous: note, ...toSummarize })) ?? note;
-    const system = merged ? `${WATCHDOG_SYSTEM}\n\n# 更早维护对话的累计记录\n${merged}` : WATCHDOG_SYSTEM;
-    return { system, history: this.dialogueHistory().history };
+    let noteFailed = false;
+    if (toSummarize) {
+      const next = await this.runNote({ previous: note, ...toSummarize });
+      noteFailed = next === null;
+      if (next !== null) merged = next;
+    }
+    let system = WATCHDOG_SYSTEM;
+    if (noteFailed) {
+      system += '\n\n# 早期维护历史压缩失败\n' +
+        '本轮没有包含已退出近期窗口的早期问答，累计记录也未能更新；当前结论可能缺少早期细节。' +
+        '只能从已有累计记录、read_inspection 或已存结论查回，不能把未包含的信息当作不存在。';
+    }
+    if (merged) {
+      system += `\n\n# 更早维护对话的完整累计记录（替代已压缩的旧问答）\n${merged}`;
+    }
+    return { system, history };
   }
 
-  private async executeTool(name: string, args: Record<string, unknown>): Promise<string | ToolOutcome> {
+  private async executeTool(
+    name: string,
+    args: Record<string, unknown>,
+    context: { defaultTaskId?: string | null } = {},
+  ): Promise<string | ToolOutcome> {
     const store = this.deps.store;
     const failed = (content: string): ToolOutcome => ({ type: 'failed', content });
     const str = (key: string): string => (typeof args[key] === 'string' ? (args[key] as string) : '');
@@ -532,20 +855,46 @@ export class WatchdogSession {
       const body = str('text').trim();
       if (body === '') return failed('通报内容不能为空');
       const id = `ic_${randomBytes(4).toString('hex')}`;
-      store.insertIntercom({
-        id,
-        fromLayer: 'watchdog',
-        kind: 'notice',
-        body: body.slice(0, 2000),
-      });
-      return `已保存通报（${id}），无会话归属，等待管理入口查看。`;
+      const explicitTaskId = str('task_id').trim();
+      if (context.defaultTaskId && explicitTaskId && explicitTaskId !== context.defaultTaskId) {
+        return failed('任务绑定的维护问答不能把 Router 消息改投到另一个任务');
+      }
+      const taskId = explicitTaskId || context.defaultTaskId || null;
+      if (taskId) {
+        store.insertTaskIntercom({
+          id,
+          fromLayer: 'watchdog',
+          kind: 'notice',
+          body: body.slice(0, 2000),
+          taskId,
+        });
+        return `已保存定向通报（${id}｜任务 ${taskId}），Router 会在该任务来源会话处理。`;
+      }
+      store.insertIntercom({ id, fromLayer: 'watchdog', kind: 'notice', body: body.slice(0, 2000) });
+      return `已保存通报（${id}），没有明确任务归属，等待管理入口查看。`;
     }
     if (name === 'ask_router') {
       const question = str('question').trim();
       if (question === '') return failed('问题不能为空');
       const id = `ic_${randomBytes(4).toString('hex')}`;
+      const explicitTaskId = str('task_id').trim();
+      if (context.defaultTaskId && explicitTaskId && explicitTaskId !== context.defaultTaskId) {
+        return failed('任务绑定的维护问答不能把 Router 消息改投到另一个任务');
+      }
+      const taskId = explicitTaskId || context.defaultTaskId || null;
+      if (taskId) {
+        store.insertTaskIntercom({
+          id,
+          fromLayer: 'watchdog',
+          kind: 'question',
+          body: question.slice(0, 2000),
+          taskId,
+          topicId: id,
+        });
+        return `问题已保存（${id}｜任务 ${taskId}），Router 会在该任务来源会话处理并回复。`;
+      }
       store.insertIntercom({ id, fromLayer: 'watchdog', kind: 'question', body: question.slice(0, 2000), topicId: id });
-      return `问题已保存（${id}），无会话归属，等待管理入口查看并回复。`;
+      return `问题已保存（${id}），没有明确任务归属，等待管理入口查看并回复。`;
     }
     if (name === 'reply_intercom') {
       const target = str('message_id').trim();
@@ -608,7 +957,12 @@ export class WatchdogSession {
       return `${id}｜${job.status}｜退出码 ${job.exitCode ?? '-'}${job.error ? `｜${job.error}` : ''}\n${output?.text ?? '（暂无输出）'}`;
     }
     if (name === 'inspect_task') {
-      return this.describeTask(str('task_id'), num('limit', 15));
+      return this.describeTask(
+        str('task_id'),
+        num('limit', 15),
+        str('result_id') || null,
+        str('review_id') || null,
+      );
     }
     if (name === 'read_history') {
       const turns = store.listWorkerTurns(str('worker_id'), num('limit', 20));
@@ -684,7 +1038,7 @@ export class WatchdogSession {
       const checkAfter = new Date(Date.now() + minutes * 60_000).toISOString();
       store.upsertWdIssue({
         id: issueId,
-        taskId: str('task_id') || null,
+        taskId: str('task_id') || context.defaultTaskId || null,
         title: str('title'),
         note: str('note') || '',
         checkAfter,
@@ -702,19 +1056,36 @@ export class WatchdogSession {
     return failed(`未知工具：${name}`);
   }
 
-  /** 维护者提问：用同一套会话与工具，主系统不可用时也能回答。 */
-  async ask(question: string): Promise<string> {
+  /**
+   * 维护者提问。
+   *
+   * 调用签名保持兼容；第二个参数只增加短历史范围与任务聚焦，不影响原
+   * `ask(question)` 行为。当前问题在上下文装配之后才落库，因此不会同时
+   * 出现在 history 与本轮 prompt 中。
+   */
+  async ask(question: string, options: WatchdogAskOptions = {}): Promise<string> {
     const { store, config, model, modelName } = this.deps;
-    const observation = observe(store, config);
+    const includeHistory = options.history ?? true;
+    const taskId = options.taskId?.trim() || null;
+    const context = includeHistory
+      ? await this.contextForTurn()
+      : { system: WATCHDOG_SYSTEM, history: [] as ChatMessage[] };
+    const observation = taskId ? null : observe(store, config);
     const health = this.deps.health?.();
     const openIssues = store.listOpenIssues();
+    const scopedIssues = taskId ? openIssues.filter((issue) => issue.taskId === taskId) : openIssues;
     const prior = loadReviewState(config);
     store.appendWdTurn({ id: `wdt_${randomBytes(4).toString('hex')}`, role: 'user', content: question });
 
     // 循环交给 pi 的 agent-loop（和 Worker 同一条路）：工具批处理、步数、截断作废都在内核里。
     const repeats = new Map<string, number>();
-    const context = await this.contextForTurn();
     let lastAssistant: import('@earendil-works/pi-ai').AssistantMessage | undefined;
+    const evidence = taskId
+      ? `## 当前任务授权与状态\n${this.taskFocus(taskId)}`
+      : `## 当前观察\n${observation
+          ? renderReviewContext(observation, prior.state, openIssues, prior.warning)
+          : '(没有可用观察)'}`;
+    const instanceScope = renderInstanceScope(config);
     const result = await runWorkerTurn({
       model: modelName,
       modelClient: new RecordingModel(model, store, 'watchdog', { sessionId: null }),
@@ -723,11 +1094,15 @@ export class WatchdogSession {
       prompts: [{
         role: 'user',
         content:
-          `# 维护者提问\n${question}\n\n## 当前观察\n` +
-          `${renderReviewContext(observation, prior.state, openIssues, prior.warning)}\n\n` +
-          `## 主系统健康\n${health ? `${health.state}｜${health.detail}` : '未知'}\n\n` +
-          `## 未解决事件\n${openIssues.map((issue) => `- ${issue.id}｜${issue.title}｜${issue.note ?? ''}`).join('\n') || '（无）'}\n\n` +
-          `先用工具核对证据再回答。说清楚哪些是已确认的事实、哪些还不确定。`,
+          `# 维护者提问\n${question}\n\n${instanceScope}\n\n${evidence}\n\n` +
+          `## 主系统健康\n${health
+            ? `${health.state}｜${health.detail}${health.degraded ? '｜降级观察' : ''}`
+            : '未知'}\n\n` +
+          `## 相关未解决事件\n${scopedIssues
+            .map((issue) => `- ${issue.id}｜${issue.title}｜${issue.note ?? ''}`)
+            .join('\n') || '（无）'}\n\n` +
+          '先复用上面已经成立的事实和有效证据；只有缺口可能改变当前决定时，才做最小范围的工具核对。' +
+          '说清楚哪些是已确认事实、哪些仍不确定。',
       }],
       protectedMessageIndexes: [context.history.length],
       onStep: (message) => { if (!message.content.some((block) => block.type === 'toolCall')) lastAssistant = message; },
@@ -740,7 +1115,11 @@ export class WatchdogSession {
         repeats.set(key, seen);
         let outcome: ToolOutcome;
         try {
-          const result = await this.executeTool(call.name, JSON.parse(call.arguments || '{}') as Record<string, unknown>);
+          const result = await this.executeTool(
+            call.name,
+            JSON.parse(call.arguments || '{}') as Record<string, unknown>,
+            { defaultTaskId: taskId },
+          );
           outcome = typeof result === 'string' ? { type: 'ok', content: result } : result;
         } catch (error) {
           outcome = { type: 'failed', content: `执行失败：${(error as Error).message}` };
@@ -788,15 +1167,9 @@ export class WatchdogSession {
     // 当前变化、open issues 和未答 intercom 已由本轮提示明确给出。
     // 人工 ask() 仍走 contextForTurn()，保留完整维护对话。
     const context = { system: WATCHDOG_SYSTEM, history: [] as ChatMessage[] };
+    const instanceScope = renderInstanceScope(config);
     const routerMessages = renderRouterMessages(store);
     const newMessages = store.listPendingIntercom('watchdog', 8);
-    if (newMessages.length > 0) {
-      store.tx(() => {
-        const content = newMessages.map((message) => `[${message.id}] ${message.kind}｜${message.body}${message.refs?.length ? `｜引用：${message.refs.join('、')}` : ''}`).join('\n');
-        store.appendWdTurn({ id: `wdt_${randomBytes(4).toString('hex')}`, role: 'user', content });
-        for (const message of newMessages) store.markIntercomDelivered(message.id);
-      });
-    }
     let lastAssistant: import('@earendil-works/pi-ai').AssistantMessage | undefined;
     const result = await runWorkerTurn({
       model: modelName,
@@ -806,7 +1179,9 @@ export class WatchdogSession {
       prompts: [{
         role: 'user',
         content: observationPrompt({
-          observation: renderReviewContext(observation, prior.state, openIssues, prior.warning),
+          observation:
+            `${instanceScope}\n\n` +
+            renderReviewContext(observation, prior.state, openIssues, prior.warning),
           issues,
           lastActions: '',
           now: nowIso(),
@@ -833,6 +1208,25 @@ export class WatchdogSession {
         }
       },
     });
+
+    if (result.stop === 'error') {
+      throw new Error(result.reason || '维护模型执行失败');
+    }
+
+    // 只有模型循环成功返回后才记投递。若提供方或循环在收到消息后失败，
+    // intercom 保持 pending，下一轮仍能重新注入；主进程对同一批失败消息退避。
+    if (newMessages.length > 0) {
+      store.tx(() => {
+        const content = newMessages
+          .map((message) =>
+            `[${message.id}] ${message.kind}｜${message.body}` +
+              `${message.refs?.length ? `｜引用：${message.refs.join('、')}` : ''}`
+          )
+          .join('\n');
+        store.appendWdTurn({ id: `wdt_${randomBytes(4).toString('hex')}`, role: 'user', content });
+        for (const message of newMessages) store.markIntercomDelivered(message.id);
+      });
+    }
 
     const answer = (result.assistantText ?? '').trim();
     const summary = answer !== '' ? answer : `本轮达到 ${result.steps} 步上限，已记录当前观察`;

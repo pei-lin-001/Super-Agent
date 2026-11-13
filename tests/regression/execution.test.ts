@@ -6,6 +6,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Execution, ExecutionRevoked, isRevoked, outsideRevocation } from '../../src/runtime/execution.ts';
+import { createHarness } from '../helpers.ts';
+import { mockReply } from '../../src/model/mock.ts';
 
 test('撤销后等结果：立即以 ExecutionRevoked 结束，不等底层', async () => {
   const execution = new Execution('unit');
@@ -66,4 +68,62 @@ test('已经撤销的执行：再次 run 仍然保持撤销状态', async () => 
     }),
     (error: unknown) => error instanceof ExecutionRevoked,
   );
+});
+
+test('任务缺失时由外层统一收敛，失败状态不会被执行撤销拦住', async () => {
+  let modelCalled = false;
+  const harness = await createHarness({
+    limits: { maxConcurrentRuns: 0 },
+    worker: () => {
+      modelCalled = true;
+      return mockReply({ text: '不应调用模型' });
+    },
+  });
+  try {
+    const now = new Date().toISOString();
+    const workerId = 'w_missing_task';
+    const missingTaskId = 'task_missing_context';
+    harness.store.createWorker({
+      id: workerId,
+      groupId: 'grp_missing_context',
+      workspaceId: 'grp_missing_context',
+      currentTaskId: missingTaskId,
+      parentId: null,
+      role: '负责人',
+      brief: '验证缺失任务错误路径',
+      status: 'queued',
+      model: 'default',
+      stepCount: 0,
+      createdAt: now,
+      updatedAt: now,
+      lastError: null,
+    });
+
+    const statusEvents: string[] = [];
+    const errorEvents: string[] = [];
+    const off = harness.runtime.on((event) => {
+      if (event.type === 'worker.status' && event.workerId === workerId) statusEvents.push(event.status);
+      if (event.type === 'error') errorEvents.push(event.text);
+    });
+
+    harness.config.limits.maxConcurrentRuns = 1;
+    harness.runtime.enqueue(workerId);
+    for (let attempt = 0; attempt < 200 && harness.store.getWorker(workerId)?.status !== 'failed'; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    const failed = harness.store.getWorker(workerId)!;
+    assert.equal(failed.status, 'failed');
+    assert.match(failed.lastError ?? '', new RegExp(`Worker ${workerId} 的当前任务不存在`));
+    assert.match(failed.lastError ?? '', new RegExp(`currentTaskId=${missingTaskId}`));
+    assert.doesNotMatch(failed.lastError ?? '', /执行已结束|ExecutionRevoked/);
+    assert.deepEqual(statusEvents, ['failed']);
+    assert.ok(errorEvents.some((text) => text.includes(missingTaskId)), '失败事件必须带任务上下文');
+    assert.equal(harness.runtime.stats().running, 0);
+    assert.equal(harness.runtime.stats().queued, 0);
+    assert.equal(modelCalled, false, '任务不存在时不应调用模型');
+    off();
+  } finally {
+    await harness.cleanup();
+  }
 });

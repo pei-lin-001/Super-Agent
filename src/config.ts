@@ -23,8 +23,16 @@ export interface Limits {
   maxNudges: number;
   /** Router 单次运行的调度轮数上限，超出后保存进度并在下次 tick 继续。 */
   maxRouterRounds: number;
-  /** Watchdog 巡检间隔（毫秒）。 */
+  /** Watchdog 活跃任务语义巡检间隔（毫秒）；兼容旧 WATCHDOG_INTERVAL_MS。 */
   watchdogIntervalMs: number;
+  /** Watchdog 无活跃任务时的语义巡检间隔（毫秒），可低于或高于活跃间隔。 */
+  watchdogIdleIntervalMs: number;
+  /** Watchdog 仅做数据库、队列和进程健康检查的本地 tick 间隔（毫秒）。 */
+  watchdogHealthTickMs: number;
+  /** 人工维护问答最多重发的最近问答组数；一组包含 user + assistant。 */
+  watchdogHistoryGroups: number;
+  /** 人工维护问答的近期历史 token 预算；与 Router 的通用窗口分开。 */
+  watchdogKeepRecentTokens: number;
   /**
    * 近期历史窗口的字符预算（字符数，不是 token）。
    *
@@ -333,7 +341,13 @@ export function loadConfig(options: { requireModel?: boolean } = {}): Config {
       modelRetry: intEnv('MODEL_RETRY', 2),
       maxNudges: 3,
       maxRouterRounds: intEnv('MAX_ROUTER_ROUNDS', 6),
-      watchdogIntervalMs: intEnv('WATCHDOG_INTERVAL_MS', 60_000),
+      // 旧变量名保留为“活跃语义巡检”唯一兼容入口。显式设置为 60000 时仍按
+      // 60 秒执行；不设置时新默认是 10 分钟。本地健康 tick 与空闲巡检另配。
+      watchdogIntervalMs: intEnv('WATCHDOG_INTERVAL_MS', 600_000),
+      watchdogIdleIntervalMs: intEnv('WATCHDOG_IDLE_INTERVAL_MS', 1_800_000),
+      watchdogHealthTickMs: intEnv('WATCHDOG_HEALTH_TICK_MS', 10_000),
+      watchdogHistoryGroups: intEnv('WATCHDOG_HISTORY_GROUPS', 12),
+      watchdogKeepRecentTokens: intEnv('WATCHDOG_KEEP_RECENT_TOKENS', 4_000),
       contextWindowChars: intEnv('CONTEXT_WINDOW_CHARS', 200_000),
       pairingOvershootChars: intEnv('CONTEXT_PAIRING_OVERSHOOT_CHARS', 8_000),
       // Router 的压缩阈值取 min(窗口-reserve, 窗口*0.75)：窗口越大，前者越接近窗口本身，

@@ -220,6 +220,7 @@ export function buildNotePrompt(input: {
   const user = `# Task (program record)
 - Title: ${task.title}
 - Goal: ${task.goal}
+- Background, constraints and authorization: ${task.brief || '(none specified)'}
 - Completion criteria: ${task.doneCriteria || '(none specified)'}
 - Requirements version: ${task.reviewEpoch}
 - Worker: ${worker.id} (${worker.role})
@@ -234,7 +235,7 @@ ${renderTurnsForNote(decision.turns)}
 ${opsBlock || '(none)'}
 
 # Output
-Maintain the current decision state: explicit requirements and remaining work, conclusions and their conditions, key evidence with references and actual coverage, resolved and consequential remaining unknowns, dependencies, execution status and failures. Update or retire superseded judgments and stale tasks; distinguish optional exploration and proposed thresholds from user requirements. Preserve the force and scope of claims when compressing. Distinguish observed facts, inference and uncertainty; do not invent reasoning or upgrade a limited search into proof of absence.
+Maintain the current decision state: the user's goal, explicit requirements, still-valid authorization and remaining work, conclusions and their conditions, key evidence with references and actual coverage, resolved and consequential remaining unknowns, dependencies, execution status and failures. Preserve who needs a finding or correction and what action remains with them. Update or retire superseded judgments and stale tasks; distinguish optional exploration and proposed thresholds from user requirements. Preserve the force and scope of claims when compressing. Distinguish observed facts, inference and uncertainty; do not invent reasoning or upgrade a limited search into proof of absence.
 A call without a result has unknown execution status (cite turn#N); preserve an explicit "未执行" as not executed. Reviews and submissions are determined by program records. Truncated input does not prove the original lacked information or was unread; retain turn#N, msg IDs, artifact IDs or filenames for retrieval. Output only the record, at most ${limits.noteMaxChars} characters, in the language useful to the Worker.`;
 
   return [

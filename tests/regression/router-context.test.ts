@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { allText, createHarness, systemText } from '../helpers.ts';
-import { mockReply } from '../../src/model/mock.ts';
+import { mockError, mockReply } from '../../src/model/mock.ts';
 import { sessionKeyOf } from '../../src/channels/types.ts';
 import type { ChatRequest } from '../../src/model/types.ts';
 import { boundRouterHistory } from '../../src/runtime/router-context.ts';
@@ -104,6 +104,115 @@ test('Router 请求：状态在历史后且不会写入持久对话', async () =
     const stored = harness.store.listRouterTurns(100, TG_KEY);
     assert.ok(stored.some((turn) => turn.content === '第一句话'));
     assert.ok(stored.every((turn) => !(turn.content ?? '').includes('Current system state')));
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('Router 摘要：成功时本轮只注入新的累计记录，旧记录和重复系统消息不再并存', async () => {
+  const calls: ChatRequest[] = [];
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    limits: { contextWindowTokens: 2_000, routerReserveTokens: 100, routerKeepRecentTokens: 300 },
+    router: ({ request }) => {
+      calls.push(request);
+      if (isNoteCall(request)) return mockReply({ text: 'NEW_CUMULATIVE_NOTE' });
+      return mockReply({ text: '好的' });
+    },
+  });
+  try {
+    harness.store.insertRouterNote({
+      id: 'rn_old',
+      sessionKey: TG_KEY,
+      conversationId: null,
+      fromSeq: 1,
+      toSeq: 2,
+      coveredSeq: 2,
+      content: 'OLD_CUMULATIVE_NOTE',
+      sourceTurns: 2,
+      sourceChars: 800,
+    });
+    for (let index = 0; index < 18; index += 1) {
+      harness.store.appendRouterTurn({
+        id: `rt_seed_u_${index}`,
+        role: 'user',
+        content: `用户历史 ${index}：${'内容'.repeat(200)}`,
+        sessionKey: TG_KEY,
+        conversationId: null,
+        createdAt: new Date(Date.UTC(2026, 10, 13, 0, 0, index)).toISOString(),
+      });
+      harness.store.appendRouterTurn({
+        id: `rt_seed_a_${index}`,
+        role: 'assistant',
+        content: `助手历史 ${index}：${'回复'.repeat(200)}`,
+        sessionKey: TG_KEY,
+        conversationId: null,
+        createdAt: new Date(Date.UTC(2026, 10, 13, 0, 1, index)).toISOString(),
+      });
+    }
+
+    await harness.router.handleUserMessage('最新用户输入', { sessionKey: TG_KEY });
+    const actual = calls.filter((request) => !isNoteCall(request)).at(-1)!;
+    const text = allText(actual);
+    assert.equal((text.match(/NEW_CUMULATIVE_NOTE/g) ?? []).length, 1);
+    assert.doesNotMatch(text, /OLD_CUMULATIVE_NOTE/);
+    assert.doesNotMatch(systemText(actual), /NEW_CUMULATIVE_NOTE|OLD_CUMULATIVE_NOTE/);
+    const lastUser = actual.messages.filter((message) => message.role === 'user').at(-1)!;
+    assert.match(lastUser.content ?? '', /NEW_CUMULATIVE_NOTE/);
+    assert.equal(harness.store.latestRouterNote(null, TG_KEY)?.content, 'NEW_CUMULATIVE_NOTE');
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('Router 摘要：生成失败时本轮继续使用旧累计记录', async () => {
+  const calls: ChatRequest[] = [];
+  const harness = await createHarness({
+    worker: () => mockReply({ text: '收到' }),
+    limits: { contextWindowTokens: 2_000, routerReserveTokens: 100, routerKeepRecentTokens: 300 },
+    router: ({ request }) => {
+      calls.push(request);
+      if (isNoteCall(request)) mockError('模拟摘要失败');
+      return mockReply({ text: '好的' });
+    },
+  });
+  try {
+    harness.store.insertRouterNote({
+      id: 'rn_old_failed',
+      sessionKey: TG_KEY,
+      conversationId: null,
+      fromSeq: 1,
+      toSeq: 2,
+      coveredSeq: 2,
+      content: 'OLD_NOTE_STILL_VALID',
+      sourceTurns: 2,
+      sourceChars: 800,
+    });
+    for (let index = 0; index < 18; index += 1) {
+      harness.store.appendRouterTurn({
+        id: `rt_failed_u_${index}`,
+        role: 'user',
+        content: `失败史 ${index}：${'内容'.repeat(200)}`,
+        sessionKey: TG_KEY,
+        conversationId: null,
+        createdAt: new Date(Date.UTC(2026, 10, 13, 1, 0, index)).toISOString(),
+      });
+      harness.store.appendRouterTurn({
+        id: `rt_failed_a_${index}`,
+        role: 'assistant',
+        content: `失败回复 ${index}：${'回复'.repeat(200)}`,
+        sessionKey: TG_KEY,
+        conversationId: null,
+        createdAt: new Date(Date.UTC(2026, 10, 13, 1, 1, index)).toISOString(),
+      });
+    }
+
+    await harness.router.handleUserMessage('摘要失败后的输入', { sessionKey: TG_KEY });
+    const actual = calls.filter((request) => !isNoteCall(request)).at(-1)!;
+    const text = allText(actual);
+    assert.equal((text.match(/OLD_NOTE_STILL_VALID/g) ?? []).length, 1);
+    assert.doesNotMatch(systemText(actual), /OLD_NOTE_STILL_VALID/);
+    assert.equal(harness.store.latestRouterNote(null, TG_KEY)?.content, 'OLD_NOTE_STILL_VALID');
   } finally {
     await harness.cleanup();
   }

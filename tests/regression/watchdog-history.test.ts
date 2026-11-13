@@ -11,9 +11,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { loadConfig } from '../../src/config.ts';
-import { MockModel } from '../../src/model/mock.ts';
+import { mockReply, MockModel } from '../../src/model/mock.ts';
 import { WatchdogSession } from '../../src/watchdog/session.ts';
 import { Store } from '../../src/storage/store.ts';
+import { createHarness } from '../helpers.ts';
 
 interface Captured {
   messages: { role: string; content: string | null; toolCalls?: { id: string }[]; toolCallId?: string }[];
@@ -300,6 +301,410 @@ test('历史选择：重启维护进程后仍然选最近的记录', async () =>
     const text = answerCall.messages.map((m) => m.content ?? '').join('\n');
     assert.match(text, /重启问题-12/, '重启后仍要读到最近的问答');
     assert.doesNotMatch(text, /重启问题-1\b/, '重启后不应回退到最早的历史');
+  } finally {
+    cleanup();
+  }
+});
+
+test('历史选择：按完整问答组裁剪，旧组进入摘要且不留下孤立 assistant', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    store.appendWdTurn({ id: 'leading', role: 'assistant', content: 'LEADING_INSPECTION' });
+    for (let index = 1; index <= 3; index += 1) {
+      store.appendWdTurn({ id: `group_u${index}`, role: 'user', content: `QUESTION_${index}` });
+      store.appendWdTurn({ id: `group_a${index}`, role: 'assistant', content: `ANSWER_${index}` });
+    }
+
+    let summary = '';
+    const answerCalls: Captured[] = [];
+    const model = new MockModel(({ request }) => {
+      const system = request.messages.find((message) => message.role === 'system')?.content ?? '';
+      if (system.includes('Maintain a traceable note of the Super-Agent maintenance session')) {
+        summary = request.messages.map((message) => message.content ?? '').join('\n');
+        return mockReply({ text: '累计摘要-分组' });
+      }
+      answerCalls.push({ messages: request.messages as Captured['messages'] });
+      return mockReply({ text: '最终回答' });
+    });
+    const config = loadConfig();
+    config.limits.watchdogHistoryGroups = 2;
+    config.limits.watchdogKeepRecentTokens = 10_000;
+    await new WatchdogSession({ store, config, model, modelName: 'm' }).ask('当前问题');
+
+    assert.match(summary, /LEADING_INSPECTION/);
+    assert.match(summary, /QUESTION_1/);
+    assert.match(summary, /ANSWER_1/);
+    const answer = answerCalls[0];
+    assert.ok(answer);
+    const text = answer.messages.map((message) => message.content ?? '').join('\n');
+    assert.doesNotMatch(text, /LEADING_INSPECTION|QUESTION_1|ANSWER_1/);
+    assert.match(text, /QUESTION_2/);
+    assert.match(text, /ANSWER_2/);
+    assert.match(text, /QUESTION_3/);
+    assert.match(text, /ANSWER_3/);
+
+    const history = answer.messages.filter((message) =>
+      message.role === 'user' || message.role === 'assistant'
+    ).slice(0, -1);
+    for (let index = 0; index < history.length; index += 1) {
+      if (history[index]!.role === 'assistant') {
+        assert.equal(history[index - 1]?.role, 'user', '历史起点不能是孤立 assistant');
+      }
+    }
+  } finally {
+    cleanup();
+  }
+});
+
+test('摘要：noteInputChars 分批且每批继承上一份完整累计摘要', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    for (let index = 1; index <= 8; index += 1) {
+      store.appendWdTurn({
+        id: `batch_u${index}`,
+        role: 'user',
+        content: `BATCH_QUESTION_${index}｜${index}`.padEnd(900, 'u'),
+      });
+      store.appendWdTurn({
+        id: `batch_a${index}`,
+        role: 'assistant',
+        content: `BATCH_ANSWER_${index}｜${index}`.padEnd(900, 'a'),
+      });
+    }
+
+    const summaries: string[] = [];
+    let answerText = '';
+    const model = new MockModel(({ request }) => {
+      const system = request.messages.find((message) => message.role === 'system')?.content ?? '';
+      const user = request.messages.find((message) => message.role === 'user')?.content ?? '';
+      if (system.includes('Maintain a traceable note of the Super-Agent maintenance session')) {
+        summaries.push(user);
+        return mockReply({ text: `累计摘要-${summaries.length}` });
+      }
+      answerText = request.messages.map((message) => message.content ?? '').join('\n');
+      return mockReply({ text: '最终回答' });
+    });
+    const config = loadConfig();
+    config.limits.watchdogHistoryGroups = 1;
+    config.limits.watchdogKeepRecentTokens = 100;
+    config.limits.noteInputChars = 2_000;
+    await new WatchdogSession({ store, config, model, modelName: 'm' }).ask('分批后的当前问题');
+
+    assert.ok(summaries.length >= 2, `应至少分成两次摘要，实际 ${summaries.length}`);
+    assert.match(summaries[1]!, /# Previous note\n累计摘要-1/);
+    assert.match(answerText, new RegExp(`累计摘要-${summaries.length}`));
+    assert.equal(
+      answerText.split('分批后的当前问题').length - 1,
+      1,
+      '当前问题不能同时出现在历史与本轮 prompt',
+    );
+    assert.ok(store.latestWatchdogNote());
+  } finally {
+    cleanup();
+  }
+});
+
+test('摘要失败：明确告知早期历史未进入本轮，后续仍能重新压缩而不丢原文', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    store.appendWdTurn({ id: 'fail_u1', role: 'user', content: 'FAIL_OLD_QUESTION' });
+    store.appendWdTurn({ id: 'fail_a1', role: 'assistant', content: 'FAIL_OLD_ANSWER' });
+    store.appendWdTurn({ id: 'fail_u2', role: 'user', content: 'FAIL_RECENT_QUESTION' });
+    store.appendWdTurn({ id: 'fail_a2', role: 'assistant', content: 'FAIL_RECENT_ANSWER' });
+
+    let failSummary = true;
+    let firstAnswer = '';
+    let secondSummary = '';
+    const model = new MockModel(({ request }) => {
+      const system = request.messages.find((message) => message.role === 'system')?.content ?? '';
+      const user = request.messages.find((message) => message.role === 'user')?.content ?? '';
+      if (system.includes('Maintain a traceable note of the Super-Agent maintenance session')) {
+        if (failSummary) throw new Error('摘要模型暂时失败');
+        secondSummary = user;
+        return mockReply({ text: '第二次累计摘要' });
+      }
+      firstAnswer = request.messages.map((message) => message.content ?? '').join('\n');
+      return mockReply({ text: '失败后仍可回答' });
+    });
+    const config = loadConfig();
+    config.limits.watchdogHistoryGroups = 1;
+    config.limits.watchdogKeepRecentTokens = 100;
+    const session = new WatchdogSession({ store, config, model, modelName: 'm' });
+
+    await session.ask('第一次当前问题');
+    assert.match(firstAnswer, /早期维护历史压缩失败/);
+    assert.match(firstAnswer, /当前结论可能缺少早期细节/);
+    assert.doesNotMatch(firstAnswer, /FAIL_OLD_QUESTION|FAIL_OLD_ANSWER/);
+    assert.equal(store.latestWatchdogNote(), null, '整批摘要失败不能推进覆盖水位');
+
+    failSummary = false;
+    await session.ask('第二次当前问题');
+    assert.match(secondSummary, /FAIL_OLD_QUESTION/, '失败后原文仍在，后续可重新摘要');
+  } finally {
+    cleanup();
+  }
+});
+
+test('维护申请式提问不继承问答历史，当前问题只在本轮出现一次', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    store.appendWdTurn({ id: 'old_u', role: 'user', content: 'MAINTENANCE_OLD_QUESTION' });
+    store.appendWdTurn({ id: 'old_a', role: 'assistant', content: 'MAINTENANCE_OLD_ANSWER' });
+    let requestText = '';
+    const model = new MockModel(({ request }) => {
+      requestText = request.messages.map((message) => message.content ?? '').join('\n');
+      assert.equal(request.messages.length, 2, '维护申请只应发送稳定 system 与当前请求');
+      return mockReply({ text: '申请处理结论' });
+    });
+    const config = loadConfig();
+    await new WatchdogSession({ store, config, model, modelName: 'm' })
+      .ask('请只根据任务授权处理本次维护申请', { history: false });
+
+    assert.doesNotMatch(requestText, /MAINTENANCE_OLD_QUESTION|MAINTENANCE_OLD_ANSWER/);
+    assert.equal(
+      requestText.split('请只根据任务授权处理本次维护申请').length - 1,
+      1,
+      '当前申请问题不能重复进入 history 与 prompt',
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test('历史查询先过滤 tool 日志，400 条日志不会挤掉最新问答', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    for (let index = 0; index < 400; index += 1) {
+      store.appendWdTurn({
+        id: `tool_noise_${index}`,
+        role: 'tool',
+        content: `TOOL_NOISE_${index}`,
+      });
+    }
+    store.appendWdTurn({ id: 'latest_q', role: 'user', content: 'LATEST_QUESTION' });
+    store.appendWdTurn({ id: 'latest_a', role: 'assistant', content: 'LATEST_ANSWER' });
+    let requestText = '';
+    const config = loadConfig();
+    config.limits.watchdogHistoryGroups = 12;
+    config.limits.watchdogKeepRecentTokens = 4_000;
+    await new WatchdogSession({
+      store,
+      config,
+      model: new MockModel(({ request }) => {
+        requestText = request.messages.map((message) => message.content ?? '').join('\n');
+        return mockReply({ text: '已读取最新问答' });
+      }),
+      modelName: 'm',
+    }).ask('当前问题');
+    assert.match(requestText, /LATEST_QUESTION/);
+    assert.match(requestText, /LATEST_ANSWER/);
+    assert.doesNotMatch(requestText, /TOOL_NOISE_/);
+  } finally {
+    cleanup();
+  }
+});
+
+test('分页读取超过 400 组未摘要问答，最近组不因单页上限漏掉', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    for (let index = 1; index <= 405; index += 1) {
+      store.appendWdTurn({ id: `page_u${index}`, role: 'user', content: `PAGE_QUESTION_${index}` });
+      store.appendWdTurn({ id: `page_a${index}`, role: 'assistant', content: `PAGE_ANSWER_${index}` });
+    }
+    let summaryText = '';
+    const answers: Captured[] = [];
+    const model = new MockModel(({ request }) => {
+      const system = request.messages.find((message) => message.role === 'system')?.content ?? '';
+      if (system.includes('Maintain a traceable note of the Super-Agent maintenance session')) {
+        summaryText = request.messages.map((message) => message.content ?? '').join('\n');
+        return mockReply({ text: '分页累计摘要' });
+      }
+      answers.push({ messages: request.messages as Captured['messages'] });
+      return mockReply({ text: '分页读取完成' });
+    });
+    const config = loadConfig();
+    config.limits.watchdogHistoryGroups = 12;
+    config.limits.watchdogKeepRecentTokens = 4_000;
+    await new WatchdogSession({ store, config, model, modelName: 'm' }).ask('分页当前问题');
+
+    const answer = answers[0]!;
+    const text = answer.messages.map((message) => message.content ?? '').join('\n');
+    assert.match(text, /PAGE_QUESTION_405/);
+    assert.match(text, /PAGE_ANSWER_405/);
+    assert.doesNotMatch(text, /PAGE_QUESTION_1\b/);
+    assert.match(summaryText, /PAGE_QUESTION_1\b/, '第 400 条之前的旧问答应全部进入摘要，不能无痕遗漏');
+  } finally {
+    cleanup();
+  }
+});
+
+test('任务绑定提问：Router 消息继承任务来源，未知归属不伪造路由，跨任务改投被拒绝', async () => {
+  const harness = await createHarness({
+    worker: () => mockReply({ text: 'ok' }),
+    limits: { maxConcurrentRuns: 0 },
+  });
+  try {
+    const scoped = harness.runtime.createTask({
+      title: '定向维护',
+      goal: '核对任务',
+      ownerRole: '负责人',
+      ownerBrief: '执行',
+      source: {
+        channel: 'telegram',
+        accountId: 'bot',
+        peerId: 'owner',
+        sessionKey: 'telegram|bot|owner',
+        conversationId: 'topic-scoped',
+      },
+    }).task;
+    const other = harness.runtime.createTask({
+      title: '另一个任务',
+      goal: '不能串线',
+      ownerRole: '负责人',
+      ownerBrief: '执行',
+    }).task;
+
+    let step = 0;
+    let finalToolText = '';
+    const scopedModel = new MockModel(({ request }) => {
+      if (step === 0) {
+        step += 1;
+        return mockReply({ toolCalls: [{ name: 'notify_router', arguments: { text: '定向通报' } }] });
+      }
+      if (step === 1) {
+        step += 1;
+        return mockReply({ toolCalls: [{ name: 'ask_router', arguments: { question: '定向问题' } }] });
+      }
+      if (step === 2) {
+        step += 1;
+        return mockReply({
+          toolCalls: [{
+            name: 'notify_router',
+            arguments: { text: '不应改投', task_id: other.id },
+          }],
+        });
+      }
+      finalToolText = request.messages.map((message) => message.content ?? '').join('\n');
+      return mockReply({ text: '定向处理完成' });
+    });
+    await new WatchdogSession({
+      store: harness.store,
+      config: harness.config,
+      model: scopedModel,
+      modelName: 'mock',
+    }).ask('处理这个已授权任务', { taskId: scoped.id, history: false });
+
+    const routed = harness.store.listOpenIntercom('router', 20);
+    const notice = routed.find((message) => message.body === '定向通报');
+    const question = routed.find((message) => message.body === '定向问题');
+    for (const message of [notice, question]) {
+      assert.ok(message);
+      assert.equal(message.routeKnown, true);
+      assert.equal(message.taskId, scoped.id);
+      assert.equal(message.sessionKey, 'telegram|bot|owner');
+      assert.equal(message.conversationId, 'topic-scoped');
+    }
+    assert.equal(routed.some((message) => message.body === '不应改投'), false);
+    assert.match(finalToolText, /任务绑定的维护问答不能把 Router 消息改投到另一个任务/);
+
+    let unscopedStep = 0;
+    const unscopedModel = new MockModel(() => {
+      if (unscopedStep++ === 0) {
+        return mockReply({ toolCalls: [{ name: 'notify_router', arguments: { text: '无归属通报' } }] });
+      }
+      return mockReply({ text: '已保存管理入口消息' });
+    });
+    await new WatchdogSession({
+      store: harness.store,
+      config: harness.config,
+      model: unscopedModel,
+      modelName: 'mock',
+    }).ask('没有明确任务归属', { history: false });
+    const unknown = harness.store.listOpenIntercom('router', 20).find((message) => message.body === '无归属通报');
+    assert.ok(unknown);
+    assert.equal(unknown.routeKnown, false);
+    assert.equal(unknown.taskId, null);
+    assert.equal(unknown.sessionKey, null);
+    assert.equal(unknown.conversationId, null);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('任务绑定 record 和 CLI task-bound ask_router 保留明确任务归属', async () => {
+  const harness = await createHarness({
+    worker: () => mockReply({ text: 'ok' }),
+    limits: { maxConcurrentRuns: 0 },
+  });
+  try {
+    const task = harness.runtime.createTask({
+      title: 'CLI 定向',
+      goal: '核对维护问题',
+      ownerRole: '负责人',
+      ownerBrief: '执行',
+    }).task;
+    let step = 0;
+    const model = new MockModel(() => {
+      if (step++ === 0) {
+        return mockReply({
+          toolCalls: [
+            { name: 'record', arguments: { title: '缺少任务归属的事件' } },
+            { name: 'ask_router', arguments: { question: 'CLI 任务需要 Router 回答' } },
+          ],
+        });
+      }
+      return mockReply({ text: '已登记并提问' });
+    });
+    await new WatchdogSession({
+      store: harness.store,
+      config: harness.config,
+      model,
+      modelName: 'mock',
+    }).ask('处理 CLI 任务', { taskId: task.id, history: false });
+
+    const issue = harness.store.listOpenIssues()[0];
+    assert.equal(issue?.taskId, task.id, 'record 未显式给 task_id 时应继承绑定任务');
+    const question = harness.store.listOpenIntercom('router', 20)
+      .find((message) => message.body === 'CLI 任务需要 Router 回答');
+    assert.ok(question);
+    assert.equal(question.routeKnown, true);
+    assert.equal(question.taskId, task.id);
+    assert.equal(question.sessionKey, null);
+    assert.equal(question.conversationId, null);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('周期巡检失败时 Router 消息保持 pending，成功处理后才会投递', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    store.insertIntercom({
+      id: 'ic_pending_on_failure',
+      fromLayer: 'router',
+      kind: 'question',
+      body: '必须保留到成功处理',
+    });
+    const config = loadConfig();
+    const failed = new WatchdogSession({
+      store,
+      config,
+      model: new MockModel(() => {
+        throw new Error('模型暂时失败');
+      }),
+      modelName: 'm',
+    });
+    await assert.rejects(() => failed.runOnce(10), /模型暂时失败/);
+    assert.equal(store.getIntercom('ic_pending_on_failure')?.status, 'pending');
+
+    const succeeded = new WatchdogSession({
+      store,
+      config,
+      model: new MockModel(() => mockReply({ text: '已处理' })),
+      modelName: 'm',
+    });
+    await succeeded.runOnce(10);
+    assert.equal(store.getIntercom('ic_pending_on_failure')?.status, 'delivered');
   } finally {
     cleanup();
   }

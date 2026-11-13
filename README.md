@@ -112,7 +112,7 @@ Message: queued → delivered → consumed
 | kind | 方向 | 用途 |
 |---|---|---|
 | `assign` | Router→Worker | 派活（建任务时自动产生） |
-| `update` | Router→Worker | 补充要求、改变方向（同时写入任务 brief） |
+| `update` | Router→Worker；或负责人→成员 | Router 的 update 是任务级补充要求，同时写入任务 brief 并抬升要求版本；负责人发给成员的是只对该接收者有效的工作指示，不改变共同目标或要求版本 |
 | `stop` | Router→Worker | 停止 |
 | `progress` / `fail` / `question` | Worker→Router | 进展、失败、需用户回答 |
 | `result` | Worker→Router | 交付（程序在提交校验通过后生成） |
@@ -149,11 +149,13 @@ Message: queued → delivered → consumed
 - `require_review` 默认关闭；开启时仅对最终提交的每个产物要求当前版本及要求下的有效 `approved`，普通求助和自愿核对不依赖该门槛。
 - 回复检查必须给 `outcome`：`approved` / `changes_required` / `inconclusive`。程序只认 `approved`，
   不解析自然语言里的"通过"。
+- 正式检查回复仍先投递给请求者；若被检查产物的作者不是请求者，且作者的 `currentTaskId` 仍指向该请求所属任务，程序会另发一条定向系统通知给作者。通知带检查记录、回复消息 id、产物版本与有效范围；长意见只展示明确标注的摘录，作者可用 `message_read` 分段读取完整回复。作者恰为请求者时不重复整段意见；休眠或已迁移到其他任务的作者不会把旧检查正文和 refs 注入新任务。
+- 跨参与者查回检查回复只允许由系统生成的对应检查回流通知授权，并要求作者的 `currentTaskId` 仍匹配该任务。普通 Worker 自行填写 `refs.messages` 不能猜 id 扩大读取范围。
 - 当前任务的成员可以跨创建来源直接点对点发送 `notice`。Peer notice 关联请求时，`reply_to` 指向该请求，只有请求双方可使用；它不带 `outcome`，不代替唯一的正式 `reply`，也不产生检查结论。等待特定请求答复的发送者收到关联通知时会被临时唤醒，但原等待仍有效。
 - Router 可用 `send_to_worker(kind=notice)` 向当前任务成员传递事实、证据、澄清或维护答复；它不修改任务 brief，也不抬升要求版本。Router notice 可临时唤醒任意 `reason='reply'` 的等待，包括只带 `from` 或没有关联字段的等待，但不会解除等待；非 reply 等待不会被它唤醒。
 - `wait_for` 默认匹配非 `notice` 消息；显式用 `kinds` 等待 `notice` 且不包含 `reply` 时，notice 可结束该次事件等待。
 - 检查旧版本、检查别的文件、结论不是通过、检查后又改了内容，都不能放行。
-- 用户补充要求（Router 的 `update`）会让要求版本 `epoch` 加一，旧结论立即失效。
+- 用户补充要求（Router 的 `update`）会让要求版本 `epoch` 加一，旧结论立即失效。负责人发给成员的局部 `update` 不抬升版本，也不会被渲染成所有人的“最新任务级要求”。
 - 检查通过后如果没有再改产物，可以直接提交，不需要重复检查。
 
 ## 4.5 上下文管理
@@ -167,6 +169,7 @@ Message: queued → delivered → consumed
 | 工作记录 | 整理模型输出（`worker_note`） | 有则注入 | `NOTE_MAX_CHARS`，默认 6000 |
 | 近期历史 | `worker_turn` | 是，按字符预算 | `CONTEXT_WINDOW_CHARS`，默认 200000（≈50k token） |
 | Router 对话历史 | `router_turn` | 是，按 token 预算，超出压成摘要 | `CONTEXT_WINDOW_TOKENS` / `ROUTER_KEEP_RECENT_TOKENS` |
+| Watchdog 人工问答 | `wd_turn` | 最多最近 12 组，按保守 token 预算；旧组压入 `wd_note` | `WATCHDOG_HISTORY_GROUPS` / `WATCHDOG_KEEP_RECENT_TOKENS` |
 
 > 上表的默认值**以 `src/config.ts` 为准**。文档与代码不一致时按代码执行；
 > 改默认值请同时改这两处。历史压测记录里的旧值（如 `CONTEXT_WINDOW_CHARS=16000`）
@@ -174,8 +177,11 @@ Message: queued → delivered → consumed
 
 ### 窗口怎么取
 
-人工 `ask()` 的维护者对话历史取**最近 N 组**再按时间正序喂回去；周期 `runOnce()` 不复用旧问答历史，只按需用 `read_inspection` 查上轮结论。直接「按时间正序 + LIMIT」拿到的是最早的历史，
-问答超过十组之后就再也读不到新内容——这是本轮修掉的缺陷，测试用 14 组问答覆盖，并验证重启后仍然取最近的。
+人工 `ask()` 的维护者对话历史以 user 消息为边界取**最近 12 组**，再从最新组向前按中英混排的保守 token 估算装入约 4000 token；整组保留或整组移出，不会留下孤立 assistant。更早问答分批写入 `wd_note`，每批把上一份完整记录作为输入，单批上限沿用 `NOTE_INPUT_CHARS`。周期 `runOnce()` 不复用旧问答历史，只按需用 `read_inspection` 查上轮结论。当前问题先装配上下文、后写入 `wd_turn`，所以不会同时进入 history 和本轮 prompt；维护申请使用独立上下文，但其问答仍会落库，之后人工压缩时可能进入累计摘要。
+
+维护摘要失败时不会永久截掉原文或推进 `wd_note` 覆盖水位；本轮 system 会明确标注“早期历史压缩失败”，并写一条 `note_compact_failed` 动作记录实际范围和已完成批次数。后续人工提问仍可从原始 `wd_turn` 重新压缩。
+
+Router 触发对话摘要时，摘要成功会先更新本轮唯一的累计记录，再生成状态块；失败则继续使用旧记录。稳定 system 提示不夹带累计记录，同一次请求不会同时注入旧记录和新记录。
 
 从最新 turn 往前累计字符，直到超过预算。切分以「一次模型调用 + 它的全部工具结果」为最小单位，
 所以窗口起点不会落在孤立的工具结果上。因保持配对而超出预算时，允许不超过
@@ -235,7 +241,7 @@ Message: queued → delivered → consumed
 - Router notice 对 reply 等待只做一次临时唤醒，等待记录和真正 reply 的匹配保持不变。
 - 当前实现每个 Worker 同时只保留一个 `wait_record`。已有 reply 等待期间到达的普通 peer
   `request` 会留在精确过滤后的当前任务收件箱，等这次等待结束后的下一轮可见；它不会并行替换或打断原等待。需要多依赖并存时应另开设计，不能把它误说成已经支持。
-- 当同组成员对具体请求的回复依赖形成闭环时，程序解除环内最早的一条等待并提示该成员；无需全组都等待。作业、提供方、用户或维护等待不会被误当作回复闭环。
+- 当同组成员对具体请求的回复依赖形成闭环时，程序在一次事务中解除这条环上的全部 reply 等待，并把路径、成员角色/状态、各自请求与依赖目标、负责人、任务目标和任务授权分别通知环内成员及环外负责人。解除等待只表示程序移除了当前依赖，不表示请求已回复、产物已交付或任务已完成，也不自动把成员判为失败；下一步由模型结合原目标决定。作业、提供方、用户或维护等待不会被误当作回复闭环。
 - 提供方（模型服务）暂时不可用时，Worker 转 `waiting` 并写入 `wait_record(reason='provider')`，
   60 秒后由 `tick()` 自动恢复——这个等待点是持久化的，重启后照样生效。
 - 每个 Worker 有独立的执行锁，同一 Worker 永远不会并发改上下文。
@@ -466,9 +472,9 @@ pnpm watchdog --ask "为什么这个任务停住了？"   # 维护者提问（�
 pnpm watchdog --answer <问题ID>                # 查询之前提交的问题
 ```
 
-Router 与 Watchdog 的内部消息保存在数据库中：新消息会尝试唤醒对方，提问或请求送达后仍保持待答，只有实际回复才标记为已答；普通通知和回复送达后结束。唤醒标记只用于提醒，监听不可用时仍由定时巡检读取数据库。维护者第一次处理失败后，已送达但未答的问题会留待后续正常巡检，不会无限重复唤醒。
+Router 与 Watchdog 的内部消息保存在数据库中：新消息会尝试唤醒对方，提问或请求送达后仍保持待答，只有实际回复才标记为已答；普通通知和回复送达后结束。唤醒标记只用于提醒，监听不可用时仍由定时巡检读取数据库。维护者处理失败后，本轮未成功处理的 Router 消息保持 `pending`；同一消息批次在失败后 60 秒内退避，不会随 10 秒本地健康 tick 重复调用模型，新消息批次则可以立即触发。
 
-来自聊天会话的提问，其答复会回到原会话和原话题；没有明确会话归属的维护消息（包括旧数据）只在 CLI 管理入口的维护状态中查看和回复，不会推送到任意聊天。Worker 之间的消息提供编号、发送者、意图和引用；自己的历史检索也可查回工具调用参数和消息引用。
+来自聊天会话的提问，其答复会回到原会话和原话题；来自 CLI 任务的维护消息虽然 `sessionKey` 为 `NULL`，但只要 `taskId` 明确，仍视为已知 CLI 路由，并由主系统现有 tick 自动驱动 Router 处理，不等待用户下一次输入。只有没有可靠任务或会话归属的旧消息/未知消息只在 CLI 管理入口的维护状态中查看和回复，不会推送到任意聊天。Worker 之间的消息提供编号、发送者、意图和引用；自己的历史检索也可查回工具调用参数和消息引用。
 
 ### 关闭依据必须是真实状态
 
@@ -687,8 +693,7 @@ store.modelCallStats()  // 按用途聚合：调用数、成功、失败、有 u
 
 ### 巡检频率由证据决定
 
-`dueForReview()`：有到期事件 → 必须审视；有活跃任务 → 按间隔周期性审视；否则跳过并记录原因。
-巡检间隔可用 `watchdog.interval` 在线调整。
+`dueForReview()` 优先处理未处于失败退避期的 Router 消息；有到期事件、新的或待复查的严重健康事实、没有可用巡检基线时也会触发审视。没有显式触发时，有活跃任务按默认 10 分钟间隔检查，系统空闲则按默认 30 分钟间隔检查；未到期时跳过并记录原因。同一批 Router 消息失败后 60 秒内退避，新批次仍可立即触发。`watchdog.interval` 可在线调整活跃任务的检查间隔；10 秒本地健康 tick 只做只读检查，不调用模型。
 
 ### 累计调用不再是失败条件
 
@@ -1070,7 +1075,8 @@ Watchdog 与 Worker 走同一条路：
 | 读文件 | `fs_read` 等 | 同一套 `fs_*`（只读，不含 `fs_write`） |
 | 执行命令 | `proc_run`（异步作业，scope=业务） | `run_command` + `job_output`（scope=watchdog，与业务作业分开恢复） |
 | 维护动作 | 无 | `maintain` / `inspect_task` / `record` / `check_main` / `command_status` |
-| 上下文 | `CONTEXT_WINDOW_CHARS` 字符预算 | 周期巡检无旧 history；人工 `ask` 使用 token 预算 + `wd_note` 累计摘要。完整上轮结论可用 `read_inspection` 按 ID 查回 |
+| 巡检节奏 | 按任务运行状态走 Router/Worker 循环 | 10 秒本地健康 tick；活跃任务默认 10 分钟、空闲默认 30 分钟做语义巡检；显式 Router 消息、到期事件和新严重健康事实可即时触发 |
+| 上下文 | `CONTEXT_WINDOW_CHARS` 字符预算 | 周期巡检无旧 history；人工 `ask` 最多 12 组且约 4000 token，更早内容进 `wd_note`。完整上轮结论可用 `read_inspection` 按 ID 查回 |
 
 读文件复用 Worker 的实现（行语义、2000 行/50KB 截断、能读仓库根），不再自己按字节读。
 执行命令仍分开：Watchdog 的作业带 `scope=watchdog`，主系统恢复时不会把它的 running 作业

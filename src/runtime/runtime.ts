@@ -37,6 +37,7 @@ import type {
   Message,
   MessageKind,
   MessageRefs,
+  ReviewOutcome,
   RuntimeEvent,
   Task,
   Worker,
@@ -855,6 +856,9 @@ note: null,
       this.store.appendEvent(task.id, from.id, `message.${input.kind}`, `${from.id} → ${recipient.id}`);
       this.emit({ type: 'message.sent', messageId: message.id, from: from.id, to: recipient.id, kind: input.kind });
       this.onMessageDelivered(message);
+      if (input.kind === 'reply' && outcome && origin) {
+        this.deliverReviewFeedback(origin, message, from, outcome);
+      }
     }
 
     if (!broadcast && (input.kind === 'update' || input.kind === 'stop')) {
@@ -862,6 +866,68 @@ note: null,
     }
 
     return { ok: true, messageId: firstMessageId ?? undefined, messageIds: createdIds };
+  }
+
+  /**
+   * 正式检查回复按产物作者定向回流。
+   *
+   * 请求者本来就会收到唯一一条正式 reply，因此作者恰好是请求者时不再复制；
+   * 其他作者拿到结论、有效范围、产物身份和可查回的回复 id。长正文只展示
+   * 明确标注的摘录，完整内容由 message_read 读取。
+   */
+  private deliverReviewFeedback(
+    request: Message,
+    reply: Message,
+    reviewer: Worker,
+    outcome: ReviewOutcome,
+  ): void {
+    const byAuthor = new Map<string, { artifacts: Artifact[]; reviewIds: string[]; epochs: number[] }>();
+    for (const review of this.store.listReviewsByRequest(request.id)) {
+      const artifact = this.store.getArtifact(review.artifactId);
+      if (!artifact) continue;
+      // 系统通知会按作者此刻的 currentTaskId 选择收件任务。作者休眠或已迁到
+      // 另一任务时，旧任务的检查正文和 refs 都不能借新任务上下文重新注入。
+      const author = this.store.getWorker(artifact.workerId);
+      if (!request.taskId || author?.currentTaskId !== request.taskId) continue;
+      // 请求者已经收到原回复；检查者对自己产物的结论也不需要自通知。
+      if (author.id === request.fromId || author.id === reviewer.id) continue;
+      const current = byAuthor.get(artifact.workerId) ?? { artifacts: [], reviewIds: [], epochs: [] };
+      if (!current.artifacts.some((item) => item.id === artifact.id)) current.artifacts.push(artifact);
+      if (!current.reviewIds.includes(review.id)) current.reviewIds.push(review.id);
+      if (!current.epochs.includes(review.epoch)) current.epochs.push(review.epoch);
+      byAuthor.set(artifact.workerId, current);
+    }
+
+    for (const [authorId, feedback] of byAuthor) {
+      const artifacts = feedback.artifacts
+        .map((artifact) => `${artifact.name} v${artifact.version}（${artifact.id}）`)
+        .join('、');
+      const inlineLimit = 1200;
+      const truncated = reply.body.length > inlineLimit;
+      const excerpt = truncated
+        ? `${reply.body.slice(0, inlineLimit)}\n…（摘录，不完整；原文共 ${reply.body.length} 字符）`
+        : reply.body;
+      const body =
+        `你的产物 ${artifacts} 收到正式检查结论：${outcome}。\n` +
+        `检查记录：${feedback.reviewIds.join('、')}；检查者：${reviewer.id}；` +
+        `请求：${request.id}；回复：${reply.id}；结论所对要求版本：${feedback.epochs.join('、')}。\n` +
+        `有效范围：${outcome === 'approved' ? 'approved ' : '该结论'}只针对本请求登记的上述产物版本，` +
+        '不代表任务其他产物或产物的未检查部分也通过；后续内容变化或要求版本抬升会使结论失效。\n' +
+        `检查意见${truncated ? '摘录' : '原文'}：\n${excerpt}\n` +
+        `完整回复可用 message_read(message_id="${reply.id}", offset=0, limit=8000) 分段读取。`;
+      this.pushSystemNotice(authorId, body, {
+        deliver: true,
+        payload: { reviewFeedbackReplyId: reply.id },
+        refs: {
+          messages: [request.id, reply.id],
+          artifacts: feedback.artifacts.map((artifact) => ({
+            artifactId: artifact.id,
+            name: artifact.name,
+            version: artifact.version,
+          })),
+        },
+      });
+    }
   }
 
   private buildMessage(input: {
@@ -1785,8 +1851,12 @@ note: null,
     if (!worker || isInactiveWorker(worker.status)) return;
     let task = this.currentTaskForWorker(worker);
     if (!task) {
-      await this.failWorker(workerId, '任务不存在');
-      return;
+      // failWorker 会 revoke 当前 Execution；若在 execution.run 内调用，后续
+      // 失败状态和事件反而会被撤销守卫拦住。交给 runWorker 的外层 catch，
+      // 由现有 handleRunError 在无撤销上下文中统一收敛。
+      throw new Error(
+        `Worker ${workerId} 的当前任务不存在（currentTaskId=${worker.currentTaskId ?? 'null'}）`,
+      );
     }
     if (isTerminalTask(task.status)) {
       this.store.setWorkerStatus(workerId, 'cancelled', '任务已结束');
@@ -2008,8 +2078,8 @@ note: null,
     if (!router || this.stopped) return;
     // 维护者发了消息：叫醒 Router 去处理。节流到 60 秒一次——
     // 不节流的话维护者每写一条都会触发一轮 Router，两边会互相抽起来。
-    // 没有会话归属的消息（CLI、或维护者不知道发给谁）不唤醒 Router：
-    // 唤醒了也没有收件对象，只会每 60 秒空转一次。
+    // 已知 CLI 任务用 (sessionKey=null, conversationId=null) 作为真实路由；
+    // 只有 routeKnown=false、完全没有收件归属的消息不进入自动驱动目标。
     const pendingFromMaintainer = this.store.intercomRouterTargets().length > 0;
     if (pendingFromMaintainer && Date.now() - this.lastMaintainerPumpAt >= 60_000) {
       this.lastMaintainerPumpAt = Date.now();
@@ -2240,12 +2310,39 @@ note: null,
     });
   }
 
-  private latestUpdateFor(task: Task): string | null {
+  /** Router 的 update 才改变任务级要求；Worker 之间的 update 只是局部工作指示。 */
+  private taskLevelUpdateFor(task: Task): string | null {
     const updates = this.store
       .listTaskMessages(task.id, 200)
-      .filter((message) => message.kind === 'update')
+      .filter((message) => message.kind === 'update' && message.fromKind === 'router')
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
     return updates.at(-1)?.body ?? null;
+  }
+
+  /** 每个来源发给该成员的最新 update；来源身份原样保留，不推断成负责人。 */
+  private assignedInstructionsFor(task: Task, worker: Worker): {
+    body: string;
+    fromKind: Message['fromKind'];
+    fromId: string;
+  }[] {
+    const latestBySource = new Map<string, Message>();
+    const messages = this.store
+      .listTaskMessages(task.id, 200)
+      .filter(
+        (message) =>
+          message.kind === 'update' &&
+          message.fromKind === 'worker' &&
+          message.toKind === 'worker' &&
+          message.toId === worker.id &&
+          message.fromId !== worker.id,
+      )
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+    for (const message of messages) latestBySource.set(`${message.fromKind}:${message.fromId}`, message);
+    return [...latestBySource.values()].map((message) => ({
+      body: message.body,
+      fromKind: message.fromKind,
+      fromId: message.fromId,
+    }));
   }
 
   /** 触发条件由 note.decideNote 判定；失败只记录，不影响本轮执行。 */
@@ -2308,7 +2405,12 @@ note: null,
       worker,
       collaborators,
       isOwner,
-      taskFacts: renderTaskFacts({ task, isOwner, latestUpdate: this.latestUpdateFor(task) }),
+      taskFacts: renderTaskFacts({
+        task,
+        isOwner,
+        latestUpdate: this.taskLevelUpdateFor(task),
+        assignedInstructions: this.assignedInstructionsFor(task, worker),
+      }),
       artifactTable: renderArtifactTable({ task, lines: collectArtifactLines(task, artifacts, reviews) }),
       noteText: note && note.epoch === task.reviewEpoch ? note.content : null,
       noteStaleEpoch: note && note.epoch !== task.reviewEpoch ? note.epoch : null,
@@ -2322,7 +2424,12 @@ note: null,
       worker,
       collaborators,
       isOwner,
-      taskFacts: renderTaskFacts({ task, isOwner, latestUpdate: this.latestUpdateFor(task) }),
+      taskFacts: renderTaskFacts({
+        task,
+        isOwner,
+        latestUpdate: this.taskLevelUpdateFor(task),
+        assignedInstructions: this.assignedInstructionsFor(task, worker),
+      }),
       artifactTable: renderArtifactTable({ task, lines: collectArtifactLines(task, artifacts, reviews) }),
       noteText: note && note.epoch === task.reviewEpoch ? note.content : null,
       noteStaleEpoch: note && note.epoch !== task.reviewEpoch ? note.epoch : null,
@@ -2480,8 +2587,14 @@ note: null,
   getMessageForWorker(workerId: string, messageId: string): Message | null {
     const message = this.store.getMessage(messageId);
     if (!message) return null;
-    // 只能读自己收发的消息，避免跨 Worker 窥探过程细节。
-    if (message.fromId !== workerId && message.toId !== workerId) return null;
+    // 默认只能读自己收发的消息。
+    if (message.fromId === workerId || message.toId === workerId) return message;
+    // 跨参与者读取只认系统生成的正式检查回流，并要求该 Worker 当前仍服务同一任务。
+    // Worker 自己伪造 refs.messages 不能扩大权限；引用 id 还必须确为同任务 reply。
+    if (!message.taskId || message.kind !== 'reply') return null;
+    const worker = this.store.getWorker(workerId);
+    if (!worker || worker.currentTaskId !== message.taskId) return null;
+    if (!this.store.hasReviewFeedbackReferenceForWorker(workerId, message.taskId, message.id)) return null;
     return message;
   }
 
@@ -2536,7 +2649,16 @@ note: null,
   }
 
   /** 供测试与外部组件投递系统通知。 */
-  notifySystem(workerId: string, body: string, options: { wake?: 'none' | 'force' } = {}): void {
+  notifySystem(
+    workerId: string,
+    body: string,
+    options: {
+      wake?: 'none' | 'force';
+      deliver?: boolean;
+      refs?: MessageRefs | null;
+      payload?: Record<string, unknown> | null;
+    } = {},
+  ): void {
     this.pushSystemNotice(workerId, body, options);
   }
 
@@ -2545,11 +2667,20 @@ note: null,
    * 退避中的等待、作业等待、维护挂起都不应因为一条通知就恢复。
    * 只有明确「依赖对象已消失」时才用 wake='force'。
    */
-  private pushSystemNotice(workerId: string, body: string, options: { wake?: 'none' | 'force' } = {}): void {
+  private pushSystemNotice(
+    workerId: string,
+    body: string,
+    options: {
+      wake?: 'none' | 'force';
+      deliver?: boolean;
+      refs?: MessageRefs | null;
+      payload?: Record<string, unknown> | null;
+    } = {},
+  ): void {
     const worker = this.store.getWorker(workerId);
     if (!worker) return;
     const task = this.currentTaskForWorker(worker);
-    this.store.insertMessage({
+    const message: Message = {
       id: newMessageId(),
       groupId: task?.groupId ?? worker.groupId,
       taskId: task?.id ?? null,
@@ -2559,9 +2690,9 @@ note: null,
       toId: workerId,
       kind: 'notice',
       body,
-      payload: null,
+      payload: options.payload ?? null,
       replyTo: null,
-      refs: null,
+      refs: options.refs ?? null,
       dedupeKey: null,
       broadcastId: null,
       status: 'queued',
@@ -2569,8 +2700,12 @@ note: null,
       deliveredAt: null,
       consumedAt: null,
       error: null,
-    });
-    if (options.wake !== 'force') return;
+    };
+    this.store.insertMessage(message);
+    if (options.wake !== 'force') {
+      if (options.deliver) this.onMessageDelivered(message);
+      return;
+    }
     const current = this.store.getWorker(workerId);
     if (!current || current.status !== 'waiting') return;
     for (const wait of this.store.listActiveWaitsForWorker(workerId)) {
@@ -2680,7 +2815,7 @@ note: null,
     if (!task) return;
     const workers = this.store.listTaskWorkers(task.id).filter((worker) => !isInactiveWorker(worker.status));
     const byId = new Map(workers.map((worker) => [worker.id, worker]));
-    const edges = new Map<string, { target: string; waitId: string; createdAt: string }>();
+    const edges = new Map<string, { target: string; waitId: string; requestId: string; createdAt: string }>();
     for (const worker of workers) {
       if (worker.status !== 'waiting') continue;
       const waits = this.store.listActiveWaitsForWorker(worker.id);
@@ -2689,8 +2824,16 @@ note: null,
       if (wait.reason !== 'reply' || !wait.matchReplyTo || (wait.matchKinds && !wait.matchKinds.includes('reply'))) continue;
       const request = this.store.getMessage(wait.matchReplyTo);
       if (!request || request.kind !== 'request' || request.fromId !== worker.id || request.toKind !== 'worker' || request.groupId !== groupId || (wait.matchFrom && wait.matchFrom !== request.toId) || this.store.hasReply(request.id)) continue;
-      if (byId.has(request.toId)) edges.set(worker.id, { target: request.toId, waitId: wait.id, createdAt: wait.createdAt });
+      if (byId.has(request.toId)) {
+        edges.set(worker.id, {
+          target: request.toId,
+          waitId: wait.id,
+          requestId: request.id,
+          createdAt: wait.createdAt,
+        });
+      }
     }
+    const handledCycles = new Set<string>();
     for (const start of edges.keys()) {
       const path: string[] = [];
       const positions = new Map<string, number>();
@@ -2702,11 +2845,60 @@ note: null,
       }
       if (!current || !positions.has(current)) continue;
       const cycle = path.slice(positions.get(current)!);
-      const first = cycle.map((id) => ({ id, ...edges.get(id)! })).sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0]!;
-      this.store.resolveWait(first.waitId);
-      this.pushSystemNotice(first.id, `检测到回复依赖形成闭环：${cycle.join(' → ')} → ${current}。请根据已有信息决定如何推进；其他等待没有自动解除。`);
-      this.enqueue(first.id);
-      return;
+      const signature = [...cycle].sort().join(',');
+      if (handledCycles.has(signature)) continue;
+      handledCycles.add(signature);
+
+      const members = cycle
+        .map((id) => ({ id, ...edges.get(id)! }))
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      const pathText = `${cycle.join(' → ')} → ${current}`;
+      const ownerId = task.ownerWorkerId;
+      const owner = ownerId ? this.store.getWorker(ownerId) : null;
+      const dependencies = members
+        .map((member) => {
+          const worker = byId.get(member.id);
+          const target = byId.get(member.target);
+          return (
+            `- ${member.id}（${worker?.role ?? '未知角色'}，${worker?.status ?? '未知状态'}）` +
+            ` 等待请求 ${member.requestId} 的 reply；目标 ${member.target}` +
+            `（${target?.role ?? '未知角色'}，${target?.status ?? '未知状态'}）`
+          );
+        })
+        .join('\n');
+      this.store.tx(() => {
+        for (const member of members) this.store.resolveWait(member.waitId);
+        this.store.appendEvent(
+          task.id,
+          null,
+          'deadlock.detected',
+          `${pathText}；程序已解除环上 ${members.length} 条 reply 等待，任务状态未改变`,
+        );
+      });
+
+      const brief = task.brief || '（未填写）';
+      const briefText =
+        brief.length > 1000
+          ? `${brief.slice(0, 1000)}\n…（任务授权/背景已截断，原文共 ${brief.length} 字符；` +
+            `用 inspect_task(task_id="${task.id}") 查看完整 brief）`
+          : brief;
+      const renderNotice = (workerId: string): string =>
+        `检测到回复依赖形成闭环（任务 ${task.id}「${task.title}」）：${pathText}。\n` +
+        `共同目标：${task.goal || '（未填写）'}\n` +
+        `任务授权/背景：${briefText}\n` +
+        `负责人：${owner ? `${owner.id}（${owner.role}，${owner.status}）` : ownerId ?? '未知'}\n` +
+        `环上依赖状态：\n${dependencies}\n` +
+        `程序已解除本次环上的全部 reply 等待；这不等于请求已获回复、产物已交付或任务已完成。` +
+        `请结合原用户目标、已有证据和当前任务状态决定如何推进；不要自动重建同一闭环。` +
+        (workerId === ownerId ? '你是负责人，请判断是否需要调整分工或直接处理。' : '');
+
+      for (const member of members) {
+        this.pushSystemNotice(member.id, renderNotice(member.id));
+        this.enqueue(member.id);
+      }
+      if (owner && !cycle.includes(owner.id) && !isTerminalWorker(owner.status)) {
+        this.pushSystemNotice(owner.id, renderNotice(owner.id), { deliver: true });
+      }
     }
   }
 

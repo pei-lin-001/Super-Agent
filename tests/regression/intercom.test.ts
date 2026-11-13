@@ -231,6 +231,153 @@ test('通信：维护者提问可从管理入口回复，重复回复不生成�
   } finally { await h.cleanup(); }
 });
 
+test('通信：任务来源区分 CLI null、IM 路由和完全未知，未知消息不广播', async () => {
+  const { createHarness } = await import('../helpers.ts');
+  const { mockReply } = await import('../../src/model/mock.ts');
+  const h = await createHarness({ limits: { maxConcurrentRuns: 0 }, worker: () => mockReply({ text: 'ok' }) });
+  try {
+    const imTask = h.runtime.createTask({
+      title: 'IM 任务',
+      goal: '核对维护答复',
+      ownerRole: '负责人',
+      ownerBrief: '执行',
+      source: {
+        channel: 'telegram',
+        accountId: 'bot',
+        peerId: 'owner',
+        sessionKey: 'telegram|bot|owner',
+        conversationId: 'topic_a',
+      },
+    }).task;
+    h.store.insertTaskIntercom({
+      id: 'ic_im_task',
+      fromLayer: 'watchdog',
+      kind: 'question',
+      body: '这个任务为何停滞？',
+      taskId: imTask.id,
+      topicId: 'ic_im_task',
+    });
+    const imMessage = h.store.getIntercom('ic_im_task')!;
+    assert.equal(imMessage.routeKnown, true);
+    assert.equal(imMessage.taskId, imTask.id);
+    assert.equal(imMessage.sessionKey, 'telegram|bot|owner');
+    assert.equal(imMessage.conversationId, 'topic_a');
+    assert.equal(h.store.listIntercomForRouter('telegram|bot|other', 'topic_a').length, 0);
+    assert.equal(h.store.listIntercomForRouter('telegram|bot|owner', 'topic_a')[0]?.id, 'ic_im_task');
+    assert.equal(h.store.replyIntercom(imMessage, 'ic_im_reply', '正在核对'), true);
+    const imReply = h.store.getIntercom('ic_im_reply')!;
+    assert.equal(imReply.taskId, imTask.id, '跨层 reply 必须保留任务归属');
+    assert.equal(imReply.sessionKey, 'telegram|bot|owner');
+
+    const cliTask = h.runtime.createTask({
+      title: 'CLI 任务',
+      goal: '处理本机维护问题',
+      ownerRole: '负责人',
+      ownerBrief: '执行',
+    }).task;
+    h.store.insertTaskIntercom({
+      id: 'ic_cli_task',
+      fromLayer: 'watchdog',
+      kind: 'notice',
+      body: 'CLI 任务维护结论',
+      taskId: cliTask.id,
+    });
+    const cliMessage = h.store.getIntercom('ic_cli_task')!;
+    assert.equal(cliMessage.routeKnown, true, '显式 CLI task 是已知路由');
+    assert.equal(cliMessage.sessionKey, null);
+    assert.equal(cliMessage.conversationId, null);
+    assert.equal(cliMessage.taskId, cliTask.id);
+    assert.equal(h.store.listIntercomForRouter(null, null).some((message) => message.id === 'ic_cli_task'), true);
+    assert.equal(
+      h.store.listIntercomForRouter('telegram|bot|owner', 'topic_a').some((message) => message.id === 'ic_cli_task'),
+      false,
+      'CLI null 不能泄漏到 IM 会话',
+    );
+
+    h.store.insertIntercom({
+      id: 'ic_unknown',
+      fromLayer: 'watchdog',
+      kind: 'notice',
+      body: '没有可靠任务或会话归属',
+    });
+    const unknown = h.store.getIntercom('ic_unknown')!;
+    assert.equal(unknown.routeKnown, false);
+    assert.equal(unknown.sessionKey, null);
+    assert.equal(unknown.conversationId, null);
+    assert.equal(unknown.taskId, null);
+    assert.equal(h.store.listIntercomForRouter(null, null).some((message) => message.id === 'ic_unknown'), false);
+    assert.equal(
+      h.store.listIntercomForRouter('telegram|bot|owner', 'topic_a').some((message) => message.id === 'ic_unknown'),
+      false,
+    );
+    assert.equal(
+      h.store.listOpenIntercom('router', 50, true).some((message) => message.id === 'ic_unknown'),
+      true,
+      '未知消息只保留在管理入口，不广播',
+    );
+    assert.throws(
+      () => h.store.insertTaskIntercom({
+        id: 'ic_missing_task',
+        fromLayer: 'watchdog',
+        kind: 'notice',
+        body: '无效任务',
+        taskId: 'task_missing',
+      }),
+      /任务不存在/,
+    );
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('通信：已知 CLI task 来源由现有 Runtime tick 自动驱动 Router', async () => {
+  const { createHarness, allText } = await import('../helpers.ts');
+  const { mockReply } = await import('../../src/model/mock.ts');
+  let routerCalls = 0;
+  let seen = '';
+  const h = await createHarness({
+    limits: { maxConcurrentRuns: 0 },
+    worker: () => mockReply({ text: '不应调用 Worker' }),
+    router: ({ request }) => {
+      routerCalls += 1;
+      seen = allText(request);
+      return mockReply({ text: '已处理 CLI 维护问题' });
+    },
+  });
+  try {
+    const { task } = h.runtime.createTask({
+      title: 'CLI 自动维护',
+      goal: '无需等待下一次用户输入',
+      ownerRole: '负责人',
+      ownerBrief: '执行',
+    });
+    h.store.insertTaskIntercom({
+      id: 'ic_cli_auto',
+      fromLayer: 'watchdog',
+      kind: 'question',
+      body: 'CLI_AUTO_ROUTE_MARKER',
+      taskId: task.id,
+    });
+    assert.ok(
+      h.store.intercomRouterTargets().some((target) =>
+        target.sessionKey === null && target.conversationId === null,
+      ),
+      '已知 CLI 来源必须成为自动驱动目标',
+    );
+
+    h.runtime.tick();
+    await until(
+      () => h.store.getIntercom('ic_cli_auto')?.status === 'delivered',
+      'CLI 维护消息自动送达 Router',
+    );
+    assert.equal(routerCalls, 1);
+    assert.match(seen, /CLI_AUTO_ROUTE_MARKER/);
+    assert.match(seen, new RegExp(task.id));
+  } finally {
+    await h.cleanup();
+  }
+});
+
 test('通信全链：Worker 提问经 Router、Watchdog 回复后作为 notice 回到 Worker，且要求版本不变', async () => {
   const { createHarness, allText } = await import('../helpers.ts');
   const { MockModel, mockReply } = await import('../../src/model/mock.ts');
@@ -430,7 +577,8 @@ test('通信：维护者模型失败后重新启动仍能看到未答问题', as
   try {
     h.store.insertIntercom({ id: 'ic_failure', fromLayer: 'router', kind: 'question', body: '失败后恢复的问题' });
     const failed = new WatchdogSession({ store: h.store, config: h.config, modelName: 'mock', model: new MockModel(() => { throw new Error('模拟失败'); }) });
-    await failed.runOnce(1);
+    await assert.rejects(() => failed.runOnce(1), /模拟失败/);
+    assert.equal(h.store.getIntercom('ic_failure')?.status, 'pending');
     let seen = '';
     const restarted = new WatchdogSession({ store: h.store, config: h.config, modelName: 'mock', model: new MockModel((ctx) => { seen = JSON.stringify(ctx.request.messages); return mockReply({ text: '恢复' }); }) });
     await restarted.runOnce(1);

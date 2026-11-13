@@ -58,6 +58,162 @@ export interface Observation {
   }[];
 }
 
+export interface ModelReviewGateState {
+  /** 最近一次已安排语义巡检的严重健康事件签名。 */
+  incidentSignature: string | null;
+  incidentReviewedAt: number;
+  /** 同一个到期事件只在首次到期或等待一个语义巡检周期后再次触发。 */
+  dueIssueAttempts: Record<string, number>;
+  /** 最近一次模型处理失败的 Router 消息批次；相同批次失败后短暂退避。 */
+  routerMessageBatch: string | null;
+  routerMessageFailedAt: number;
+}
+
+export interface ModelReviewGateResult {
+  run: boolean;
+  reason: string;
+  incidentSignature: string | null;
+  dueIssueKeys: string[];
+  healthNote: string | null;
+}
+
+/**
+ * 严重健康事件用稳定程序事实做签名，心跳年龄不进入签名。
+ *
+ * unverified 可能只是没有权限读取进程身份，因此只作为观察降级，不触发
+ * 高频模型巡检。absent、exited、unresponsive 才可能立即要求语义判断。
+ */
+export function mainIncidentSignature(health: {
+  state: string;
+  pid: number | null;
+}): string | null {
+  if (!['absent', 'exited', 'unresponsive'].includes(health.state)) return null;
+  return `${health.state}:${health.pid ?? '-'}`;
+}
+
+/**
+ * 纯函数版本地 review gate。
+ *
+ * 每几秒调用它只做数据库查询后的比较；只有显式消息、事件到期、新的严重
+ * 健康签名，或活跃/空闲语义间隔到期时才返回 run=true。相同健康事实只触发
+ * 一次，随后等待一个活跃语义周期再复查，避免探测异常造成模型风暴。
+ */
+export function decideModelReview(input: {
+  now: number;
+  active: boolean;
+  lastModelReviewAt: number;
+  baselineAt: string | null;
+  activeIntervalMs: number;
+  idleIntervalMs: number;
+  pendingRouterMessages: number;
+  /** 当前 pending Router 消息 id 的稳定签名；空串表示没有消息。 */
+  pendingRouterBatch?: string;
+  /** 同一批 Router 消息在模型失败后的退避时间。 */
+  routerFailureBackoffMs?: number;
+  dueIssues: { id: string; checkAfter: string | null }[];
+  health: {
+    state: string;
+    pid: number | null;
+    detail?: string;
+    identity?: string | null;
+    degraded?: boolean;
+  };
+  state: ModelReviewGateState;
+}): ModelReviewGateResult {
+  const activeInterval = Math.max(1, input.activeIntervalMs);
+  const idleInterval = Math.max(1, input.idleIntervalMs);
+  const dueIssueKeys = input.dueIssues.map((issue) => `${issue.id}@${issue.checkAfter ?? 'always'}`);
+  const incidentSignature = mainIncidentSignature(input.health);
+  const healthNote =
+    input.health.identity === 'mismatch'
+      ? '主系统实例 PID 已确认不匹配本项目进程，存在 PID 复用风险'
+      : input.health.identity === 'unknown' || input.health.degraded || input.health.state === 'unverified'
+        ? '主系统身份探测不可用；只能观察已有心跳，不能据此授权停止或拉起'
+        : null;
+
+  const pendingRouterBatch = input.pendingRouterBatch ?? '';
+  const routerFailureBackoff =
+    input.pendingRouterMessages > 0 &&
+    pendingRouterBatch !== '' &&
+    input.state.routerMessageBatch === pendingRouterBatch &&
+    input.now - input.state.routerMessageFailedAt <
+      Math.max(1, input.routerFailureBackoffMs ?? 60_000);
+
+  if (input.pendingRouterMessages > 0 && !routerFailureBackoff) {
+    return {
+      run: true,
+      reason: `${input.pendingRouterMessages} 条来自 Router 的未投递消息`,
+      incidentSignature,
+      dueIssueKeys,
+      healthNote,
+    };
+  }
+
+  const issueNeedsReview = dueIssueKeys.some((key) => {
+    const previous = input.state.dueIssueAttempts[key];
+    return previous === undefined || input.now - previous >= activeInterval;
+  });
+  if (issueNeedsReview) {
+    return {
+      run: true,
+      reason: `${dueIssueKeys.length} 个事件到期或需要再次复查`,
+      incidentSignature,
+      dueIssueKeys,
+      healthNote,
+    };
+  }
+
+  if (
+    incidentSignature !== null &&
+    (incidentSignature !== input.state.incidentSignature ||
+      input.now - input.state.incidentReviewedAt >= activeInterval)
+  ) {
+    return {
+      run: true,
+      reason: `主系统严重健康事实：${input.health.state}`,
+      incidentSignature,
+      dueIssueKeys,
+      healthNote,
+    };
+  }
+
+  if (
+    input.baselineAt === null &&
+    (input.lastModelReviewAt === 0 || input.now - input.lastModelReviewAt >= activeInterval)
+  ) {
+    return {
+      run: true,
+      reason: '没有可用的巡检基线，建立初始快照',
+      incidentSignature,
+      dueIssueKeys,
+      healthNote,
+    };
+  }
+
+  const interval = input.active ? activeInterval : idleInterval;
+  if (input.now - input.lastModelReviewAt >= interval) {
+    return {
+      run: true,
+      reason: input.active ? '存在活跃任务，到语义巡检间隔' : '系统空闲，到低频巡检间隔',
+      incidentSignature,
+      dueIssueKeys,
+      healthNote,
+    };
+  }
+
+  return {
+    run: false,
+    reason: routerFailureBackoff
+      ? '同一批 Router 消息上次模型处理失败，正在退避'
+      : input.active
+      ? '没有显式触发，活跃任务的语义巡检尚未到期'
+      : '没有显式触发，空闲语义巡检尚未到期',
+    incidentSignature,
+    dueIssueKeys: [],
+    healthNote,
+  };
+}
+
 /** 主系统实例文件：用于判断它是活着、还是已经退出。 */
 export function instancePath(config: Config): string {
   return join(config.workDir, '.runtime', 'instance.json');
@@ -160,10 +316,18 @@ export function observe(store: Store, config: Config): Observation {
     }, new Map<string, typeof artifacts[number]>()).values()];
     const currentReviews = reviews.filter((review) => latest.some((artifact) => artifact.id === review.artifactId && artifact.sha256 === review.artifactSha256) && review.epoch === task.reviewEpoch);
     const recentEndedJobs = jobs.filter((job) => job.status !== 'running').slice(-8);
-    const trackedJobs = [
-      ...running,
-      ...recentEndedJobs.filter((job) => !running.some((active) => active.id === job.id)),
-    ];
+    const abnormalEndedJobs = recentEndedJobs
+      .filter((job) => ['failed', 'timeout', 'killed', 'unknown'].includes(job.status) || (job.exitCode ?? 0) !== 0)
+      .slice(-2);
+    const latestEndedJob = recentEndedJobs.at(-1);
+    // 运行中作业最多保留 6 个身份；总数由 runningJobs 字段准确给出。
+    // 已结束作业只保留最近异常和最后完成的一项，避免批量作业把 delta 撑大。
+    const trackedIds = new Set([
+      ...running.slice(0, 6).map((job) => job.id),
+      ...abnormalEndedJobs.map((job) => job.id),
+      ...(latestEndedJob ? [latestEndedJob.id] : []),
+    ]);
+    const trackedJobs = jobs.filter((job) => trackedIds.has(job.id));
     if (task.requireReview && latest.some((artifact) => !currentReviews.some((review) => review.artifactId === artifact.id && review.outcome === 'approved'))) {
       signals.push('当前产物存在未获当前要求版本 approved 的版本（是否必须交付由负责人决定）');
     }

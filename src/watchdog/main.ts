@@ -14,10 +14,18 @@ import { clockStamp } from '../domain/ids.ts';
 import { PiModel } from '../model/pi.ts';
 import { Store } from '../storage/store.ts';
 import { mkdirSync as mkdir, writeFileSync as writeJson } from 'node:fs';
-import { identifyProcess, instancePath, isPidAlive, looksLikeOurProcess, readInstance } from './observer.ts';
+import {
+  decideModelReview,
+  identifyProcess,
+  instancePath,
+  isPidAlive,
+  looksLikeOurProcess,
+  readInstance,
+  type ModelReviewGateState,
+} from './observer.ts';
 import { mainHealth, restartMainWithRollbackPoint, spawnMain } from './process.ts';
 import { ProcessService } from '../runtime/process.ts';
-import { WatchdogSession } from './session.ts';
+import { latestReviewTimestamp, WatchdogSession } from './session.ts';
 
 const config = loadConfig();
 // 维护者也是独立实例：它的调用记录不能被主系统的恢复流程误收敛。
@@ -291,7 +299,7 @@ const log = (message: string): void => {
   console.log(`[${clockStamp()}] ${message}`);
 };
 
-/** 巡检间隔可以在线调整：watchdog.interval 覆盖项优先于配置。 */
+/** 活跃语义巡检间隔可以在线调整：旧 watchdog.interval 覆盖项继续兼容。 */
 function currentIntervalMs(): number {
   const override = store.activeOverride('watchdog.interval');
   if (override) {
@@ -302,40 +310,101 @@ function currentIntervalMs(): number {
 }
 
 let intervalMs = currentIntervalMs();
-log(`Watchdog 启动：pid=${process.pid}｜间隔 ${Math.round(intervalMs / 1000)}s｜数据库 ${config.dbPath}`);
+const idleIntervalMs = config.limits.watchdogIdleIntervalMs;
+const healthTickMs = config.limits.watchdogHealthTickMs;
+log(
+  `Watchdog 启动：pid=${process.pid}｜本地健康 tick ${Math.round(healthTickMs / 1000)}s` +
+    `｜活跃语义巡检 ${Math.round(intervalMs / 1000)}s｜空闲语义巡检 ${Math.round(idleIntervalMs / 1000)}s` +
+    `｜数据库 ${config.dbPath}`,
+);
 log('主系统状态：' + (readInstance(config) ? `实例文件存在（pid=${readInstance(config)!.pid}）` : '没有实例文件'));
 
 let running = false;
-let lastModelReview = 0;
+let lastModelReview = latestReviewTimestamp(config) ?? 0;
+let lastGateReason = '';
+let lastHealthNote: string | null = null;
+let observedActiveIntervalMs = intervalMs;
+const ROUTER_MESSAGE_FAILURE_BACKOFF_MS = 60_000;
+const reviewGateState: ModelReviewGateState = {
+  incidentSignature: null,
+  incidentReviewedAt: 0,
+  dueIssueAttempts: {},
+  routerMessageBatch: null,
+  routerMessageFailedAt: 0,
+};
 const wakeFile = join(config.workDir, '.runtime', 'maintainer.wake');
 
 /**
- * 是否现在需要模型审视：
- * - 有到期的未解决事件 → 必须看；
- * - 有活跃任务 → 按间隔周期性看（不能只靠规则命中）；
- * - 否则跳过，避免空转。
+ * 本地 gate 只读事实，不调用模型。
+ *
+ * 正常活跃/空闲按两个语义间隔巡视；显式 Router 消息、到期事件、维护申请和
+ * 新的严重健康签名才即时触发。相同健康事实由 observer 中稳定的程序签名去重，
+ * 心跳年龄本身不会制造新 incident。
  */
-function dueForReview(): { run: boolean; reason: string } {
+function dueForReview(forceReview = false): {
+  run: boolean;
+  reason: string;
+  active: boolean;
+  healthNote: string | null;
+  incidentSignature: string | null;
+  dueIssueKeys: string[];
+} {
   const now = Date.now();
-  // Router 主动找了维护者：立刻看，不能等到定时点。用户那边正等着回话。
-  const fromRouter = store.listPendingIntercom('watchdog', 1);
-  if (fromRouter.length > 0) return { run: true, reason: `${fromRouter.length} 条来自 Router 的消息` };
+  intervalMs = currentIntervalMs();
+  if (intervalMs !== observedActiveIntervalMs) {
+    log(`活跃语义巡检间隔调整为 ${Math.round(intervalMs / 1000)}s（旧 watchdog.interval 覆盖项）`);
+    observedActiveIntervalMs = intervalMs;
+  }
+  const active = store.listTasks().some((item) =>
+    item.status === 'pending' || item.status === 'active' || item.status === 'waiting',
+  );
+  const pendingRouter = store.listPendingIntercom('watchdog', 8);
+  const pendingRouterBatch = pendingRouter.map((message) => message.id).sort().join(',');
   const issues = store.listOpenIssues();
-  const due = issues.filter((issue) => !issue.checkAfter || Date.parse(issue.checkAfter) <= now);
-  if (due.length > 0) return { run: true, reason: `${due.length} 个事件到期待复查` };
-  const active = store.listTasks().some((item) => item.status === 'active' || item.status === 'waiting');
-  if (active && now - lastModelReview >= intervalMs) return { run: true, reason: '存在活跃任务，周期性审视' };
-  // 系统闲置时每 5 分钟审视一次纯属空转：实测 33 轮巡检全是「无需介入」，
-  // 每轮却要重发 15 万 token 的上下文。闲置时半小时看一眼足够。
-  if (!active && now - lastModelReview >= intervalMs * 30) return { run: true, reason: '长时间未审视，做一次巡检' };
-  return { run: false, reason: '没有到期事件，也没有新的活跃任务' };
+  const dueIssues = issues
+    .filter((issue) => !issue.checkAfter || Date.parse(issue.checkAfter) <= now)
+    .map((issue) => ({ id: issue.id, checkAfter: issue.checkAfter }));
+  const health = mainHealth(config);
+  const gate = decideModelReview({
+    now,
+    active,
+    lastModelReviewAt: lastModelReview,
+    baselineAt: latestReviewTimestamp(config) === null ? null : new Date(lastModelReview || 0).toISOString(),
+    activeIntervalMs: intervalMs,
+    idleIntervalMs,
+    pendingRouterMessages: pendingRouter.length,
+    pendingRouterBatch,
+    routerFailureBackoffMs: ROUTER_MESSAGE_FAILURE_BACKOFF_MS,
+    dueIssues,
+    health,
+    state: reviewGateState,
+  });
+  if (forceReview) {
+    return {
+      run: true,
+      reason: '一次性强制语义巡检',
+      active,
+      healthNote: gate.healthNote,
+      incidentSignature: gate.incidentSignature,
+      dueIssueKeys: [],
+    };
+  }
+  return {
+    run: gate.run,
+    reason: gate.reason,
+    active,
+    healthNote: gate.healthNote,
+    incidentSignature: gate.incidentSignature,
+    dueIssueKeys: gate.dueIssueKeys,
+  };
 }
 
 /**
  * Worker 提的维护申请。
  *
- * 申请只是线索，不是结论：Worker 说的「测试通过」不采信，让它自己跑一遍。
- * 判断权在模型，进程操作在 restart_main 那个程序函数里——两边都不越界。
+ * 申请只是线索，不是结论。维护者先复用任务授权、已有有效证据和当前状态；
+ * 只有缺口或范围变化可能改变决定时，才补做最小检查。进程操作仍只经
+ * restart_main 的程序守卫执行。
  */
 async function runMaintenanceRequests(): Promise<void> {
   const pending = store.listPendingWdRequests(3);
@@ -352,20 +421,19 @@ async function runMaintenanceRequests(): Promise<void> {
       `它给的理由：${request.reason}`,
       `它给的引用：${request.refs.length > 0 ? request.refs.join('、') : '（没有给）'}`,
       '',
-      '这只是申请，不是结论。它可能判断错，也可能改的代码根本跑不起来。请自己核对后再决定：',
-      '- run_command 看 git status / git diff --stat / git log，确认改动范围与提交',
-      '- 亲自跑它声称跑过的检查（例如 pnpm typecheck），不要采信"测试通过"这句话',
-      '- inspect_task 看任务进度与产物，判断现在重启会不会把半成品打断',
+      '这只是申请，不是结论。先复用任务 brief、已有检查结论、作业回执和正式结果；',
+      '只有证据缺失、过期，或当前改动/要求/范围已变化且可能改变决定时，才补做最小检查。',
+      '已知有效的同一检查不必机械重跑；申请方报告本身仍不能替代可核对证据。',
       '',
       '决定：',
       '- 值得 → maintain(action="restart_main", reason="...")。它会先打回滚点、停主系统、拉起、等心跳，然后把结果给你。',
-      '- 不值得 → record 记一个事件说明理由，不要重启。',
-      '- 重启失败（心跳没起来）→ 先 run_command 看 work/.runtime/main.log，再决定重试、回滚（git reset --hard <tag>）还是上报。',
+      '- 不值得 → record 记一个事件说明理由，或直接给出简短结论，不要重启。',
+      '- 重启失败（心跳没起来）→ 读取 work/.runtime/main.log 和 restart.json，再决定是否上报或提出后续动作。',
       '',
       '结束时写清：你核对了什么、看到什么、做了什么决定、为什么。',
     ].join('\n');
     try {
-      const answer = await session.ask(question);
+      const answer = await session.ask(question, { taskId: request.taskId, history: false });
       store.resolveWdRequest(request.id, 'done', answer.slice(0, 800));
       log(`维护申请 ${request.id} 已处理：${answer.split('\n')[0]?.slice(0, 140) ?? ''}`);
     } catch (error) {
@@ -375,9 +443,10 @@ async function runMaintenanceRequests(): Promise<void> {
   }
 }
 
-async function tick(): Promise<void> {
+async function tick(forceReview = false): Promise<void> {
   if (running) return;
   running = true;
+  let attemptedRouterMessages: string[] = [];
   try {
     // 提问与巡检串行：同一时刻只有一个维护会话在动。
     // 提问优先于停机标记：停机只表示"不要自动拉起主系统"，不影响回答人的问题。
@@ -389,16 +458,53 @@ async function tick(): Promise<void> {
       log('发现停机标记，等待恢复维护（不会自动重启主系统）');
       return;
     }
-    const gate = dueForReview();
+    const gate = dueForReview(forceReview);
+    if (gate.healthNote !== lastHealthNote) {
+      if (gate.healthNote) log(`本地健康检查：${gate.healthNote}`);
+      lastHealthNote = gate.healthNote;
+    }
+    if (!gate.incidentSignature) {
+      reviewGateState.incidentSignature = null;
+      reviewGateState.incidentReviewedAt = 0;
+    }
     if (!gate.run) {
-      log(`跳过本轮巡检：${gate.reason}`);
+      if (gate.reason !== lastGateReason) {
+        log(`跳过语义巡检：${gate.reason}`);
+        lastGateReason = gate.reason;
+      }
       return;
     }
+    lastGateReason = '';
+    attemptedRouterMessages = store.listPendingIntercom('watchdog', 8).map((message) => message.id).sort();
+    if (gate.incidentSignature) {
+      reviewGateState.incidentSignature = gate.incidentSignature;
+      reviewGateState.incidentReviewedAt = Date.now();
+    }
+    for (const key of gate.dueIssueKeys) {
+      reviewGateState.dueIssueAttempts[key] = Date.now();
+    }
     lastModelReview = Date.now();
-    const result = await session.runOnce(Math.round(intervalMs / 60_000));
-    log(`巡检完成（${gate.reason}）：${result.steps} 次模型调用${result.acted ? '，尝试了维护动作' : ''}｜${result.summary.split('\n')[0]?.slice(0, 160) ?? ''}`);
+    const reviewIntervalMs = gate.active ? intervalMs : idleIntervalMs;
+    const result = await session.runOnce(Math.max(1, Math.round(reviewIntervalMs / 60_000)));
+    reviewGateState.routerMessageBatch = null;
+    reviewGateState.routerMessageFailedAt = 0;
+    log(
+      `语义巡检完成（${gate.reason}）：本会话 ${result.steps} 个模型 step` +
+        `${result.acted ? '，尝试了维护动作' : ''}｜${result.summary.split('\n')[0]?.slice(0, 160) ?? ''}`,
+    );
   } catch (error) {
-    log(`巡检失败：${(error as Error).message}（保留观察记录，继续按间隔重试）`);
+    const stillPending = new Set(store.listPendingIntercom('watchdog', 20).map((message) => message.id));
+    const failedMessages = attemptedRouterMessages.filter((id) => stillPending.has(id));
+    if (failedMessages.length > 0) {
+      reviewGateState.routerMessageBatch = failedMessages.sort().join(',');
+      reviewGateState.routerMessageFailedAt = Date.now();
+      log(
+        `语义巡检失败：${(error as Error).message}｜${failedMessages.length} 条 Router 消息保持 pending，` +
+          `同批退避 ${ROUTER_MESSAGE_FAILURE_BACKOFF_MS / 1000}s`,
+      );
+    } else {
+      log(`语义巡检失败：${(error as Error).message}（保留观察记录，等待下个语义间隔）`);
+    }
     store.appendWdAction({
       id: `wda_${Date.now().toString(36)}`,
       issueId: null,
@@ -426,7 +532,7 @@ function checkWake(): void {
 // 只验证进程独立性与状态隔离时，可以跳过首次巡检（用于进程存活测试）。
 if (process.env['WATCHDOG_ONCE'] === '1') {
   // 一次性巡检：给验收脚本用，跑完就退出。
-  await tick();
+  await tick(true);
   store.close();
   process.exit(0);
 }
@@ -442,17 +548,8 @@ try {
 }
 if (existsSync(wakeFile)) checkWake();
 else if (process.env['WATCHDOG_NO_TICK'] !== '1') void tick();
-let timer = setInterval(() => void tick(), intervalMs);
-// 每轮都重新读一次间隔，在线调整不需要重启进程。
-setInterval(() => {
-  const next = currentIntervalMs();
-  if (next !== intervalMs) {
-    intervalMs = next;
-    clearInterval(timer);
-    timer = setInterval(() => void tick(), intervalMs);
-    log(`巡检间隔调整为 ${Math.round(intervalMs / 1000)}s（在线生效）`);
-  }
-}, 15_000);
+// 本地 tick 只检查队列、事件期限和进程健康；模型语义巡检由 dueForReview gate 决定。
+setInterval(() => void tick(), healthTickMs);
 
 const shutdown = (): void => {
   log('Watchdog 退出');

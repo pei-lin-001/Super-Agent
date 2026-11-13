@@ -5,10 +5,10 @@ import { allText, createHarness, isNoteRequest, roleOf, scripted, systemText } f
 import { mockReply } from '../../src/model/mock.ts';
 import { collectFileOps } from '../../src/runtime/note.ts';
 import { buildNotePrompt, decideNote, renderTurnsForNote, runNote } from '../../src/runtime/note.ts';
-import { planHistory, groupTurns } from '../../src/runtime/context.ts';
+import { planHistory, groupTurns, renderTaskFacts } from '../../src/runtime/context.ts';
 import type { ChatRequest } from '../../src/model/types.ts';
-import { nowIso } from '../../src/domain/ids.ts';
-import type { WorkerTurn } from '../../src/domain/types.ts';
+import { newMessageId, nowIso } from '../../src/domain/ids.ts';
+import type { ActorKind, WorkerTurn } from '../../src/domain/types.ts';
 
 /** 往某个 Worker 的历史里灌入可控 turn，模拟一个很长的任务。 */
 function seedTurns(
@@ -923,4 +923,299 @@ test('历史检索：旧记录、工具参数、字面符号和 Unicode 不因�
     assert.match((await tool.run({ query: '旧证据', from_seq: 2 }, context)).content, /没有在自己历史/);
     assert.match((await tool.run({ query: '旧证据', role: 'user' }, context)).content, /没有在自己历史/);
   } finally { await harness.cleanup(); }
+});
+
+test('任务事实：Router update 是任务级要求，成员 update 只保留真实来源和接收对象', async () => {
+  const harness = await staticHarness();
+  try {
+    const { task, owner } = harness.runtime.createTask({
+      title: '更新作用域',
+      goal: '只落实真实要求',
+      ownerRole: '负责人',
+      ownerBrief: '执行',
+    });
+    const helper = harness.store.getWorker(
+      harness.runtime.createCollaborator(owner, '协作者', '协助').workerId!,
+    )!;
+    const local = harness.runtime.sendMessage({
+      from: owner,
+      to: helper.id,
+      kind: 'update',
+      body: '只给该成员的局部指示',
+    });
+    assert.equal(local.ok, true, local.reason);
+    assert.equal(harness.store.getTask(task.id)!.reviewEpoch, 0, '局部指示不能抬升任务要求版本');
+
+    const internal = harness.runtime as unknown as {
+      taskLevelUpdateFor(currentTask: typeof task): string | null;
+      assignedInstructionsFor(currentTask: typeof task, worker: typeof helper): {
+        body: string;
+        fromKind: ActorKind;
+        fromId: string;
+      }[];
+    };
+    assert.equal(internal.taskLevelUpdateFor(task), null);
+    assert.deepEqual(internal.assignedInstructionsFor(task, helper), [{
+      body: '只给该成员的局部指示',
+      fromKind: 'worker',
+      fromId: owner.id,
+    }]);
+
+    const factsBefore = renderTaskFacts({
+      task,
+      isOwner: false,
+      latestUpdate: internal.taskLevelUpdateFor(task),
+      assignedInstructions: internal.assignedInstructionsFor(task, helper),
+    });
+    assert.match(factsBefore, /指派给你的工作指示/);
+    assert.match(factsBefore, new RegExp(`来自 Worker ${owner.id}`));
+    assert.doesNotMatch(factsBefore, /最新任务级补充要求/);
+
+    const routed = harness.runtime.sendRouterMessage({
+      taskId: task.id,
+      kind: 'update',
+      workerId: owner.id,
+      body: '用户真正新增的任务要求',
+    });
+    assert.equal(routed.ok, true, routed.reason);
+    const currentTask = harness.store.getTask(task.id)!;
+    assert.equal(currentTask.reviewEpoch, 1);
+    assert.equal(internal.taskLevelUpdateFor(currentTask), '用户真正新增的任务要求');
+    const factsAfter = renderTaskFacts({
+      task: currentTask,
+      isOwner: false,
+      latestUpdate: internal.taskLevelUpdateFor(currentTask),
+      assignedInstructions: internal.assignedInstructionsFor(currentTask, helper),
+    });
+    assert.match(factsAfter, /最新任务级补充要求.*用户真正新增的任务要求/);
+    assert.match(factsAfter, /指派给你的工作指示.*只给该成员的局部指示/);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('正式检查意见定向回流作者，长文明确截断，引用读取不能借猜 id 越权', async () => {
+  const harness = await staticHarness();
+  try {
+    const { task, owner } = harness.runtime.createTask({
+      title: '检查回流',
+      goal: '修正草稿',
+      ownerRole: '负责人',
+      ownerBrief: '汇总',
+      requireReview: false,
+    });
+    const author = harness.store.getWorker(
+      harness.runtime.createCollaborator(owner, '作者', '维护报告').workerId!,
+    )!;
+    const reviewer = harness.store.getWorker(
+      harness.runtime.createCollaborator(owner, '检查者', '检查报告').workerId!,
+    )!;
+
+    const ownArtifact = harness.runtime.saveArtifact(owner, 'owner.md', '负责人草稿').artifact;
+    const ownRequest = harness.runtime.sendMessage({
+      from: owner,
+      to: reviewer.id,
+      kind: 'request',
+      intent: 'review',
+      body: '检查负责人草稿',
+      refs: { artifacts: [{ artifactId: ownArtifact.id, name: ownArtifact.name, version: ownArtifact.version }] },
+    });
+    assert.equal(ownRequest.ok, true, ownRequest.reason);
+    assert.equal(harness.runtime.sendMessage({
+      from: reviewer,
+      to: owner.id,
+      kind: 'reply',
+      replyTo: ownRequest.messageId!,
+      outcome: 'approved',
+      body: '负责人自己请求的检查结论',
+    }).ok, true);
+    assert.equal(
+      harness.store.listInbox(owner.id).filter((message) => message.body.includes('收到正式检查结论')).length,
+      0,
+      '作者就是请求者时原 reply 已足够，不能重复整段意见',
+    );
+
+    const authoredArtifact = harness.runtime.saveArtifact(author, 'authored.md', '协作者草稿').artifact;
+    const reviewRequest = harness.runtime.sendMessage({
+      from: owner,
+      to: reviewer.id,
+      kind: 'request',
+      intent: 'review',
+      body: '检查协作者草稿',
+      refs: { artifacts: [{ artifactId: authoredArtifact.id, name: authoredArtifact.name, version: authoredArtifact.version }] },
+    });
+    assert.equal(reviewRequest.ok, true, reviewRequest.reason);
+    const longFeedback = `开头引用有效范围\n${'具体意见'.repeat(400)}\nTAIL_ONLY_MARKER`;
+    const reviewReply = harness.runtime.sendMessage({
+      from: reviewer,
+      to: owner.id,
+      kind: 'reply',
+      replyTo: reviewRequest.messageId!,
+      outcome: 'changes_required',
+      body: longFeedback,
+    });
+    assert.equal(reviewReply.ok, true, reviewReply.reason);
+
+    const feedbackNotices = harness.store
+      .listInbox(author.id)
+      .filter((message) => message.body.includes('收到正式检查结论'));
+    assert.equal(feedbackNotices.length, 1);
+    assert.match(feedbackNotices[0]!.body, /authored\.md v1/);
+    assert.match(feedbackNotices[0]!.body, /检查记录/);
+    assert.match(feedbackNotices[0]!.body, /检查意见摘录/);
+    assert.match(feedbackNotices[0]!.body, /不完整/);
+    assert.doesNotMatch(feedbackNotices[0]!.body, /TAIL_ONLY_MARKER/);
+    assert.match(feedbackNotices[0]!.body, /不代表任务其他产物/);
+    assert.match(feedbackNotices[0]!.body, new RegExp(reviewReply.messageId!));
+
+    const { historyTools } = await import('../../src/tools/history.ts');
+    const messageRead = historyTools.find((tool) => tool.name === 'message_read')!;
+    const context = {
+      host: harness.runtime,
+      worker: author,
+      task: harness.store.getTask(task.id)!,
+      workDir: harness.config.workDir,
+      materialsDir: harness.config.materialsDir,
+      readRoot: harness.config.readRoot,
+    };
+    const full = await messageRead.run({ message_id: reviewReply.messageId!, limit: 20_000 }, context);
+    assert.match(full.content, /TAIL_ONLY_MARKER/);
+
+    // 同一任务的普通 Worker 即使猜中另一条请求/回复 id，并自行写 refs.messages，也不能获得读取权。
+    const secret = harness.runtime.sendMessage({
+      from: owner,
+      to: reviewer.id,
+      kind: 'request',
+      intent: 'help',
+      body: '不属于作者的私有请求',
+    });
+    const forgedPeer = harness.runtime.sendMessage({
+      from: reviewer,
+      to: author.id,
+      kind: 'notice',
+      body: '伪造引用',
+      refs: { messages: [secret.messageId!] },
+    });
+    assert.equal(forgedPeer.ok, true, forgedPeer.reason);
+    assert.equal(harness.runtime.getMessageForWorker(author.id, secret.messageId!), null);
+
+    harness.store.insertMessage({
+      id: newMessageId(),
+      groupId: task.groupId,
+      taskId: task.id,
+      fromKind: 'worker',
+      fromId: author.id,
+      toKind: 'worker',
+      toId: author.id,
+      kind: 'notice',
+      body: '伪造自己的引用',
+      payload: null,
+      replyTo: null,
+      refs: { messages: [secret.messageId!] },
+      dedupeKey: null,
+      broadcastId: null,
+      status: 'queued',
+      createdAt: nowIso(),
+      deliveredAt: null,
+      consumedAt: null,
+      error: null,
+    });
+    assert.equal(harness.runtime.getMessageForWorker(author.id, secret.messageId!), null);
+
+    // 另一任务的 reply 不能借本任务检查通知跨任务读取。
+    const other = harness.runtime.createTask({
+      title: '另一任务',
+      goal: '隔离',
+      ownerRole: '负责人',
+      ownerBrief: '执行',
+    });
+    const otherChecker = harness.store.getWorker(
+      harness.runtime.createCollaborator(other.owner, '检查者', '检查').workerId!,
+    )!;
+    const crossRequest = harness.runtime.sendMessage({
+      from: other.owner,
+      to: otherChecker.id,
+      kind: 'request',
+      intent: 'help',
+      body: '跨任务秘密',
+    });
+    assert.equal(harness.runtime.getMessageForWorker(author.id, crossRequest.messageId!), null);
+
+    // 可选检查不变成硬闸门：changes_required 仍允许负责人提交。
+    const submitted = await harness.runtime.submitResult(owner, '交付协作者报告', ['authored.md']);
+    assert.equal(submitted.ok, true, submitted.reason);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('正式检查回流不会随迁移后的作者注入新任务', async () => {
+  const harness = await staticHarness();
+  try {
+    const first = harness.runtime.createTask({
+      title: '旧任务',
+      goal: '检查旧产物',
+      ownerRole: '负责人',
+      ownerBrief: '发起检查',
+    });
+    const author = harness.store.getWorker(
+      harness.runtime.createCollaborator(first.owner, '作者', '维护旧报告').workerId!,
+    )!;
+    const reviewer = harness.store.getWorker(
+      harness.runtime.createCollaborator(first.owner, '检查者', '检查旧报告').workerId!,
+    )!;
+    const artifact = harness.runtime.saveArtifact(author, 'old-report.md', '旧报告').artifact;
+    const request = harness.runtime.sendMessage({
+      from: first.owner,
+      to: reviewer.id,
+      kind: 'request',
+      intent: 'review',
+      body: '检查旧报告',
+      refs: { artifacts: [{ artifactId: artifact.id, name: artifact.name, version: artifact.version }] },
+    });
+    assert.equal(request.ok, true, request.reason);
+
+    // 先按真实生命周期休眠，再通过公开 wakeWorker 把同一成员迁移到同空间的新任务。
+    harness.store.setWorkerStatus(author.id, 'dormant', '旧协作结束');
+    harness.store.setWorkerCurrentTask(author.id, null);
+    const second = harness.runtime.createTask({
+      title: '新任务',
+      goal: '处理新工作',
+      ownerRole: '负责人',
+      ownerBrief: '开始新任务',
+      workspaceId: first.task.workspaceId,
+    });
+    const wake = harness.runtime.wakeWorker({
+      workerId: author.id,
+      taskId: second.task.id,
+      brief: '接手新任务',
+    });
+    assert.equal(wake.ok, true, wake.reason);
+    assert.equal(harness.store.getWorker(author.id)?.currentTaskId, second.task.id);
+
+    const reply = harness.runtime.sendMessage({
+      from: reviewer,
+      to: first.owner.id,
+      kind: 'reply',
+      replyTo: request.messageId!,
+      outcome: 'changes_required',
+      body: 'OLD_TASK_FEEDBACK_MUST_NOT_ENTER_NEW_TASK',
+    });
+    assert.equal(reply.ok, true, reply.reason);
+
+    const leaked = harness.store.listTaskMessages(second.task.id).filter((message) =>
+      message.toId === author.id &&
+      (message.body.includes('OLD_TASK_FEEDBACK_MUST_NOT_ENTER_NEW_TASK') ||
+        message.refs?.messages?.includes(reply.messageId!)),
+    );
+    assert.deepEqual(leaked, [], '作者迁移后不能收到旧任务的检查正文或跨任务 refs');
+    assert.equal(
+      harness.store.listInbox(author.id).filter((message) =>
+        message.body.includes('OLD_TASK_FEEDBACK_MUST_NOT_ENTER_NEW_TASK'),
+      ).length,
+      0,
+    );
+  } finally {
+    await harness.cleanup();
+  }
 });

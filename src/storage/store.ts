@@ -808,6 +808,33 @@ export class Store {
     ).map(mapMessage);
   }
 
+  /** 系统正式检查回流是否明确授权该 Worker 读取对应 reply。 */
+  hasReviewFeedbackReferenceForWorker(workerId: string, taskId: string, replyMessageId: string): boolean {
+    const rows = this.all(
+      `SELECT refs, payload FROM message
+       WHERE task_id = ? AND from_kind = 'system' AND from_id = 'system'
+         AND to_kind = 'worker' AND to_id = ? AND refs IS NOT NULL`,
+      taskId,
+      workerId,
+    );
+    return rows.some((row) => {
+      const rawRefs = strOrNull(row['refs']);
+      const rawPayload = strOrNull(row['payload']);
+      if (rawRefs === null || rawPayload === null) return false;
+      try {
+        const refs = JSON.parse(rawRefs) as { messages?: unknown };
+        const payload = JSON.parse(rawPayload) as { reviewFeedbackReplyId?: unknown };
+        return (
+          payload.reviewFeedbackReplyId === replyMessageId &&
+          Array.isArray(refs.messages) &&
+          refs.messages.includes(replyMessageId)
+        );
+      } catch {
+        return false;
+      }
+    });
+  }
+
   /** Router 未消费的消息。 */
   /**
    * Router 收件箱。
@@ -1012,7 +1039,8 @@ export class Store {
   /** 水位线之后的维护对话（摘要已覆盖的部分不重复取）。 */
   listWdDialogueSince(afterRow: number, limit = 400): { row: number; id: string; role: 'user' | 'assistant'; content: string; piMessage?: import('@earendil-works/pi-ai').AssistantMessage }[] {
     return this.all(
-      `SELECT rowid AS rid, id, role, content, pi_message FROM wd_turn WHERE rowid > ? ORDER BY rowid ASC LIMIT ?`,
+      `SELECT rowid AS rid, id, role, content, pi_message FROM wd_turn
+       WHERE rowid > ? AND role IN ('user', 'assistant') ORDER BY rowid ASC LIMIT ?`,
       afterRow, limit,
     ).map((row) => ({
       row: Number((row as { rid?: unknown }).rid ?? 0),
@@ -1210,6 +1238,35 @@ export class Store {
   }
 
   /**
+   * 从任务来源发送跨层消息。
+   *
+   * taskId 是明确的路由依据：IM 任务复制原会话和话题；CLI 任务的
+   * sourceSessionKey 为 NULL，但仍记 routeKnown=true，表示“已知 CLI 入口”。
+   * 不能把 NULL 与“完全不知道路由”混为一谈。
+   */
+  insertTaskIntercom(input: {
+    id: string;
+    fromLayer: 'router' | 'watchdog';
+    kind: 'notice' | 'request' | 'question' | 'reply';
+    body: string;
+    taskId: string;
+    topicId?: string | null;
+    replyTo?: string | null;
+    refs?: string[] | null;
+    hops?: number;
+    ttlMs?: number;
+  }): void {
+    const task = this.getTask(input.taskId);
+    if (!task) throw new Error(`任务不存在：${input.taskId}`);
+    this.insertIntercom({
+      ...input,
+      routeKnown: true,
+      sessionKey: task.sourceSessionKey ?? null,
+      conversationId: task.sourceSessionKey === null ? null : task.sourceConversationId ?? null,
+    });
+  }
+
+  /**
    * 某个层还没看到的消息，最老的在前（先看到的先处理）。
    *
    * 只取 pending：投递过的绝不再给。否则每轮都会重复注入同一批"已经看过的旧话"，
@@ -1238,12 +1295,15 @@ export class Store {
     ).map((row) => this.toIntercom(row));
   }
 
-  intercomRouterTargets(): { sessionKey: string; conversationId: string | null }[] {
+  intercomRouterTargets(): { sessionKey: string | null; conversationId: string | null }[] {
     return this.all(
       `SELECT DISTINCT session_key, conversation_id FROM intercom
-       WHERE to_layer = 'router' AND route_known = 1 AND session_key IS NOT NULL
+       WHERE to_layer = 'router' AND route_known = 1
        AND status = 'pending' AND (expires_at IS NULL OR expires_at > ?)`, nowIso(),
-    ).map((row) => ({ sessionKey: str(row['session_key']), conversationId: strOrNull(row['conversation_id']) }));
+    ).map((row) => ({
+      sessionKey: strOrNull(row['session_key']),
+      conversationId: strOrNull(row['conversation_id']),
+    }));
   }
 
   listOpenIntercom(toLayer: 'router' | 'watchdog', limit = 10, unassignedOnly = false): IntercomMessage[] {
@@ -1263,7 +1323,8 @@ export class Store {
           (current.expiresAt !== null && current.expiresAt <= nowIso())) return false;
       this.insertIntercom({ id, fromLayer: current.toLayer, kind: 'reply', body,
         topicId: current.topicId ?? current.id, replyTo: current.id, sessionKey: current.sessionKey,
-        conversationId: current.conversationId, routeKnown: current.routeKnown, hops: current.hops + 1 });
+        conversationId: current.conversationId, routeKnown: current.routeKnown,
+        taskId: current.taskId, hops: current.hops + 1 });
       this.consumeIntercom(current.id);
       return true;
     });

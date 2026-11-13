@@ -533,15 +533,7 @@ export class Router {
     const history = context.history
       ? boundRouterHistory({ messages: context.history, limits: this.runtime.config.limits })
       : (assembled?.history ?? []);
-    // system 只放不随时间变的东西（角色规则）。每轮都会变的表单与待处理消息
-    // 挪到历史之后——提示缓存按前缀匹配，把易变内容摆在中间会让后面的历史每轮重算。
-    const stateBlock = routerStateBlock({
-      taskCards: this.renderWorkspaces(sessionKey, conversationId),
-      pendingMessages: pending,
-      conversationNote: assembled?.note ?? null,
-      maintainerMessages: this.renderMaintainerMessages(maintainerMessages),
-    });
-    const messages: ChatMessage[] = [{ role: 'system', content: routerSystemPrompt() }, ...history];
+    let conversationNote = assembled?.note ?? null;
 
     if (assembled?.toSummarize) {
       // 超阈值：先把被挤出去的旧对话压进摘要，再发请求。
@@ -557,11 +549,21 @@ export class Router {
         limits: this.runtime.config.limits,
       });
       if (note.ok && note.content) {
-        messages.push({ role: 'system', content: `# 更早对话的累计记录\n${note.content}` });
+        conversationNote = note.content;
       } else {
         this.runtime.store.appendEvent(null, null, 'router.note_failed', note.reason ?? '摘要生成失败');
       }
     }
+
+    // 摘要成功后本轮只使用新的累计记录；失败才继续使用旧记录。
+    // system 仍只放稳定角色规则，累计记录随状态块放在历史之后。
+    const stateBlock = routerStateBlock({
+      taskCards: this.renderWorkspaces(sessionKey, conversationId),
+      pendingMessages: pending,
+      conversationNote,
+      maintainerMessages: this.renderMaintainerMessages(maintainerMessages),
+    });
+    const messages: ChatMessage[] = [{ role: 'system', content: routerSystemPrompt() }, ...history];
 
     if (userText !== null) {
       // 图片只挂在这一次请求上；落库的历史只有文字，下一轮不会重发 base64。
