@@ -52,15 +52,15 @@ export const docTools: ToolDefinition[] = [
       type: 'object',
       properties: {
         path: { type: 'string', description: 'PDF 路径（相对任务目录，或以 materials/ 开头）' },
-        from_page: { type: 'number', description: '起始页，从 1 开始' },
-        to_page: { type: 'number', description: '结束页（含）' },
+        from_page: { type: 'number', description: '起始页，从 1 开始；未指定时默认为第 1 页' },
+        to_page: { type: 'number', description: '结束页（含）；仅传 from_page 时只提取该页，未传 from_page 时从第 1 页开始；两个页码都未指定时提取整份 PDF' },
         limit: { type: 'number', description: '返回字符上限，默认 8000' },
         save_to: {
           type: 'string',
           description:
-            '把全文另存为任务目录下的文本文件（如 pdf/paper.txt），返回路径而不返回正文。' +
+            '把本次请求页码范围内提取到的文字另存为任务目录下的文本文件（如 pdf/paper.txt），返回路径而不返回正文。' +
             '要在文档里反复检索时用它：转换一次，之后用 fs_search / fs_read / proc_run 直接处理，' +
-            '不必每次调用都重新解析 PDF。',
+            '不必每次调用都重新解析 PDF。这里只提取文字，不渲染或查看 PDF 原版面。',
         },
       },
       required: ['path'],
@@ -79,6 +79,12 @@ export const docTools: ToolDefinition[] = [
         throw new ToolError('页码必须为正整数，结束页不能早于起始页');
       }
       const argv = ['-layout'];
+      const requestedRange =
+        from !== null
+          ? `第 ${from}–${to ?? from} 页`
+          : to !== null
+            ? `第 1–${to} 页`
+            : '未限定页码（整份 PDF）';
       if (from !== null) {
         argv.push('-f', String(Math.max(1, Math.trunc(from))));
         argv.push('-l', String(Math.max(1, Math.trunc(to ?? from))));
@@ -100,25 +106,27 @@ export const docTools: ToolDefinition[] = [
       const saveTo = argOptionalString(args, 'save_to');
       if (saveTo !== null) {
         if (text.trim() === '') {
-          return ok(`${logical}：没有提取到文字。可能是扫描件（图片型 PDF），需要 OCR。`);
+          return ok(`${logical}｜请求范围：${requestedRange}：没有提取到文字。可能是扫描件（图片型 PDF），也可能是这些页没有文本层；本工具不执行 OCR。`);
         }
         const target = saveText(context, saveTo, text);
         const lines = text.split('\n').length;
         return ok(
-          `${logical}｜共 ${pages.filter((page) => page.trim() !== '').length} 页有文字，已存为 ${target}（${lines} 行，${text.length} 字符）。\n` +
+          `${logical}｜请求范围：${requestedRange}；其中提取到文字的页数：${pages.filter((page) => page.trim() !== '').length}；已存为 ${target}（${lines} 行，${text.length} 字符）。这是 pdftotext 提取的文字，不是原版面；有文字的页数不是 PDF 总页数。\n` +
             '后续用 fs_search 定位关键词、fs_read 按行读；不要再用 proc_run 重新解析 PDF。',
         );
       }
 
       const shown: string[] = [];
       let used = 0;
+      let truncatedAtPage: number | null = null;
       for (let index = 0; index < pages.length; index += 1) {
         const pageText = pages[index]!.trim();
         if (pageText === '') continue;
         const block = `--- 第 ${(from ?? 1) + index} 页 ---\n${pageText}`;
         if (used + block.length > limit) {
+          truncatedAtPage = (from ?? 1) + index;
           const remaining = Math.max(0, limit - used - 100);
-          if (shown.length === 0 && remaining > 0) shown.push(`${block.slice(0, remaining)}\n…（该页超过输出上限；请用 save_to 保存全文后分段读取）`);
+          if (shown.length === 0 && remaining > 0) shown.push(`${block.slice(0, remaining)}\n…（该页超过输出上限；可用 save_to 保存请求范围内的全部提取文字后分段读取）`);
           else shown.push(`…（已达输出上限 ${limit} 字符；请从第 ${(from ?? 1) + index} 页继续读取）`);
           break;
         }
@@ -127,10 +135,13 @@ export const docTools: ToolDefinition[] = [
       }
       if (shown.length === 0) {
         return ok(
-          `${logical}：没有提取到文字。可能是扫描件（图片型 PDF），需要 OCR 才能读取，当前不具备该能力。`,
+          `${logical}｜请求范围：${requestedRange}：没有提取到文字。可能是扫描件（图片型 PDF）、该范围没有文本层，或页范围超出文档；本工具不执行 OCR，也不报告 PDF 总页数。`,
         );
       }
-      return ok(`${logical}｜共 ${pages.filter((page) => page.trim() !== '').length} 页有文字\n\n${shown.join('\n\n')}`);
+      const returnedScope = truncatedAtPage === null
+        ? '请求范围内提取到的文字已完整返回'
+        : `达到 ${limit} 字符返回上限，从第 ${truncatedAtPage} 页起的内容未完整返回`;
+      return ok(`${logical}｜请求范围：${requestedRange}；其中提取到文字的页数：${pages.filter((page) => page.trim() !== '').length}；返回范围：${returnedScope}。这是 pdftotext 提取的文字，不是原版面；页数只统计请求范围内有文字的页，不是 PDF 总页数。\n\n${shown.join('\n\n')}`);
     },
   },
   {

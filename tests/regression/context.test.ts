@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { join } from 'node:path';
 import test from 'node:test';
 import { allText, createHarness, isNoteRequest, roleOf, scripted, systemText } from '../helpers.ts';
 import { mockReply } from '../../src/model/mock.ts';
@@ -257,7 +258,8 @@ test('预算：产物变多、记录变大时，system prompt 有上限而不是
     const lines = collectArtifactLines(task, harness.store.listArtifacts(task.id), []);
     const table = renderArtifactTable({ task, lines });
     assert.match(table, /另有 8 份产物未显示/, '超出上限的产物不进入常驻上下文');
-    assert.ok(table.split('\n').length <= 14);
+    assert.ok(table.split('\n').length <= 15);
+    assert.match(table, /检查门槛：可选/);
   } finally {
     await harness.cleanup();
   }
@@ -345,7 +347,7 @@ test('检索：按消息 id 读全文，支持分页', async () => {
   }
 });
 
-test('产物：相同内容复用版本，改内容才新建，复用不自动变成已检查', async () => {
+test('产物：相同内容复用版本并保留审查状态，改内容才新建', async () => {
   const harness = await staticHarness();
   try {
     const { task, owner } = harness.runtime.createTask({
@@ -360,15 +362,60 @@ test('产物：相同内容复用版本，改内容才新建，复用不自动�
     assert.equal(again.artifact.version, 1);
     assert.equal(harness.store.listArtifacts(task.id).length, 1, '不产生新版本');
 
+    const checker = harness.runtime.createCollaborator(owner, '检查者', '检查');
+    const reviewRequest = harness.runtime.sendMessage({
+      from: owner,
+      to: checker.workerId!,
+      kind: 'request',
+      intent: 'review',
+      body: '检查 report',
+      refs: { artifacts: [{ artifactId: first.artifact.id, name: 'report.md', version: 1 }] },
+    });
+    assert.equal(reviewRequest.ok, true, reviewRequest.reason);
+    assert.equal(harness.runtime.sendMessage({
+      from: harness.store.getWorker(checker.workerId!)!,
+      to: owner.id,
+      kind: 'reply',
+      replyTo: reviewRequest.messageId!,
+      outcome: 'approved',
+      body: '通过',
+    }).ok, true);
+
+    const approvedReuse = await import('../../src/tools/artifacts.ts');
+    const saveTool = approvedReuse.artifactTools.find((tool) => tool.name === 'artifact_save')!;
+    const result = await saveTool.run({ name: 'report.md', content: '内容一致\n' }, {
+      host: harness.runtime, worker: owner, task,
+      workDir: harness.config.workDir, materialsDir: harness.config.materialsDir,
+      readRoot: harness.config.readRoot, signal: null,
+    });
+    assert.match(result.content, /没有创建新版本，也未改变该版本的审查状态/);
+    assert.match(result.content, /有效 approved/);
+    const { renderArtifactTable, collectArtifactLines } = await import('../../src/runtime/context.ts');
+    const table = renderArtifactTable({ task, lines: collectArtifactLines(task, harness.store.listArtifacts(task.id), harness.store.listReviews(task.id)) });
+    assert.match(table, /approved（要求版本 0）/);
+
+    const { artifactTools } = await import('../../src/tools/artifacts.ts');
+    const importTool = artifactTools.find((tool) => tool.name === 'artifact_import')!;
+    const sourcePath = join(harness.config.workDir, task.id, 'report-source.md');
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(sourcePath, '内容一致\n', 'utf8');
+    const importedReuse = await importTool.run({ source: 'report-source.md', name: 'report.md' }, {
+      host: harness.runtime, worker: owner, task,
+      workDir: harness.config.workDir, materialsDir: harness.config.materialsDir,
+      readRoot: harness.config.readRoot, signal: null,
+    });
+    assert.match(importedReuse.content, /没有创建新版本，也未改变该版本的审查状态/);
+    assert.match(importedReuse.content, /有效 approved/);
+
+    // 新版本仍须对自己的指纹取得检查；旧版本的批准不放行。
     const changed = harness.runtime.saveArtifact(owner, 'report.md', '内容改了\n');
     assert.equal(changed.reused, false);
     assert.equal(changed.artifact.version, 2);
     assert.equal(harness.store.listArtifacts(task.id).length, 2, '旧版本保留');
 
-    // 复用不等于检查通过
     const submit = await harness.runtime.submitResult(owner, '交付', ['report.md']);
     assert.equal(submit.ok, false, '未检查的产物不能被复用绕过');
-    assert.equal(harness.store.listReviews(task.id).length, 0);
+    assert.equal(harness.store.listReviews(task.id).length, 1, 'v1 的批准记录仍保留');
   } finally {
     await harness.cleanup();
   }

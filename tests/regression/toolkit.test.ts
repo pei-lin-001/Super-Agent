@@ -368,6 +368,10 @@ test('产物：导入真实二进制文件，指纹一致且源文件改动不�
     await tool(artifactTools, 'artifact_import').run({ source: 'same.txt' }, fixture.context);
     const again = await tool(artifactTools, 'artifact_import').run({ source: 'same.txt' }, fixture.context);
     assert.match(text(again), /已复用/);
+    assert.match(text(again), /没有创建新版本，也未改变该版本的审查状态/);
+    assert.match(text(again), /否则复用本身不会产生通过结论/);
+    assert.match(tool(artifactTools, 'artifact_import').description, /包括文本报告/);
+    assert.match(tool(artifactTools, 'artifact_import').description, /fs_edit/);
   } finally {
     await fixture.harness.cleanup();
   }

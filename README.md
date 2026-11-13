@@ -205,8 +205,7 @@ Message: queued → delivered → consumed
 
 ### 产物收敛
 
-`artifact_save` 的内容与该名字最新版本完全一致时，直接复用该版本并告诉模型，不产生新版本。
-内容变化仍创建新版本，旧版本不删除。复用**不会**自动获得检查通过：要求检查时仍要针对该版本取得结论。
+`artifact_save` 或 `artifact_import` 的内容与该名字最新版本完全一致时，直接复用该版本并告诉模型，不产生新版本，也不改变该版本已有的审查状态。当前要求下有效的 `approved` 继续适用，具体状态以产物表为准；没有有效审查时，复用本身不会产生通过结论。内容变化仍创建新版本，旧版本不删除；新版本按任务的实际检查门槛处理。局部修改已有文件时，可先用 `fs_edit` 修改，再用 `artifact_import` 登记，无需重生成全文。
 
 ## 5. 等待与并发
 
@@ -298,7 +297,7 @@ Router：`create_task` `send_to_worker` `stop_task` `list_tasks` `read_task` `se
 | `fs_list` | 列目录 | 只读范围内 |
 | `fs_stat` | 文件类型、大小、mtime、sha256 | 只读范围内 |
 | `fs_glob` | 按 `**/*.py` 这类模式找文件 | 任务目录内，跳过 node_modules/.git |
-| `fs_search` | 按内容搜索，带行号与上下文 | 任务目录内 |
+| `fs_search` | 按内容搜索，带行号与实际覆盖回执 | 允许读取的任务/材料/仓库路径；目录搜索仅读支持的文本扩展名及不超过 2MB 的文件，回报实际观察到的跳过项；达到 80 条结果或 300 个已读文本文件时说明剩余范围未检查且数量未知。搜索 PDF 请先用 `doc_pdf` 提取文字 |
 | `fs_read` | 分段读取，尾部给下一次 offset | 单次上限 2MB |
 | `fs_view_image` | 看图片：把图片本身交给模型，能读到画面内容 | png/jpeg/gif/webp，单张 4MB |
 | `fs_write` | 创建或整体覆盖 | 任务目录内 |
@@ -341,7 +340,7 @@ Router：`create_task` `send_to_worker` `stop_task` `list_tasks` `read_task` `se
 |---|---|---|
 | `net_fetch` | 抓取已知 URL：状态码、最终 URL、内容类型、正文；HTML 提正文，二进制落盘 | 无 |
 | `net_search` | 联网搜索，返回标题/URL/摘要 | `SEARCH_API_KEY`（Tavily）或 `SEARCH_PROVIDER=ollama` 复用模型凭据 |
-| `doc_pdf` | PDF 按页提取文字；`save_to` 可落成任务目录里的 .txt 供反复检索 | 系统 `pdftotext` |
+| `doc_pdf` | 用 `pdftotext -layout` 按请求页码范围提取文字；`save_to` 保存该范围内的提取文本供反复检索，并回报范围和返回截断 | 系统 `pdftotext`；不渲染原版面、不执行 OCR |
 | `doc_notebook` | 读 .ipynb 的单元格与文本输出 | 无 |
 | `env_capabilities` | 报告当前可用能力（不输出密钥） | 无 |
 
@@ -357,7 +356,7 @@ Router：`create_task` `send_to_worker` `stop_task` `list_tasks` `read_task` `se
 | 工具 | 做什么 |
 |---|---|
 | `artifact_save` | 文本内容存为产物（原有用法定持） |
-| `artifact_import` | 把任务目录里的真实文件按字节登记为产物 |
+| `artifact_import` | 把任务目录中已有的文件（包括文本报告）按字节快照登记为产物；局部修改可用 `fs_edit` 后登记 |
 | `artifact_read` / `artifact_list` | 读文本版本、列清单 |
 
 `artifact_import` 登记的是**快照**：源文件之后再改，也不会改变已登记的版本；检查与交付绑定的始终是这个快照的指纹。

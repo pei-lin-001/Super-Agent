@@ -198,6 +198,7 @@ export function renderArtifactTable(input: {
   const maxItems = input.maxItems ?? 12;
   if (lines.length === 0) return '- （还没有保存任何产物）';
   const shown = lines.slice(0, maxItems);
+  const header = `检查门槛：${task.requireReview ? '必需；最终提交的每份产物须有当前要求版本下的 approved' : '可选；未通过或待回复的自愿检查不阻止提交'}`;
   const body = shown.map((line) => {
     const { artifact, review, approved } = line;
     let state: string;
@@ -212,5 +213,5 @@ export function renderArtifactTable(input: {
     rest > 0
       ? `另有 ${rest} 份产物未显示，用 artifact_list 查看；历史版本用 artifact_read 指定 version 读取。`
       : '历史版本用 artifact_read 指定 version 读取。';
-  return [...body, footer].join('\n');
+  return [header, ...body, footer].join('\n');
 }

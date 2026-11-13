@@ -264,7 +264,10 @@ export const fileTools: ToolDefinition[] = [
   },
   {
     name: 'fs_search',
-    description: '在任务目录与材料目录中按正则搜索文本，返回 文件:行号: 内容。',
+    description:
+      '在允许读取的任务、材料与仓库路径中按正则搜索文本，返回 文件:行号: 内容及实际覆盖摘要。' +
+      '目录搜索只读取支持的文本扩展名且不超过 2MB 的文件；会报告已观察到的跳过项和预算停止，未检查范围的数量未知。' +
+      '显式指定文件时可尝试读取无扩展名文件；PDF 请先用 doc_pdf 提取文本。',
     parameters: {
       type: 'object',
       properties: {
@@ -285,23 +288,44 @@ export const fileTools: ToolDefinition[] = [
       const start = resolveReadPath(context, logical);
       const results: string[] = [];
       let scanned = 0;
+      let skippedPdf = 0;
+      let skippedOtherExtension = 0;
+      let skippedCredential = 0;
+      let skippedOversize = 0;
+      let stoppedBy: 'result_limit' | 'file_limit' | null = null;
 
-      const scanFile = async (absolute: string, label: string): Promise<void> => {
+      const scanFile = async (absolute: string, label: string, explicit: boolean): Promise<void> => {
         const info = await stat(absolute);
-        if (!info.isFile() || info.size > MAX_READ_BYTES) return;
+        if (!info.isFile()) return;
+        if (explicit && absolute.toLowerCase().endsWith('.pdf')) {
+          skippedPdf += 1;
+          return;
+        }
+        if (info.size > MAX_READ_BYTES) {
+          skippedOversize += 1;
+          return;
+        }
         scanned += 1;
         const text = await readFile(absolute, 'utf8');
-        text.split('\n').forEach((line, index) => {
-          if (results.length < MAX_SEARCH_RESULTS && regexp.test(line)) {
+        for (const [index, line] of text.split('\n').entries()) {
+          if (regexp.test(line)) {
             results.push(`${label}:${index + 1}: ${line.trim().slice(0, 200)}`);
+            if (results.length >= MAX_SEARCH_RESULTS) {
+              stoppedBy = 'result_limit';
+              break;
+            }
           }
-        });
+        }
       };
       const walk = async (dir: string, label: string): Promise<void> => {
-        if (results.length >= MAX_SEARCH_RESULTS || scanned >= MAX_SEARCH_FILES) return;
+        if (stoppedBy) return;
         const entries = await readdir(dir, { withFileTypes: true });
         for (const entry of entries) {
-          if (results.length >= MAX_SEARCH_RESULTS || scanned >= MAX_SEARCH_FILES) return;
+          if (stoppedBy) return;
+          if (scanned >= MAX_SEARCH_FILES) {
+            stoppedBy = 'file_limit';
+            return;
+          }
           const absolute = resolve(dir, entry.name);
           const entryLabel = label === '.' ? entry.name : `${label}/${entry.name}`;
           if (entry.isDirectory()) {
@@ -309,10 +333,21 @@ export const fileTools: ToolDefinition[] = [
             continue;
           }
           if (!entry.isFile()) continue;
-          if (entry.name === '.env' || entry.name.startsWith('.env.')) continue;
+          if (entry.name === '.env' || entry.name.startsWith('.env.')) {
+            skippedCredential += 1;
+            continue;
+          }
           const ext = entry.name.slice(entry.name.lastIndexOf('.'));
-          if (!TEXT_EXTENSIONS.has(ext.toLowerCase())) continue;
-          await scanFile(absolute, entryLabel);
+          const normalizedExt = ext.toLowerCase();
+          if (normalizedExt === '.pdf') {
+            skippedPdf += 1;
+            continue;
+          }
+          if (!TEXT_EXTENSIONS.has(normalizedExt)) {
+            skippedOtherExtension += 1;
+            continue;
+          }
+          await scanFile(absolute, entryLabel, false);
         }
       };
 
@@ -323,11 +358,23 @@ export const fileTools: ToolDefinition[] = [
         throw new ToolError(`无法访问搜索路径 ${logical}：${(error as Error).message}`);
       }
       if (startInfo.isDirectory()) await walk(start, logical);
-      else if (startInfo.isFile()) await scanFile(start, logical);
+      else if (startInfo.isFile()) await scanFile(start, logical, true);
       else throw new ToolError(`搜索路径不是文件或目录：${logical}`);
-      const truncated = results.length >= MAX_SEARCH_RESULTS || scanned >= MAX_SEARCH_FILES;
+      const scope = [
+        `已读取文本文件 ${scanned} 个`,
+        ...(skippedCredential > 0 ? [`跳过受保护凭据文件 ${skippedCredential} 个`] : []),
+        ...(skippedPdf > 0 ? [`跳过 PDF ${skippedPdf} 个`] : []),
+        ...(skippedOtherExtension > 0 ? [`跳过其他非文本扩展名 ${skippedOtherExtension} 个`] : []),
+        ...(skippedOversize > 0 ? [`跳过超过 ${formatSize(MAX_READ_BYTES)} 的文件 ${skippedOversize} 个`] : []),
+        ...(stoppedBy === 'result_limit'
+          ? [`达到 ${MAX_SEARCH_RESULTS} 条结果上限，剩余范围未检查且数量未知`]
+          : stoppedBy === 'file_limit'
+            ? [`达到 ${MAX_SEARCH_FILES} 个已读取文本文件上限，剩余范围未检查且数量未知`]
+            : [startInfo.isDirectory() ? '已遍历起点下符合搜索规则的文件' : '已检查显式指定文件']),
+        '这是文本搜索，不包含被跳过的 PDF 内容',
+      ].join('；');
       const result = results.length > 0 ? results.join('\n') : `未找到匹配 ${patternText}`;
-      return ok(result + (truncated ? `\n…搜索达到 ${MAX_SEARCH_RESULTS} 条结果或 ${MAX_SEARCH_FILES} 个文件的上限，结果可能不完整` : ''));
+      return ok(`搜索范围：${scope}\n${result}`);
     },
   },
 ];

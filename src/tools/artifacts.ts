@@ -25,8 +25,8 @@ export const artifactTools: ToolDefinition[] = [
       const { artifact, reused } = context.host.saveArtifact(context.worker, name, raw);
       if (reused) {
         return ok(
-          `内容与当前最新版本完全相同，已复用 ${artifact.name} v${artifact.version}（id=${artifact.id}），没有创建新版本。` +
-            '复用不会自动获得检查通过；如果要求检查，仍需针对这个版本取得结论。',
+          `内容与当前最新版本完全相同，已复用 ${artifact.name} v${artifact.version}（id=${artifact.id}，sha256=${artifact.sha256.slice(0, 12)}…），没有创建新版本，也未改变该版本的审查状态。` +
+            '若产物表显示此版本在当前要求下已有有效 approved，该结论仍适用；否则复用本身不会产生通过结论。请以产物表中的实际状态为准。',
         );
       }
       return ok(
@@ -37,7 +37,7 @@ export const artifactTools: ToolDefinition[] = [
   {
     name: 'artifact_import',
     description:
-      '把任务目录里的真实文件登记为正式产物（按字节快照）。用于脚本生成的 CSV/JSON/代码/图片/PDF 等。' +
+      '把任务目录里已存在的文件登记为正式产物（按字节快照），包括文本报告及脚本生成的 CSV/JSON/代码/图片/PDF 等。局部修改可先用 fs_edit 修改原文件再登记，无需重生成全文。' +
       '登记后源文件再变化也不会改变已登记的版本；后续检查、提交都针对这个快照。',
     parameters: {
       type: 'object',
@@ -53,8 +53,8 @@ export const artifactTools: ToolDefinition[] = [
       const { artifact, reused } = context.host.importArtifact(context.worker, name, source);
       if (reused) {
         return ok(
-          `文件内容与当前最新版本完全相同，已复用 ${artifact.name} v${artifact.version}（id=${artifact.id}），没有创建新版本。` +
-            '复用不会自动获得检查通过。',
+          `文件内容与当前最新版本完全相同，已复用 ${artifact.name} v${artifact.version}（id=${artifact.id}，sha256=${artifact.sha256.slice(0, 12)}…），没有创建新版本，也未改变该版本的审查状态。` +
+            '若产物表显示此版本在当前要求下已有有效 approved，该结论仍适用；否则复用本身不会产生通过结论。请以产物表中的实际状态为准。',
         );
       }
       return ok(

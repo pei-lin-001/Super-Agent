@@ -269,12 +269,18 @@ test('doc_pdf 落盘：转换一次，之后用文件工具检索', async () => 
     const materials = join(dir, 'materials');
     mkdirSync(materials, { recursive: true });
     // 用系统自带 PDF 造一份：先生成文本再转 PDF 不可靠，改用 python 写最小 PDF。
+    const firstPageBody = Array.from({ length: 24 }, (_, index) =>
+      `BT /F1 10 Tf 20 ${180 - index * 7} Td (line ${index} unmix abundance detail detail detail detail detail) Tj ET`,
+    ).join('\n');
+    const secondPageBody = 'BT /F1 12 Tf 20 100 Td (second page marker) Tj ET';
     const pdf =
       '%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n' +
-      '2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n' +
-      '3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj\n' +
-      '4 0 obj<</Length 44>>stream\nBT /F1 12 Tf 20 100 Td (unmix abundance) Tj ET\nendstream endobj\n' +
+      '2 0 obj<</Type/Pages/Kids[3 0 R 6 0 R]/Count 2>>endobj\n' +
+      '3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 400 200]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj\n' +
+      `4 0 obj<</Length ${firstPageBody.length}>>stream\n${firstPageBody}\nendstream endobj\n` +
       '5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\n' +
+      '6 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 400 200]/Contents 7 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj\n' +
+      `7 0 obj<</Length ${secondPageBody.length}>>stream\n${secondPageBody}\nendstream endobj\n` +
       'trailer<</Root 1 0 R>>\n%%EOF\n';
     writeFileSync(join(materials, 'p.pdf'), pdf);
 
@@ -288,8 +294,27 @@ test('doc_pdf 落盘：转换一次，之后用文件工具检索', async () => 
     const outcome = await pdfTool.run({ path: 'materials/p.pdf', save_to: 'pdf/p.txt' }, ctx);
     assert.equal(outcome.type, 'ok');
     assert.match(outcome.content, /已存为 pdf\/p\.txt/, '要给回路径');
+    assert.match(outcome.content, /请求范围：未限定页码（整份 PDF）/);
+    assert.match(outcome.content, /不是原版面/);
+    assert.match(outcome.content, /不是 PDF 总页数/);
     assert.doesNotMatch(outcome.content, /unmix/, '落盘模式不把正文塞进上下文');
     assert.match(readFileSync(join(taskRoot, 'pdf', 'p.txt'), 'utf8'), /unmix|abundance/);
+
+    const page = await pdfTool.run({ path: 'materials/p.pdf', from_page: 1, save_to: 'pdf/pages.txt' }, ctx);
+    assert.match(page.content, /请求范围：第 1–1 页/);
+    assert.match(page.content, /这是 pdftotext 提取的文字/);
+    assert.match(readFileSync(join(taskRoot, 'pdf', 'pages.txt'), 'utf8'), /unmix|abundance/);
+
+    const secondPage = await pdfTool.run({ path: 'materials/p.pdf', from_page: 2, to_page: 2, save_to: 'pdf/page-2.txt' }, ctx);
+    assert.match(secondPage.content, /请求范围：第 2–2 页/);
+    assert.match(readFileSync(join(taskRoot, 'pdf', 'page-2.txt'), 'utf8'), /second page marker/);
+    assert.doesNotMatch(readFileSync(join(taskRoot, 'pdf', 'page-2.txt'), 'utf8'), /unmix/);
+
+    const bounded = await pdfTool.run({ path: 'materials/p.pdf', limit: 500 }, ctx);
+    assert.match(bounded.content, /达到 500 字符返回上限/);
+    assert.match(bounded.content, /返回范围：达到 500 字符返回上限/);
+    assert.match(bounded.content, /不是 PDF 总页数/);
+    assert.match(bounded.content, /请求范围：未限定页码（整份 PDF）/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
