@@ -39,6 +39,64 @@ test('Watchdog 首次巡检明确为初始快照，纯步数增长不进入 delt
   }
 });
 
+test('Watchdog 当前任务始终展示作业事实，作业变化继续进入 delta', async () => {
+  const harness = await createHarness({
+    worker: () => mockReply({ text: 'ok' }),
+    limits: { maxConcurrentRuns: 0 },
+  });
+  try {
+    const { task, owner } = harness.runtime.createTask({
+      title: '作业可见性',
+      goal: 'g',
+      ownerRole: '负责人',
+      ownerBrief: 'b',
+    });
+    const job = harness.runtime.startJob({
+      worker: owner,
+      taskId: task.id,
+      command: process.execPath,
+      args: ['-e', 'setTimeout(() => {}, 60_000)'],
+      cwd: harness.config.workDir,
+      stdin: null,
+      timeoutMs: 60_000,
+    });
+    const before = observe(harness.store, harness.config);
+    const beforeJob = before.tasks.find((item) => item.id === task.id)?.jobs.find((item) => item.id === job.id);
+    assert.ok(beforeJob);
+    assert.equal(beforeJob.status, 'running');
+    assert.equal(beforeJob.exitCode, null);
+
+    const state = createReviewState(before, null);
+    const unchanged = structuredClone(before);
+    unchanged.generatedAt = new Date(Date.parse(before.generatedAt) + 1000).toISOString();
+    const unchangedText = renderReviewContext(unchanged, state, []);
+    const unchangedDelta = unchangedText.split('## 当前非终态任务')[0]!;
+    const currentBlock = unchangedText.split('## 当前非终态任务')[1]!.split('## 终态任务')[0]!;
+    assert.match(unchangedDelta, /未检测到 task\/worker\/wait\/job\/artifact\/review 事实状态变化/);
+    assert.ok(
+      currentBlock.includes(`当前作业：${job.id}(${job.command}) running|exit=-`),
+      '作业没有发生事实变化时，当前任务块仍应保留它的身份和状态',
+    );
+
+    const changed = structuredClone(before);
+    changed.generatedAt = new Date(Date.parse(before.generatedAt) + 2000).toISOString();
+    const changedJob = changed.tasks.find((item) => item.id === task.id)!.jobs.find((item) => item.id === job.id)!;
+    changedJob.status = 'exited';
+    changedJob.exitCode = 0;
+    changedJob.endedAt = changed.generatedAt;
+    const changedText = renderReviewContext(changed, state, []);
+    const changedDelta = changedText.split('## 当前非终态任务')[0]!;
+    assert.ok(
+      changedDelta.includes(
+        `作业 ${job.id}：running|exit=-|${job.command} → exited|exit=0|${job.command}`,
+      ),
+      '作业状态和退出码变化仍应进入事实 delta',
+    );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test('Watchdog 依赖带作业状态和截止时间，终态任务遇未解决事件仍保留详情', async () => {
   const harness = await createHarness({
     worker: () => mockReply({ text: 'ok' }),

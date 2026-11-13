@@ -183,6 +183,10 @@ function renderTask(task: ObservedTask, issues: ReviewIssue[]): string[] {
   lines.push(
     `  产物：${artifacts}｜当前检查 approved ${task.approvedReviews}/pending ${task.pendingReviews}｜运行中作业 ${task.runningJobs}`,
   );
+  const jobs = task.jobs.length
+    ? task.jobs.map((job) => `${job.id}(${job.command}) ${job.status}|exit=${job.exitCode ?? '-'}`).join('；')
+    : '无';
+  lines.push(`  当前作业：${jobs}`);
   const referenced = issues.filter((issue) => issue.taskId === task.id);
   if (referenced.length) {
     lines.push(`  未解决事件引用：${referenced.map((issue) => `${issue.id}｜${issue.title}`).join('；')}`);
