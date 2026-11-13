@@ -258,7 +258,7 @@ test('多模型：模型目录不会把凭据写进提示词或调用记录', as
       windowSummary: '',
       modelCatalog: { models: runtime.models.list(), currentAlias: worker.model },
     });
-    assert.match(prompt, /可用模型/, '提示词里应有可用模型段');
+    assert.match(prompt, /Available models/, '提示词里应有可用模型段');
     assert.match(prompt, /strong/, '应列出可选择的别名');
     assert.ok(!prompt.includes('test-key'), '凭据不能进入提示词');
     assert.ok(!prompt.includes('apiKey'), '凭据字段名也不应出现');

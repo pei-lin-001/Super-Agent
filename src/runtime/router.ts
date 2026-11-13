@@ -555,7 +555,7 @@ export class Router {
     } else {
       messages.push({
         role: 'user',
-        content: `${stateBlock}\n\n# 触发本轮的原因\n以上是 Worker 的最新消息，请判断是否需要向用户汇报或采取动作。`,
+        content: `${stateBlock}\n\n# Trigger\nThese are the latest Worker messages. Decide whether to inform the user or take action.`,
       });
     }
 

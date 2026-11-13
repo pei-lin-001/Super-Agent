@@ -269,7 +269,7 @@ test('图片：当轮进 Router 上下文，下一轮不重发 base64', async ()
 
     const first = harness.routerModel.calls.at(-1)!;
     const userMessages = first.messages.filter((m) => m.role === 'user');
-    assert.match(userMessages.at(-1)?.content ?? '', /系统当前状态/);
+    assert.match(userMessages.at(-1)?.content ?? '', /Current system state/);
     const userTurn = userMessages.at(-2)!;
     assert.equal(userTurn.content, '这张图是什么');
     assert.deepEqual(userTurn.images, [png], '当轮要带上图');

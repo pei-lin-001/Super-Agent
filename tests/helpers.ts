@@ -205,7 +205,7 @@ export function allText(request: ChatRequest): string {
 
 // 身份与职责在「系统当前状态」块里（跟着最后那条 user 消息走），不在 system。
 export function roleOf(request: ChatRequest): string {
-  const match = allText(request).match(/- 职责：(.+)/);
+  const match = allText(request).match(/- Role: (.+)/);
   return match?.[1]?.trim() ?? '';
 }
 
@@ -216,7 +216,7 @@ export function workerIdOf(request: ChatRequest): string {
 
 /** 工作记录整理请求与普通任务请求分开应答。 */
 export function isNoteRequest(request: ChatRequest): boolean {
-  return systemText(request).includes('工作记录整理器');
+  return systemText(request).includes('Maintain a revisable working record');
 }
 
 /** 按职责分派剧本，每个职责独立计数。 */

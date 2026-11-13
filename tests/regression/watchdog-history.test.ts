@@ -244,7 +244,7 @@ test('历史选择：超出 token 预算时，最早的几轮被裁掉', async (
     await session.ask('最新问题');
 
     // 触发压缩时会先有一次摘要调用，跳过它，看真正的回答请求。
-    const answerCall = captured.find((call) => !(call.messages[0]?.content ?? '').includes('摘要器'))!;
+    const answerCall = captured.find((call) => !(call.messages[0]?.content ?? '').includes('Maintain a traceable note of the Super-Agent maintenance session'))!;
     const text = answerCall.messages.map((m) => m.content ?? '').join('\n');
     assert.match(text, /问题-14/, '最近的一组问答必须进入请求');
     assert.match(text, /回答-14/, '最近的一组回答必须进入请求');
@@ -296,7 +296,7 @@ test('历史选择：重启维护进程后仍然选最近的记录', async () =>
       health: () => ({ state: 'alive' as const, pid: 1, detail: 'test', heartbeatAgeMs: 10 }),
     });
     await session.ask('重启后提问');
-    const answerCall = captured.find((call) => !(call.messages[0]?.content ?? '').includes('摘要器'))!;
+    const answerCall = captured.find((call) => !(call.messages[0]?.content ?? '').includes('Maintain a traceable note of the Super-Agent maintenance session'))!;
     const text = answerCall.messages.map((m) => m.content ?? '').join('\n');
     assert.match(text, /重启问题-12/, '重启后仍要读到最近的问答');
     assert.doesNotMatch(text, /重启问题-1\b/, '重启后不应回退到最早的历史');

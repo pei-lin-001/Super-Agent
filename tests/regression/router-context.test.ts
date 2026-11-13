@@ -11,7 +11,7 @@ import { boundRouterHistory } from '../../src/runtime/router-context.ts';
 
 const TG_KEY = sessionKeyOf({ channel: 'telegram', accountId: 'bot_1', peerId: 'owner-1' });
 const isNoteCall = (request: ChatRequest): boolean =>
-  (request.messages[0]?.content ?? '').includes('对话摘要器');
+  (request.messages[0]?.content ?? '').includes('Maintain a traceable conversation note');
 
 test('Router 用量：按会话和话题隔离并计入缓存写入', async () => {
   const h = await createHarness({ worker: () => mockReply({ text: 'ok' }) });
@@ -51,7 +51,7 @@ test('Router：窗口内不压缩，超出才生成摘要', async () => {
     const last = calls.filter((request) => !isNoteCall(request)).at(-1)!;
     const system = allText(last);
     assert.match(system, /SUMMARY_MARK/, '摘要要注入 system，否则等于丢了旧对话');
-    assert.match(system, /更早对话的累计记录/);
+    assert.match(system, /Earlier conversation note/);
     const userTurns = last.messages.filter((message) => message.role === 'user');
     assert.ok(
       !userTurns.some((message) => (message.content ?? '').includes('第 0 轮')),
@@ -98,12 +98,12 @@ test('Router 请求：状态在历史后且不会写入持久对话', async () =
     const second = calls[1]!.messages;
     assert.equal(second[0]!.content, first[0]!.content);
     const historyIndex = second.findIndex((message) => message.content === '第一句话');
-    const stateIndex = second.findIndex((message) => (message.content ?? '').includes('系统当前状态'));
+    const stateIndex = second.findIndex((message) => (message.content ?? '').includes('Current system state'));
     assert.ok(historyIndex > 0 && stateIndex > historyIndex);
     assert.match(second[stateIndex]!.content ?? '', /状态变化标记/);
     const stored = harness.store.listRouterTurns(100, TG_KEY);
     assert.ok(stored.some((turn) => turn.content === '第一句话'));
-    assert.ok(stored.every((turn) => !(turn.content ?? '').includes('系统当前状态')));
+    assert.ok(stored.every((turn) => !(turn.content ?? '').includes('Current system state')));
   } finally {
     await harness.cleanup();
   }

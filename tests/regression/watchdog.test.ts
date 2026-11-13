@@ -325,7 +325,7 @@ test('在线生效：覆盖项真的进入 Worker 的 system prompt，回滚后�
     // 覆盖项属于「每轮都会变」的状态，在最后那条 user 消息里；system 只留稳定规则。
     const all = async (): Promise<string> => (await build(owner, task)).map((m) => m.content ?? '').join('\n');
     const before = await all();
-    assert.ok(!before.includes('维护者调整'), '默认没有覆盖');
+    assert.ok(!before.includes('Maintainer override'), '默认没有覆盖');
 
     harness.store.insertControlCommand({
       id: 'cc_apply', command: 'set_override',
@@ -334,7 +334,7 @@ test('在线生效：覆盖项真的进入 Worker 的 system prompt，回滚后�
     });
     harness.runtime.tick();
     const after = await all();
-    assert.match(after, /维护者调整（v1/, '新版本应进入实际请求');
+    assert.match(after, /Maintainer override \(v1/, '新版本应进入实际请求');
     assert.match(after, /必须修改项与可选建议/);
 
     harness.store.insertControlCommand({
@@ -344,7 +344,7 @@ test('在线生效：覆盖项真的进入 Worker 的 system prompt，回滚后�
     });
     harness.runtime.tick();
     const rolled = await all();
-    assert.match(rolled, /维护者调整（v1/);
+    assert.match(rolled, /Maintainer override \(v1/);
   } finally {
     await harness.cleanup();
   }

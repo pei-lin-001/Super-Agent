@@ -70,7 +70,7 @@ test('话题隔离：同一聊天里两个话题的历史互不可见', async ()
     // 话题二的 Router 请求里不能带上话题一的内容
     const lastPrompt = prompts[prompts.length - 1]!;
     assert.ok(!lastPrompt.includes('话题一说的秘密'), '话题二不能看到话题一的历史');
-    // 本轮消息现在与「系统当前状态」拼在同一条 user 里，所以它必然出现；
+    // 本轮消息现在与「Current system state」拼在同一条 user 里，所以它必然出现；
     // 要验证的是「历史里没有重复一份」——只出现一次才对。
     const occurrences = lastPrompt.split('这是话题二说的话').length - 1;
     assert.equal(occurrences, 1, '历史里不该重复当前这条');
@@ -91,7 +91,7 @@ test('话题隔离：任务归属原话题，别的话题里看不到也改不�
       if (last) toolResults.push(last.content ?? '');
       const userMessages = context.request.messages.filter((message) => message.role === 'user');
       const state = userMessages.at(-1)?.content ?? '';
-      assert.match(state, /系统当前状态/, '动态状态必须作为独立尾部消息');
+      assert.match(state, /Current system state/, '动态状态必须作为独立尾部消息');
       const userTurn = userMessages.at(-2)?.content ?? '';
       // 「停掉」这轮真的去调用工具：授权必须由代码拒绝，而不是靠模型自觉
       if (userTurn.includes('停掉') && target !== null) {

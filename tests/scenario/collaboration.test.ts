@@ -188,7 +188,7 @@ test('协作：自主创建协作者、直接沟通、检查引发修改、旧�
     const index = bStep++;
     if (index === 0) {
       // 协作者列表在「系统当前状态」块里，跟着最后那条 user 消息走。
-      assert.match(allText(request), /同组协作者/);
+      assert.match(allText(request), /Collaborators/);
       return mockReply({ toolCalls: [{ name: 'fs_read', arguments: { path: 'materials/a.md' } }] });
     }
     if (index >= 2) return mockReply({ text: '核对已完成并回复负责人。' });

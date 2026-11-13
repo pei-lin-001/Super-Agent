@@ -86,7 +86,7 @@ async function withHarness<T>(
       const alreadyCreated = request.messages.some(
         (message) => message.role === 'tool' && (message.content ?? '').includes('已创建任务'),
       );
-      if (!state.includes('系统当前状态') || userText !== '建个任务' || alreadyCreated) {
+      if (!state.includes('Current system state') || userText !== '建个任务' || alreadyCreated) {
         // 非法别名的失败也要能被观察到，所以这里不吞结果，只按普通回复收尾。
         return mockReply({ text: '收到。' });
       }

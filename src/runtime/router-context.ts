@@ -85,27 +85,18 @@ export function buildRouterNotePrompt(input: {
   return [
     {
       role: 'system',
-      content:
-        '你是 Super-Agent 的对话摘要器，为一个聊天话题维护累计记录。' +
-        '你的输出会成为 Router 后续唯一可见的旧对话记忆，必须准确、可追溯，不能编造，也不要继续对话。',
+      content: 'Maintain a traceable conversation note for the Super-Agent Router. It will replace older visible dialogue; do not invent facts or continue the conversation.',
     },
     {
       role: 'user',
-      content: `# 上一份记录
-${input.previous ?? '（这是第一次整理，之前没有记录）'}
+      content: `# Previous note
+${input.previous ?? '(first note)'}
 
-# 本次需要并入的对话
+# New conversation
 ${body}
 
-# 输出要求
-1. 输出一份累计记录：保留上一份里仍然有效的内容，再并入这次的新内容。
-2. 只记事实：用户说明过的背景与偏好、明确做出的决定、约定好的下一步、尚未解决的问题、需要提醒的编号或路径。
-3. 不要写客套话、不要复述寒暄、不要写"用户询问了 X"这种流水账；直接写结论和状态。
-4. 冲突的旧内容写成「已失效：<原因>」。
-5. 不确定的写「未确认」，不要猜测补齐。
-6. 全文不超过 ${input.maxChars} 字符。只输出记录正文，不要前言，不要代码块围栏。
-
-建议小节：## 用户背景与偏好 / ## 已确认的事实 / ## 已作出的决定 / ## 约定但未完成 / ## 待解决问题`,
+# Output
+Keep still-valid user goals, constraints, authorizations, decisions, relevant evidence and its scope, open questions, unfinished work and references. Update superseded material. Distinguish claims, observations, assumptions, recommendations, completed actions and proposals; preserve uncertainty and limitations rather than strengthening them. A limited search or extraction does not establish absence, and a proposed threshold is not a user requirement. Preserve whether a deliverable was actually produced and verified. Record uncertainty where details are unavailable. Output only the updated note, at most ${input.maxChars} characters.`,
     },
   ];
 }

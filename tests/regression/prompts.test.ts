@@ -56,105 +56,11 @@ test('检查提示词：用真实工具名，不出现缩写 send', () => {
   assert.doesNotMatch(text, /(?<![a-z_])send\(/, '不应用缩写 send 指代工具');
 });
 
-test('检查提示词：不规定核对次数，不训斥', () => {
-  const text = prompt();
-  assert.doesNotMatch(text, /核对一次即可/, '不规定固定核对次数');
-  assert.doesNotMatch(text, /这本身是失职|失职/, '不使用训斥式表达');
-  assert.doesNotMatch(text, /只能核对|最多核对|必须恰好/, '不写死核对次数');
-});
-
-test('检查提示词：保留正式结论的必备要素', () => {
-  const text = prompt();
-  assert.match(text, /outcome/, '必须保留 outcome');
-  assert.match(text, /approved/, '必须保留 approved');
-  assert.match(text, /changes_required/, '必须保留 changes_required');
-  assert.match(text, /inconclusive/, '必须保留 inconclusive');
-  assert.match(text, /reply_to/, '必须保留 reply_to');
-  assert.match(text, /版本/, '必须保留版本要求');
-});
-
-test('检查提示词：目标与证据导向，允许继续验证', () => {
-  const text = prompt();
-  assert.match(text, /证据/, '要围绕证据');
-  assert.match(text, /可以继续验证|继续验证/, '允许在需要时继续验证');
-});
-
-test('角色边界：通用提示词不写具体用户画像', () => {
-  const text = prompt();
-  // 允许出现「不预设用户身份」这类否定式说明，不允许出现对用户的具体刻画。
-  assert.doesNotMatch(text, /用户是[^，。；\n]{2,}/, '不描述用户是谁');
-  assert.doesNotMatch(text, /用户(?:的)?(?:服务器|电脑|机器)是/, '不描述用户的运行环境');
-  assert.doesNotMatch(text, /你服务的用户(?!在当前)/, '不预设服务对象的身份');
-  assert.match(text, /不预设用户身份/, '应当明确说明不预设身份');
-});
-
-test('多模型目录：配置说明不冒充实测能力，单模型不引导换模型', () => {
-  const models = [
-    { alias: 'default', model: 'flash', note: '日常执行', costHint: null },
-    { alias: 'pro', model: 'other', note: '规划与检查', costHint: '较高' },
-  ];
-  const multi = renderModelCatalog(models, 'default');
-  assert.match(multi, /不代表实测能力/);
-  assert.match(multi, /不绑定职责/);
-  assert.match(multi, /没有自动选型/);
-  assert.match(multi, /pro/);
-  const single = renderModelCatalog([models[0]!], 'default');
-  assert.doesNotMatch(single, /换用更强|没有自动选型/);
-});
-
-test('Router 保留用户约束与授权，不能增加方法性硬门槛', () => {
-  const text = routerSystemPrompt();
-  assert.match(text, /硬性要求|结果要求/);
-  assert.match(text, /授权/);
-  assert.doesNotMatch(text, /先形成方案与验收方法/);
-  assert.match(text, /completed/);
-});
-
-test('提示词与最新能力对齐：申请重启、不读凭据、指派模型', () => {
-  const system = workerSystemPrompt({
-    task: {
-      id: 't', groupId: 'g', title: 't', goal: 'g', brief: '', doneCriteria: '',
-      requireReview: false, reviewEpoch: 0, ownerWorkerId: 'w', status: 'active',
-      closeReason: null, createdAt: '', updatedAt: '', sourceChannel: null,
-      sourceAccountId: null, sourcePeerId: null, sourceSessionKey: null,
-      sourceConversationId: null, maintenance: 0, closedAt: null,
-    },
-    worker: {
-      id: 'w', groupId: 'g', role: '负责人', brief: 'b', status: 'running',
-      model: null, parentId: null, stepCount: 0, createdAt: '', updatedAt: '', lastError: null,
-    },
-    isOwner: true,
-    collaborators: [],
-    taskFacts: '',
-    artifactTable: '',
-    noteText: null,
-    noteStaleEpoch: null,
-    noteCoveredSeq: 0,
-    windowSummary: '',
-    modelCatalog: {
-      models: [
-        { alias: 'default', model: 'flash', note: '执行', costHint: null },
-        { alias: 'pro', model: 'gpt-6.1-sol', note: '规划', costHint: '较高' },
-      ],
-      currentAlias: 'default',
-    },
-    override: null,
-  });
-  // 新能力必须出现在提示词里，否则 Worker 不知道自己能申请重启
-  assert.match(system, /request_maintenance/);
-  assert.match(system, /调用前先 artifact_save/, '重启会中断执行，必须要求先落盘');
-  assert.match(system, /不要自己去 kill 进程/, '杀进程是维护者的活');
-  assert.match(system, /共享仓库/, '切分支会影响别人，这条踩过');
-  // 读文件的教训
-  assert.match(system, /之后每一轮都重发一次/, '要说清 shell 读文件为什么更贵');
-  assert.match(system, /\.env/, '凭据读不到要有解释，否则它会以为是工具坏了');
-});
-
-test('Router 提示词：支持用户指定已配置模型', () => {
-  const text = routerSystemPrompt();
-  assert.match(text, /create_task 的 model 参数/);
-  assert.match(text, /已配置/);
-  assert.match(text, /模型配置而不是角色/);
+test('角色提示保留检查、交付与维护契约', () => {
+  const owner = prompt();
+  for (const token of ['message_send', 'reply_to', 'approved', 'changes_required', 'inconclusive', 'submit_result', 'request_maintenance', 'artifact_save']) assert.ok(owner.includes(token), token);
+  assert.match(prompt({ isOwner: false }), /owner alone calls submit_result/i);
+  assert.match(routerSystemPrompt(), /create_task[\s\S]*require_review/);
 });
 
 test('成员视图展示协作决策所需事实，运行中仍显示有效等待', () => {
@@ -170,38 +76,51 @@ test('成员视图展示协作决策所需事实，运行中仍显示有效等�
     noteCoveredSeq: 0, windowSummary: '',
   } as Parameters<typeof workerStateBlock>[0];
   const state = workerStateBlock(input);
-  const peers = state.split('## 同组协作者')[1]!;
+  const peers = state.split('## Collaborators')[1]!;
   assert.match(peers, /peer.*调查.*running.*pro/);
   assert.match(peers, /核验证据/);
-  assert.match(peers, /有效等待.*reply.*msg_1/);
+  assert.match(peers, /Active wait.*reply.*msg_1/);
   assert.match(peers, /msg_2/);
   assert.doesNotMatch(peers, /- self｜/);
 });
 
-test('协作提示区分通知与正式答复，模型选择不固定角色', () => {
-  const text = prompt();
-  assert.match(text, /notice.*reply_to/);
-  assert.match(text, /notice 不带 outcome.*不代替唯一 reply/);
-  assert.match(text, /原等待仍有效/);
-  assert.doesNotMatch(text, /同职责已有成员时不要新建|create_worker 会被拒绝/);
-  assert.match(text, /模型不是固定|不把模型固定/);
-  assert.match(text, /不同答案会如何影响下一步/);
-  assert.doesNotMatch(text, /自己再跑一遍|可能先回滚/);
-  assert.match(WATCHDOG_SYSTEM, /命令及结果位置/);
-  assert.match(WATCHDOG_SYSTEM, /可以复用/);
-});
-
-test('工作记录保留明确要求，并允许淘汰已解决的决策状态', () => {
+test('工作记录带入要求和历史边界', () => {
   const input = {
-    task: { title: '任务', goal: '目标', doneCriteria: '逐项核验', reviewEpoch: 0 },
+    task: { title: '任务', goal: '目标', doneCriteria: '逐项核验', reviewEpoch: 2 },
     worker: { id: 'w', role: '执行者' },
-    decision: { previous: null, turns: [], fromSeq: 1, toSeq: 1 },
+    decision: { previous: { content: '旧记录' }, turns: [], fromSeq: 3, toSeq: 4 },
     limits: { noteMaxChars: 6000 },
   } as unknown as Parameters<typeof buildNotePrompt>[0];
-  const text = buildNotePrompt(input).map((message) => message.content).join('\n');
-  assert.match(text, /逐项核验/);
-  assert.match(text, /未完成部分/);
-  assert.match(text, /更新或淘汰/);
-  assert.match(text, /不得因摘要压缩而降低明确要求/);
-  assert.match(text, /执行结果未知/);
+  const messages = buildNotePrompt(input);
+  assert.equal(messages.length, 2);
+  assert.match(messages[1]!.content as string, /逐项核验/);
+  assert.match(messages[1]!.content as string, /旧记录/);
+  assert.match(messages[1]!.content as string, /turn#3–4/);
+});
+
+test('系统提示不随动态状态变化，负责人身份例外', () => {
+  const changed = prompt({
+    task: { id: 'different', title: '另一任务', reviewEpoch: 7 } as Parameters<typeof workerSystemPrompt>[0]['task'],
+    worker: { id: 'other', stepCount: 99 } as Parameters<typeof workerSystemPrompt>[0]['worker'],
+    collaborators: [{ id: 'peer', role: '执行', status: 'running', parentId: null }],
+    taskFacts: 'new facts', artifactTable: 'new artifact', noteText: 'new note', windowSummary: 'new history',
+  });
+  assert.equal(changed, prompt());
+  assert.notEqual(prompt({ isOwner: false }), prompt());
+});
+
+test('动态状态携带当前信息并隔离过期工作记录', () => {
+  const state = workerStateBlock({
+    task: { groupId: 'g', title: 'current-task', reviewEpoch: 7, brief: 'context' },
+    worker: { id: 'w', role: 'owner', brief: 'assignment', stepCount: 42 },
+    collaborators: [], isOwner: true, taskFacts: 'state-fact', artifactTable: 'artifact-version',
+    noteText: null, noteStaleEpoch: 3, noteCoveredSeq: 9, windowSummary: 'recent-history',
+    modelCatalog: { currentAlias: 'default', models: [
+      { alias: 'default', model: 'model-a', note: null, costHint: null },
+      { alias: 'pro', model: 'model-b', note: null, costHint: null },
+    ] },
+  } as unknown as Parameters<typeof workerStateBlock>[0]);
+  for (const value of ['current-task', '42', 'state-fact', 'artifact-version', 'recent-history', 'default', 'pro', 'model-a', 'model-b', '3', '7']) assert.ok(state.includes(value), value);
+  assert.match(state, /stale/i);
+  assert.doesNotMatch(state, /turn#1–9/);
 });

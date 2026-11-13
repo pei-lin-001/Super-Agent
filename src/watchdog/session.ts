@@ -384,19 +384,13 @@ export class WatchdogSession {
         messages: [
           {
             role: 'system',
-            content:
-              '你是 Super-Agent 维护会话的摘要器。输出会成为 Watchdog 后续唯一可见的旧对话记忆，' +
-              '必须准确、可追溯，不能编造，也不要继续对话。',
+            content: 'Maintain a traceable note of the Super-Agent maintenance session for future Watchdog context. Preserve evidence and uncertainty without inventing facts or continuing the conversation.',
           },
           {
             role: 'user',
-            content: `# 上一份记录\n${input.previous ?? '（这是第一次整理）'}\n\n` +
-              `# 本次需要并入的对话\n${input.turns.map((turn) => `[${turn.role === 'user' ? '维护者' : 'Watchdog'}] ${turn.content}`).join('\n\n')}\n\n` +
-              `# 输出要求\n1. 保留上一份里仍然有效的内容，并入这次的新内容。\n` +
-              '2. 只记事实：观察到的现象、采取的维护动作、动作结果、未解决事件、下次复查条件。\n' +
-              '3. 不写寒暄和流水账；冲突的旧内容写「已失效：<原因>」。\n' +
-              `4. 全文不超过 ${config.limits.routerNoteMaxChars} 字符。只输出正文。\n\n` +
-              '建议小节：## 已确认的事实 / ## 已采取的动作与结果 / ## 未解决事件 / ## 下次复查条件',
+            content: `# Previous note\n${input.previous ?? '(first note)'}\n\n` +
+              `# New conversation\n${input.turns.map((turn) => `[${turn.role === 'user' ? 'Maintainer' : 'Watchdog'}] ${turn.content}`).join('\n\n')}\n\n` +
+              `Maintain current observations, evidence and its scope, actions and results, unresolved issues and conditions for rechecking. Update superseded decisions and retain uncertainty. Output only the note, at most ${config.limits.routerNoteMaxChars} characters.`,
           },
         ],
         tools: [],

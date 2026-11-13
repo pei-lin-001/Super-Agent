@@ -464,13 +464,13 @@ test('提示词：长任务触发整理后，输入里包含工作记录、产�
     const whole = messages.map((message) => message.content ?? '').join('\n');
     const system = messages[0]!.content ?? '';
 
-    assert.match(whole, /任务状态（程序记录/, '任务状态来自程序');
-    assert.match(whole, /当前产物/, '产物表常驻');
-    assert.match(whole, /工作记录/, '整理结果进入输入');
+    assert.match(whole, /Task state \(program record/, '任务状态来自程序');
+    assert.match(whole, /Current artifacts/, '产物表常驻');
+    assert.match(whole, /Working record/, '整理结果进入输入');
     assert.match(whole, /5180/, '工作记录内容真的进了输入');
     assert.match(whole, /提交门槛/, '提交门槛来自任务事实，跟着状态走');
-    assert.doesNotMatch(system, /任务状态（程序记录/, '易变的状态不能留在 system，否则缓存失效');
-    assert.doesNotMatch(system, /当前产物/, '产物表每轮都变，同样不能留在 system');
+    assert.doesNotMatch(system, /Task state \(program record/, '易变的状态不能留在 system，否则缓存失效');
+    assert.doesNotMatch(system, /Current artifacts/, '产物表每轮都变，同样不能留在 system');
     const note = harness.store.latestSuccessfulNote(owner.id);
     assert.ok(note, '整理记录已落库');
     assert.equal(note!.taskId, task.id);
@@ -756,9 +756,9 @@ test('整理输入：截断可查回，结果按调用编号关联且路径不�
     assert.doesNotMatch(rendered, /不应泄露的正文/);
     const decision = { action: 'compact' as const, reason: '', fromSeq: 1, toSeq: 3, turns, chars: 0, coveredSeq: 0, previous: null };
     const input = buildNotePrompt({ task, worker: owner, decision, limits: harness.config.limits })[1]!.content ?? '';
-    assert.match(input, /不代表操作成功/);
-    assert.match(input, /不能据此推断/);
-    assert.match(input, /执行结果未知/);
+    assert.match(input, /not evidence of success/);
+    assert.match(input, /does not prove/);
+    assert.match(input, /unknown execution status/);
   } finally {
     await harness.cleanup();
   }
@@ -776,7 +776,7 @@ test('Worker 请求：变更状态时缓存前缀稳定，状态不进入持久�
     assert.deepEqual(after.slice(0, -1), before.slice(0, -1));
     assert.match(after.at(-1)!.content ?? '', /缓存产物.md/);
     assert.doesNotMatch(before.at(-1)!.content ?? '', /缓存产物.md/);
-    assert.ok(harness.store.listWorkerTurns(owner.id, 100).every((turn) => !(turn.content ?? '').includes('系统当前状态')));
+    assert.ok(harness.store.listWorkerTurns(owner.id, 100).every((turn) => !(turn.content ?? '').includes('Current system state')));
   } finally {
     await harness.cleanup();
   }

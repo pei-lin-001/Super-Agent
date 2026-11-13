@@ -207,8 +207,7 @@ export function buildNotePrompt(input: {
   const previousText = decision.previous
     ? decision.previous.content
     : '（这是第一次整理，之前没有工作记录）';
-  const system = `你是 Super-Agent 的工作记录整理器，为同一个 Worker 维护可更新的决策状态。
-你的输出帮助该 Worker 延续工作；原始历史、消息和产物仍可查回。记录必须准确、可追溯，不能编造。`;
+  const system = `Maintain a revisable working record for the same Super-Agent Worker. Preserve traceable evidence and uncertainty so work can continue; original history, messages and artifacts remain retrievable.`;
 
   const ops = collectFileOps(decision.turns);
   const opsBlock = [
@@ -218,27 +217,25 @@ export function buildNotePrompt(input: {
     .filter(Boolean)
     .join('\n');
 
-  const user = `# 任务（程序记录，不要改写）
-- 任务：${task.title}
-- 共同目标：${task.goal}
-- 完成条件：${task.doneCriteria || '（无明确条件）'}
-- 当前要求版本：${task.reviewEpoch}
-- Worker：${worker.id}（${worker.role}）
+  const user = `# Task (program record)
+- Title: ${task.title}
+- Goal: ${task.goal}
+- Completion criteria: ${task.doneCriteria || '(none specified)'}
+- Requirements version: ${task.reviewEpoch}
+- Worker: ${worker.id} (${worker.role})
 
-# 上一份工作记录
+# Previous record
 ${previousText}
 
-# 本次新增历史（turn#${decision.fromSeq} 至 turn#${decision.toSeq}，共 ${decision.turns.length} 条）
+# New history (turn#${decision.fromSeq}–${decision.toSeq}; ${decision.turns.length} entries)
 ${renderTurnsForNote(decision.turns)}
 
-# 操作路径线索（从工具调用提取，不代表操作成功）
-${opsBlock || '（本次没有提取到路径）'}
+# Paths extracted from calls (not evidence of success)
+${opsBlock || '(none)'}
 
-# 输出要求
-维护支持交付判断的当前状态：保留用户明确要求及未完成部分、已有结论与成立条件、关键证据及来源、影响正确性或用户决策的未知、必要依赖、执行状态和故障。区分可选探索与必须完成的工作；依据新证据更新或淘汰失效判断、已解决的未知和过时待办，不把探索建议变成用户要求。低优先级细节只留可查回的引用；不得因摘要压缩而降低明确要求。
-区分事实、推断与未知，不编造动机或推理。调用路径只是线索，结合对应结果判断操作是否成功；结果缺失写「执行结果未知（turn#N）」，程序明确标注的「未执行」保留原样。检查和提交状态以程序记录为准，不用工作记录代替。
-本次历史中标明截断的内容只是整理输入未展示的部分，不能据此推断原文没有相关信息或执行者没有读过；应保留 turn 编号供 Worker 按需查回原文。保留关键来源（turn#N、msg_xxx、art_xxx 或文件名）。
-全文不超过 ${limits.noteMaxChars} 字符，只输出记录正文。`;
+# Output
+Maintain the current decision state: explicit requirements and remaining work, conclusions and their conditions, key evidence with references and actual coverage, resolved and consequential remaining unknowns, dependencies, execution status and failures. Update or retire superseded judgments and stale tasks; distinguish optional exploration and proposed thresholds from user requirements. Preserve the force and scope of claims when compressing. Distinguish observed facts, inference and uncertainty; do not invent reasoning or upgrade a limited search into proof of absence.
+A call without a result has unknown execution status (cite turn#N); preserve an explicit "未执行" as not executed. Reviews and submissions are determined by program records. Truncated input does not prove the original lacked information or was unread; retain turn#N, msg IDs, artifact IDs or filenames for retrieval. Output only the record, at most ${limits.noteMaxChars} characters, in the language useful to the Worker.`;
 
   return [
     { role: 'system', content: system },
