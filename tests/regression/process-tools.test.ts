@@ -164,7 +164,7 @@ test('重启只接受本次新实例的新心跳，旧心跳不算成功', async
     await writeFile(logPath, 'awaiting exit');
     try { process.kill(pid, 'SIGKILL'); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
     const deadline = Date.now() + 8000;
-    while (!(await readFile(logPath, 'utf8')).includes('exit=')) {
+    while (!(await readFile(logPath, 'utf8')).includes(`exit=null pid=${pid}`)) {
       if (Date.now() > deadline) throw new Error(`子进程 ${pid} 的退出回调未完成`);
       await new Promise((resolve) => setTimeout(resolve, 20));
     }

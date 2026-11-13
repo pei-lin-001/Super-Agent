@@ -145,13 +145,12 @@ export function spawnMain(
     clearTimeout(runningLogTimer);
     // 启动失败保留诊断，不丢弃输出。
     try {
-      writeFileSync(logPath, `${clockStamp()} exit=${code}\n${output}`, 'utf8');
+      writeFileSync(logPath, `${clockStamp()} exit=${code} pid=${child.pid}\n${output}`, 'utf8');
     } catch {
       // 忽略写日志失败。
     }
   });
   child.unref();
-
 
   recordRestart(config, {
     attemptedAt: new Date().toISOString(),
