@@ -145,7 +145,7 @@ test('消息：错误接收者不能冒充回复他人的请求', async () => {
       body: '我来回复',
     });
     assert.equal(impostor.ok, false);
-    assert.match(impostor.reason ?? '', /只能回复发给自己的请求/);
+    assert.match(impostor.reason ?? '', /原请求的参与者/);
   } finally {
     await harness.cleanup();
   }

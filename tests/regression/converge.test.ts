@@ -105,7 +105,7 @@ test('负责人完成、协作者仍在等待时：任务终结后协作者收�
         .map((m) => m.content ?? '')
         .join('\n');
       // 用各自独有的 brief 区分：负责人先做完，协作者的请求一直挂着。
-      const isOwner = !raw.includes('会迟到');
+      const isOwner = raw.includes('- 职责：负责人角色');
       const reply = (name: string, args: Record<string, unknown>, id: string): string =>
         sseTools([{ id, name, args }]);
       if (isOwner) {

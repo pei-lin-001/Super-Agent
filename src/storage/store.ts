@@ -823,6 +823,18 @@ export class Store {
     }));
   }
 
+  hasReply(requestId: string): boolean {
+    return Boolean(this.get("SELECT id FROM message WHERE reply_to = ? AND kind = 'reply' LIMIT 1", requestId));
+  }
+
+  listRecentWorkerMessages(taskId: string, workerId: string, otherId: string, limit = 3): Message[] {
+    return this.all(
+      `SELECT * FROM message WHERE task_id = ? AND from_kind = 'worker' AND from_id = ?
+       AND to_kind = 'worker' AND to_id = ? AND kind IN ('reply','notice')
+       ORDER BY created_at DESC, rowid DESC LIMIT ?`, taskId, otherId, workerId, limit,
+    ).map(mapMessage);
+  }
+
   listGroupMessages(groupId: string, limit = 200): Message[] {
     return this.all(
       'SELECT * FROM message WHERE group_id = ? ORDER BY created_at ASC LIMIT ?',

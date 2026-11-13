@@ -394,7 +394,6 @@ note: null,
           role: input.ownerRole,
           brief: input.ownerBrief,
           modelAlias: input.model ?? this.config.defaultModelAlias,
-          skipRoleDedup: true,
         });
         this.store.setTaskOwner(taskId, owner.id);
         // 认领和建任务同一个事务：任务回滚了，附件不能被一个不存在的任务占着，
@@ -567,11 +566,6 @@ note: null,
     /** 模型别名；必须是目录里已配置的别名。 */
     modelAlias: string;
     /**
-     * 创建任务负责人时跳过同职责去重：负责人是任务的必需品，
-     * 不是「为同一件事再造一个人」。去重只针对协作者。
-     */
-    skipRoleDedup?: boolean;
-    /**
      * 初始化状态。
      *
      * 协作者建出来时还没有任何消息，用 idle 表示"在等第一份活"；
@@ -588,16 +582,6 @@ note: null,
       throw new Error(
         `本工作空间已有 ${members.length} 名成员，达到上限 ${this.config.limits.maxWorkersPerGroup}；` +
           '先归档不用的成员，或者派给已有成员',
-      );
-    }
-    // 休眠成员也算成员：同职责优先叫醒它，而不是再造一个。
-    const sameRole = input.skipRoleDedup
-      ? undefined
-      : members.find((worker) => worker.role.trim() === input.role.trim());
-    if (sameRole) {
-      throw new Error(
-        `本空间已有职责相同的成员 ${sameRole.id}（${sameRole.role}）；` +
-          '直接给它发消息，不要为同一件事再造一个人',
       );
     }
     const active = this.store.countActiveWorkers();
@@ -702,26 +686,24 @@ note: null,
     }
 
     let origin: Message | null = null;
-    if (input.kind === 'reply') {
+    if (input.kind === 'reply' || (input.kind === 'notice' && input.replyTo)) {
       if (!input.replyTo) return { ok: false, reason: 'reply 必须带 reply_to' };
       origin = this.store.getMessage(input.replyTo);
       if (!origin) return { ok: false, reason: `被回复的消息不存在：${input.replyTo}` };
-      if (origin.groupId !== from.groupId) return { ok: false, reason: '不能跨群组回复' };
+      if (origin.groupId !== from.groupId || origin.taskId !== task.id) return { ok: false, reason: '请求不属于当前任务' };
       if (origin.kind !== 'request') return { ok: false, reason: `只能回复 request，不能回复 ${origin.kind}` };
-      if (origin.toKind === 'worker' && origin.toId !== from.id) {
-        return { ok: false, reason: '只能回复发给自己的请求' };
+      if (origin.fromKind !== 'worker' || origin.toKind !== 'worker') return { ok: false, reason: '请求参与者无效' };
+      const isRecipient = origin.toId === from.id && origin.fromId === input.to;
+      const isSender = origin.fromId === from.id && origin.toId === input.to;
+      if (input.kind === 'reply' ? !isRecipient : !(isRecipient || isSender)) {
+        return { ok: false, reason: '只能在原请求的参与者之间关联消息' };
       }
-      if (origin.fromId === from.id) return { ok: false, reason: '不能回复自己发出的请求' };
-      const existing = this.store
-        .listGroupMessages(from.groupId, 500)
-        .some((message) => message.replyTo === origin!.id && message.kind === 'reply');
-      if (existing) return { ok: false, reason: '该请求已经有回复，请作为新请求继续讨论' };
-      const reviews = this.store.listReviewsByRequest(origin.id);
-      if (reviews.length > 0 && (outcome === null || outcome === 'pending')) {
-        return {
-          ok: false,
-          reason: '这是正式检查请求，回复必须给出 outcome：approved / changes_required / inconclusive',
-        };
+      if (input.kind === 'reply') {
+        if (this.store.hasReply(origin.id)) return { ok: false, reason: '该请求已经有回复，请作为新请求继续讨论' };
+        const reviews = this.store.listReviewsByRequest(origin.id);
+        if (reviews.length > 0 && outcome === null) {
+          return { ok: false, reason: '这是正式检查请求，回复必须给出 outcome：approved / changes_required / inconclusive' };
+        }
       }
     }
 
@@ -747,6 +729,7 @@ note: null,
     }
 
     const broadcast = input.to === 'group' || input.to === from.groupId;
+    if (input.kind === 'notice' && broadcast) return { ok: false, reason: 'notice 必须指定具体接收者' };
     let recipients: Worker[];
     if (broadcast) {
       if (task.ownerWorkerId !== from.id) return { ok: false, reason: '只有任务负责人可以向全组广播' };
@@ -795,6 +778,7 @@ note: null,
       this.store.tx(() => {
         this.store.insertMessage(message);
         this.store.setMessageStatus(message.id, 'delivered');
+        if (input.kind === 'reply' && origin && outcome) this.store.answerReview(origin.id, message.id, from.id, outcome);
         if (intent === 'review' && message.refs?.artifacts?.length) {
           const reviews = message.refs.artifacts.map((ref) => {
             const artifact = this.store.getArtifact(ref.artifactId);
@@ -824,9 +808,6 @@ note: null,
       this.onMessageDelivered(message);
     }
 
-    if (input.kind === 'reply' && origin && outcome) {
-      this.store.answerReview(origin.id, firstMessageId!, from.id, outcome);
-    }
     if (!broadcast && (input.kind === 'update' || input.kind === 'stop')) {
       this.store.appendEvent(task.id, from.id, `message.${input.kind}.direct`, input.body.slice(0, 120));
     }
@@ -918,9 +899,13 @@ note: null,
     if (!target || isTerminalWorker(target.status)) return;
 
     const waits = this.store.listActiveWaitsForWorker(target.id);
-    const matched = waits.find((wait) => this.matchWait(message, wait));
+    const matched = waits.find((wait) => wait.reason === 'reply' && this.matchWait(message, wait));
     if (matched) {
       this.store.resolveWait(matched.id);
+      this.enqueue(target.id);
+      return;
+    }
+    if (waits.some((wait) => this.noticeMatchesDependency(message, wait))) {
       this.enqueue(target.id);
       return;
     }
@@ -939,7 +924,14 @@ note: null,
     }
   }
 
+  private noticeMatchesDependency(message: Message, wait: { workerId: string; reason: string; matchFrom: string | null; matchReplyTo: string | null }): boolean {
+    if (message.kind !== 'notice' || message.fromKind !== 'worker' || wait.reason !== 'reply' || !wait.matchReplyTo || message.replyTo !== wait.matchReplyTo) return false;
+    const request = this.store.getMessage(wait.matchReplyTo);
+    return Boolean(request && request.kind === 'request' && request.fromId === wait.workerId && request.toKind === 'worker' && request.toId === message.fromId && (!wait.matchFrom || wait.matchFrom === message.fromId));
+  }
+
   private matchWait(message: Message, wait: { matchFrom: string | null; matchReplyTo: string | null; matchKinds: MessageKind[] | null }): boolean {
+    if (message.kind === 'notice' && (!wait.matchKinds?.includes('notice') || wait.matchKinds.includes('reply'))) return false;
     if (wait.matchFrom && message.fromId !== wait.matchFrom) return false;
     if (wait.matchReplyTo && message.replyTo !== wait.matchReplyTo) return false;
     if (wait.matchKinds && !wait.matchKinds.includes(message.kind)) return false;
@@ -949,13 +941,15 @@ note: null,
   registerWait(worker: Worker, options: WaitOptions): WaitResult {
     const inbox = this.store.listInbox(worker.id);
     const already = inbox.some((message) =>
-      this.matchWait(message, {
+      (options.reason ?? 'reply') === 'reply' && this.matchWait(message, {
         matchFrom: options.from ?? null,
         matchReplyTo: options.replyTo ?? null,
         matchKinds: options.kinds ?? null,
       }),
     );
-    if (already) return { immediate: true };
+    const request = options.replyTo ? this.store.getMessage(options.replyTo) : null;
+    const alreadyReplied = (options.reason ?? 'reply') === 'reply' && request?.kind === 'request' && request.fromId === worker.id && request.groupId === worker.groupId && (!options.from || options.from === request.toId) && (!options.kinds || options.kinds.includes('reply')) && this.store.hasReply(request.id);
+    if (already || alreadyReplied) return { immediate: true };
 
     this.store.clearWaitsForWorker(worker.id);
     const waitId = newWaitId();
@@ -1675,7 +1669,11 @@ note: null,
           this.runningCount -= 1;
           if (this.rerunRequested.delete(workerId)) {
             const current = this.store.getWorker(workerId);
-            if (current && !isTerminalWorker(current.status) && !this.queue.includes(workerId)) {
+            const waits = this.store.listActiveWaitsForWorker(workerId);
+            const pending = this.store.listInbox(workerId);
+            const hasPendingWake = pending.some((message) => waits.some((wait) =>
+              this.noticeMatchesDependency(message, wait) || (wait.reason === 'reply' && this.matchWait(message, wait))));
+            if (current && !isInactiveWorker(current.status) && (current.status === 'queued' || waits.length === 0 || hasPendingWake) && !this.queue.includes(workerId)) {
               this.queue.push(workerId);
             }
           }
@@ -1734,8 +1732,10 @@ note: null,
     // 收件箱先落入历史再标记已读：模型后续步骤仍能看到消息原文与编号。
     const inbox = this.store.listInbox(workerId);
     if (inbox.length > 0) {
-      this.recordInboxTurn(workerId, inbox);
-      for (const message of inbox) this.markConsumed(message.id);
+      this.store.tx(() => {
+        this.recordInboxTurn(workerId, inbox);
+        for (const message of inbox) this.markConsumed(message.id);
+      });
     }
 
     this.ensureOpeningTurn(workerId);
@@ -1793,8 +1793,10 @@ note: null,
       pullInbox: () => {
         const fresh = this.store.listInbox(workerId);
         if (fresh.length === 0) return [];
-        this.recordInboxTurn(workerId, fresh);
-        for (const message of fresh) this.markConsumed(message.id);
+        this.store.tx(() => {
+          this.recordInboxTurn(workerId, fresh);
+          for (const message of fresh) this.markConsumed(message.id);
+        });
         return [{ role: 'user' as const, content: this.renderInbox(fresh) }];
       },
       onTerminate: (rest, reason) => {
@@ -1875,6 +1877,9 @@ note: null,
     if (result.stop === 'wait') {
       this.store.setWorkerStatus(workerId, 'waiting');
       this.emit({ type: 'worker.status', workerId, status: 'waiting' });
+      const pending = this.store.listInbox(workerId);
+      const activeWaits = this.store.listActiveWaitsForWorker(workerId);
+      if (pending.some((message) => activeWaits.some((wait) => this.noticeMatchesDependency(message, wait)))) this.enqueue(workerId);
       this.checkGroupDeadlock(worker.groupId);
       return;
     }
@@ -2201,12 +2206,19 @@ note: null,
     await this.maybeRefreshNote(worker, task);
 
     const plan = this.planFor(worker);
-    const collaborators = this.store.listGroupWorkers(task.groupId).map((item) => ({
-      id: item.id,
-      role: item.role,
-      status: item.status,
-      parentId: item.parentId,
-    }));
+    const collaborators = this.store.listGroupWorkers(task.groupId).map((item) => {
+      const wait = this.store.listActiveWaitsForWorker(item.id)[0];
+      const recent = this.store.listRecentWorkerMessages(task.id, worker.id, item.id).map((message) => {
+        const refs = [...(message.refs?.files ?? []), ...(message.refs?.artifacts ?? []).map((ref) => ref.artifactId)];
+        return `[${message.id} ${message.createdAt} ${message.kind}] ${message.body.replace(/\s+/g, ' ').slice(0, 180)}${refs.length ? `｜引用 ${refs.slice(0, 4).join(', ')}` : ''}`;
+      });
+      return {
+        id: item.id, role: item.role, status: item.status, parentId: item.parentId,
+        brief: item.brief, model: item.model ?? this.config.defaultModelAlias,
+        wait: wait ? { reason: wait.reason, replyTo: wait.matchReplyTo, from: wait.matchFrom, jobId: wait.matchJob ?? null } : null,
+        recent,
+      };
+    });
     const isOwner = task.ownerWorkerId === worker.id;
     const artifacts = this.store.listArtifacts(task.id);
     const reviews = this.store.listReviews(task.id);
@@ -2587,23 +2599,36 @@ note: null,
   }
 
   private checkGroupDeadlock(groupId: string): void {
-    const workers = this.store.listGroupWorkers(groupId).filter((worker) => !isTerminalWorker(worker.status));
-    if (workers.length < 2) return;
-    const allWaiting = workers.every((worker) => {
+    const workers = this.store.listGroupWorkers(groupId).filter((worker) => !isInactiveWorker(worker.status));
+    const byId = new Map(workers.map((worker) => [worker.id, worker]));
+    const edges = new Map<string, { target: string; waitId: string; createdAt: string }>();
+    for (const worker of workers) {
+      if (worker.status !== 'waiting') continue;
       const waits = this.store.listActiveWaitsForWorker(worker.id);
-      return worker.status === 'waiting' && waits.length > 0;
-    });
-    if (!allWaiting) return;
-    const earliest = workers
-      .map((worker) => ({ worker, wait: this.store.listActiveWaitsForWorker(worker.id)[0] }))
-      .sort((a, b) => (a.wait!.createdAt < b.wait!.createdAt ? -1 : 1))[0];
-    if (!earliest?.wait) return;
-    this.store.resolveWait(earliest.wait.id);
-    this.pushSystemNotice(
-      earliest.worker.id,
-      '检测到同组 Worker 全部处于互相等待。请根据已有信息自行决策：完成当前部分、改为直接汇报，或明确说明还缺什么。',
-    );
-    this.enqueue(earliest.worker.id);
+      if (waits.length !== 1) continue;
+      const wait = waits[0]!;
+      if (wait.reason !== 'reply' || !wait.matchReplyTo || (wait.matchKinds && !wait.matchKinds.includes('reply'))) continue;
+      const request = this.store.getMessage(wait.matchReplyTo);
+      if (!request || request.kind !== 'request' || request.fromId !== worker.id || request.toKind !== 'worker' || request.groupId !== groupId || (wait.matchFrom && wait.matchFrom !== request.toId) || this.store.hasReply(request.id)) continue;
+      if (byId.has(request.toId)) edges.set(worker.id, { target: request.toId, waitId: wait.id, createdAt: wait.createdAt });
+    }
+    for (const start of edges.keys()) {
+      const path: string[] = [];
+      const positions = new Map<string, number>();
+      let current: string | undefined = start;
+      while (current && edges.has(current) && !positions.has(current)) {
+        positions.set(current, path.length);
+        path.push(current);
+        current = edges.get(current)?.target;
+      }
+      if (!current || !positions.has(current)) continue;
+      const cycle = path.slice(positions.get(current)!);
+      const first = cycle.map((id) => ({ id, ...edges.get(id)! })).sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0]!;
+      this.store.resolveWait(first.waitId);
+      this.pushSystemNotice(first.id, `检测到回复依赖形成闭环：${cycle.join(' → ')} → ${current}。请根据已有信息决定如何推进；其他等待没有自动解除。`);
+      this.enqueue(first.id);
+      return;
+    }
   }
 
   /**
@@ -2770,10 +2795,25 @@ note: null,
         this.enqueue(worker.id);
         continue;
       }
+      const pending = this.store.listInbox(worker.id);
+      const matching = pending.find((message) => waits.some((wait) => wait.reason === 'reply' && this.matchWait(message, wait)));
+      if (matching) {
+        const wait = waits.find((item) => item.reason === 'reply' && this.matchWait(matching, item));
+        if (wait) this.store.resolveWait(wait.id);
+        this.enqueue(worker.id);
+        requeued += 1;
+        continue;
+      }
+      if (pending.some((message) => waits.some((wait) => this.noticeMatchesDependency(message, wait)))) {
+        this.enqueue(worker.id);
+        requeued += 1;
+        continue;
+      }
       waiting += 1;
       // provider 等待由 tick 按 deadline 恢复，其余保持原状等外部事件。
     }
 
+    for (const groupId of new Set(this.store.listActiveWaits().map((wait) => wait.groupId))) this.checkGroupDeadlock(groupId);
     return { interrupted, requeued, waiting, recovered: interrupted + requeued };
   }
 }

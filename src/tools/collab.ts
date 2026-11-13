@@ -12,7 +12,7 @@ function ok(content: string): ToolOutcome {
   return { type: 'ok', content };
 }
 
-const WORKER_SENDABLE: MessageKind[] = ['request', 'reply', 'update', 'stop'];
+const WORKER_SENDABLE: MessageKind[] = ['request', 'reply', 'notice', 'update', 'stop'];
 
 export const collabTools: ToolDefinition[] = [
   {
@@ -45,18 +45,18 @@ export const collabTools: ToolDefinition[] = [
     description:
       '给同组 Worker 发消息。kind=request 用于求助/核对/检查；kind=reply 回复某条请求，必须带 reply_to；update/stop 仅任务负责人可用。'
       + '当 intent=review 时表示正式检查：必须给出 refs 里的产物，回复时用 outcome 给出 approved / changes_required / inconclusive 结论。'
-      + '每条请求只能回复一次；普通求助用 intent=help，不会产生检查记录。',
+      + 'notice 可点对点分享增量信息；reply_to 可选，关联时只能在原请求双方之间发送，不代替正式回复。每条请求只能正式回复一次。',
     parameters: {
       type: 'object',
       properties: {
         to: { type: 'string', description: '接收者 workerId' },
         kind: {
           type: 'string',
-          enum: ['request', 'reply', 'update', 'stop'],
+          enum: ['request', 'reply', 'notice', 'update', 'stop'],
           description: '消息用途',
         },
         body: { type: 'string', description: '消息正文' },
-        reply_to: { type: 'string', description: 'reply 时必填：被回复的消息 id' },
+        reply_to: { type: 'string', description: 'reply 必填；notice 可选，关联原请求 id' },
         intent: {
           type: 'string',
           enum: ['help', 'review'],
@@ -110,7 +110,7 @@ export const collabTools: ToolDefinition[] = [
   {
     name: 'wait_for',
     description:
-      '挂起等待指定回复。等待期间不消耗模型调用。若收件箱已有匹配消息则立即返回。',
+      '挂起等待消息。默认等待非 notice 消息；若只想等待 notice 事件，可在 kinds 指定 notice 而不包含 reply。等待 reply 时关联 notice 可临时唤醒，但不会解除回复等待。已有匹配消息则立即返回。',
     parameters: {
       type: 'object',
       properties: {
@@ -204,7 +204,7 @@ export const collabTools: ToolDefinition[] = [
     description:
       '叫醒本工作空间里休眠的成员，让它接手当前任务。' +
       '可按需查回既有记录，判断其是否适用于当前任务；旧任务结论不能直接沿用。' +
-      '只在"已有成员正适合这件事"时用；不要为同一职责再造一个人。',
+      '适合当前工作的已有成员可以复用；独立判断或不同工作可另建成员。',
     parameters: {
       type: 'object',
       properties: {
@@ -230,7 +230,7 @@ export const collabTools: ToolDefinition[] = [
     name: 'request_maintenance',
     description:
       '向 Watchdog 提维护申请。目前只有 kind=restart：你改的代码需要主系统重启才能生效时用。' +
-      'Watchdog 是独立进程，会自己核对 git 状态、跑测试，再决定做不做——你说的只是线索，不是结论。' +
+      'Watchdog 是独立进程，会核验当前版本、范围、命令与结果位置，按缺口和风险复查并决定做不做。' +
       '调用前必须先 artifact_save 落盘：重启会中断你，成果不能只存在上下文里。' +
       '只给可核对的东西：commit、改了哪些文件、跑过什么命令，不要写"已完成""测试通过"这类结论。',
     parameters: {

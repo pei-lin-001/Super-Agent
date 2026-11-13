@@ -87,7 +87,7 @@ test('工作空间：下一个任务可以复用成员，不必重建', async ()
   }
 });
 
-test('成员限制：任务完成后成员休眠，同职责不能重复创建', async () => {
+test('成员限制：任务完成后成员休眠，同职责可按需创建', async () => {
   const harness = await createHarness({ worker: () => mockReply({ text: 'ok' }) });
   try {
     const { task, owner } = harness.runtime.createTask({ ...brief, title: 't', goal: 'g' });
@@ -99,10 +99,9 @@ test('成员限制：任务完成后成员休眠，同职责不能重复创建',
     assert.equal(dormant.length, 1, '任务结束后成员应当休眠而不是消失');
     assert.equal(dormant[0]!.currentTaskId, null, '休眠时不该还挂着任务');
 
-    // 同职责再建一个：应当被拒
+    // 同职责可能有不同工作或独立判断，不应按名字拒绝
     const dup = harness.runtime.createCollaborator(owner, brief.ownerRole, '再做一遍');
-    assert.equal(dup.ok, false, '同职责不能重复创建');
-    assert.match(dup.reason ?? '', /职责相同/);
+    assert.equal(dup.ok, true, dup.reason);
 
     // 不同职责可以
     const other = harness.runtime.createCollaborator(owner, '独立检查', '核对产物');

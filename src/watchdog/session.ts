@@ -283,6 +283,8 @@ export class WatchdogSession {
     lines.push(`完成条件：${task.doneCriteria || '(未填写)'}`);
     for (const worker of store.listGroupWorkers(task.groupId)) {
       lines.push(`\n## Worker ${worker.id}（${worker.role}）${worker.status}｜${worker.stepCount} 步`);
+      const waits = store.listActiveWaitsForWorker(worker.id);
+      for (const wait of waits) lines.push(`  等待 ${wait.reason}${wait.matchReplyTo ? ` 请求:${wait.matchReplyTo}` : ''}${wait.matchFrom ? ` 来源:${wait.matchFrom}` : ''}${wait.matchJob ? ` 作业:${wait.matchJob}` : ''}`);
       const turns = store.listWorkerTurns(worker.id, limit);
       for (const turn of turns.slice(-limit)) {
         const calls = turn.toolCalls ? ` 调用:${(turn.toolCalls as { name: string }[]).map((call) => call.name).join(',')}` : '';
@@ -299,7 +301,10 @@ export class WatchdogSession {
     if (reviews.length > 0) {
       lines.push('## 检查');
       for (const review of reviews.slice(-5)) {
-        lines.push(`  ${review.artifactId ?? '-'} ${review.outcome} 版本 ${review.epoch}`);
+        const artifact = artifacts.find((item) => item.id === review.artifactId);
+        const latest = artifact && !artifacts.some((item) => item.name === artifact.name && item.version > artifact.version);
+        const current = latest && artifact.sha256 === review.artifactSha256 && review.epoch === task.reviewEpoch;
+        lines.push(`  ${review.artifactId ?? '-'} ${review.outcome} 要求版本 ${review.epoch}｜${current ? '当前产物及要求' : '历史/失效记录'}`);
       }
     }
     const jobs = store.listJobs(task.id).slice(-8);

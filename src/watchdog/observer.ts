@@ -17,7 +17,7 @@ export interface Observation {
     maintenance: number;
     reviewEpoch: number;
     requireReview: boolean;
-    workers: { id: string; role: string; status: string; steps: number; lastError: string | null }[];
+    workers: { id: string; role: string; status: string; steps: number; lastError: string | null; waits: string[] }[];
     artifacts: { name: string; version: number; bytes: number }[];
     pendingReviews: number;
     approvedReviews: number;
@@ -122,8 +122,14 @@ export function observe(store: Store, config: Config): Observation {
     }
     const failed = workers.filter((worker) => worker.status === 'failed');
     if (failed.length > 0) signals.push(`${failed.length} 个 Worker 失败`);
-    if (artifacts.length > 0 && reviews.every((review) => review.outcome !== 'approved')) {
-      signals.push('已有产物但没有任何 approved 检查');
+    const latest = [...artifacts.reduce((map, artifact) => {
+      const current = map.get(artifact.name);
+      if (!current || artifact.version > current.version) map.set(artifact.name, artifact);
+      return map;
+    }, new Map<string, typeof artifacts[number]>()).values()];
+    const currentReviews = reviews.filter((review) => latest.some((artifact) => artifact.id === review.artifactId && artifact.sha256 === review.artifactSha256) && review.epoch === task.reviewEpoch);
+    if (task.requireReview && latest.some((artifact) => !currentReviews.some((review) => review.artifactId === artifact.id && review.outcome === 'approved'))) {
+      signals.push('当前产物存在未获当前要求版本 approved 的版本（是否必须交付由负责人决定）');
     }
     const same = jobs.filter((job) => job.status === 'failed').length;
     if (same >= 3) signals.push(`${same} 个作业失败`);
@@ -141,10 +147,11 @@ export function observe(store: Store, config: Config): Observation {
         status: worker.status,
         steps: worker.stepCount,
         lastError: worker.lastError,
+        waits: store.listActiveWaitsForWorker(worker.id).map((wait) => `${wait.reason}${wait.matchReplyTo ? ` 请求:${wait.matchReplyTo}` : ''}${wait.matchFrom ? ` 来源:${wait.matchFrom}` : ''}${wait.matchJob ? ` 作业:${wait.matchJob}` : ''}`),
       })),
       artifacts: artifacts.map((artifact) => ({ name: artifact.name, version: artifact.version, bytes: artifact.bytes })),
-      pendingReviews: reviews.filter((review) => review.outcome === 'pending').length,
-      approvedReviews: reviews.filter((review) => review.outcome === 'approved').length,
+      pendingReviews: currentReviews.filter((review) => review.outcome === 'pending').length,
+      approvedReviews: currentReviews.filter((review) => review.outcome === 'approved').length,
       runningJobs: running.length,
       recentEvents: events.map((event) => `${event.type} ${event.detail ?? ''}`.trim()),
       stuckSignals: signals,
@@ -173,12 +180,12 @@ export function renderObservation(observation: Observation): string {
     lines.push(
       `Worker：` +
         task.workers
-          .map((worker) => `${worker.id}(${worker.role}) ${worker.status}/${worker.steps}步${worker.lastError ? ` 错误:${worker.lastError}` : ''}`)
+          .map((worker) => `${worker.id}(${worker.role}) ${worker.status}/${worker.steps}步${worker.waits.length ? ` 等待:${worker.waits.join(',')}` : ''}${worker.lastError ? ` 错误:${worker.lastError}` : ''}`)
           .join('；'),
     );
     lines.push(
       `产物：${task.artifacts.length === 0 ? '无' : task.artifacts.map((item) => `${item.name} v${item.version}`).join('、')}｜` +
-        `检查：approved ${task.approvedReviews} / pending ${task.pendingReviews}｜运行中作业 ${task.runningJobs}`,
+        `当前产物/要求版本检查：approved ${task.approvedReviews} / pending ${task.pendingReviews}｜运行中作业 ${task.runningJobs}`,
     );
     if (task.stuckSignals.length > 0) lines.push(`可疑信号：${task.stuckSignals.join('；')}`);
     if (task.recentEvents.length > 0) lines.push(`最近事件：${task.recentEvents.join(' | ')}`);

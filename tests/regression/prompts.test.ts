@@ -3,7 +3,9 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { renderModelCatalog, routerStateBlock, routerSystemPrompt, workerSystemPrompt } from '../../src/runtime/prompts.ts';
+import { renderModelCatalog, routerStateBlock, routerSystemPrompt, workerStateBlock, workerSystemPrompt } from '../../src/runtime/prompts.ts';
+import { buildNotePrompt } from '../../src/runtime/note.ts';
+import { WATCHDOG_SYSTEM } from '../../src/watchdog/prompts.ts';
 
 function prompt(overrides: Partial<Parameters<typeof workerSystemPrompt>[0]> = {}): string {
   return workerSystemPrompt({
@@ -153,4 +155,53 @@ test('Router 提示词：支持用户指定已配置模型', () => {
   assert.match(text, /create_task 的 model 参数/);
   assert.match(text, /已配置/);
   assert.match(text, /模型配置而不是角色/);
+});
+
+test('成员视图展示协作决策所需事实，运行中仍显示有效等待', () => {
+  const input = {
+    task: { groupId: 'g', title: '任务', reviewEpoch: 0, brief: '' },
+    worker: { id: 'self', role: '负责人', brief: '整体交付', stepCount: 1 },
+    collaborators: [
+      { id: 'self', role: '负责人', status: 'running', parentId: null },
+      { id: 'peer', role: '调查', status: 'running', parentId: 'self', brief: '核验证据', model: 'pro',
+        wait: { reason: 'reply', replyTo: 'msg_1', from: 'self', jobId: null }, recent: ['msg_2 发现冲突'] },
+    ],
+    isOwner: true, taskFacts: '', artifactTable: '', noteText: null, noteStaleEpoch: null,
+    noteCoveredSeq: 0, windowSummary: '',
+  } as Parameters<typeof workerStateBlock>[0];
+  const state = workerStateBlock(input);
+  const peers = state.split('## 同组协作者')[1]!;
+  assert.match(peers, /peer.*调查.*running.*pro/);
+  assert.match(peers, /核验证据/);
+  assert.match(peers, /有效等待.*reply.*msg_1/);
+  assert.match(peers, /msg_2/);
+  assert.doesNotMatch(peers, /- self｜/);
+});
+
+test('协作提示区分通知与正式答复，模型选择不固定角色', () => {
+  const text = prompt();
+  assert.match(text, /notice.*reply_to/);
+  assert.match(text, /notice 不带 outcome.*不代替唯一 reply/);
+  assert.match(text, /原等待仍有效/);
+  assert.doesNotMatch(text, /同职责已有成员时不要新建|create_worker 会被拒绝/);
+  assert.match(text, /模型不是固定|不把模型固定/);
+  assert.match(text, /不同答案会如何影响下一步/);
+  assert.doesNotMatch(text, /自己再跑一遍|可能先回滚/);
+  assert.match(WATCHDOG_SYSTEM, /命令及结果位置/);
+  assert.match(WATCHDOG_SYSTEM, /可以复用/);
+});
+
+test('工作记录保留明确要求，并允许淘汰已解决的决策状态', () => {
+  const input = {
+    task: { title: '任务', goal: '目标', doneCriteria: '逐项核验', reviewEpoch: 0 },
+    worker: { id: 'w', role: '执行者' },
+    decision: { previous: null, turns: [], fromSeq: 1, toSeq: 1 },
+    limits: { noteMaxChars: 6000 },
+  } as unknown as Parameters<typeof buildNotePrompt>[0];
+  const text = buildNotePrompt(input).map((message) => message.content).join('\n');
+  assert.match(text, /逐项核验/);
+  assert.match(text, /未完成部分/);
+  assert.match(text, /更新或淘汰/);
+  assert.match(text, /不得因摘要压缩而降低明确要求/);
+  assert.match(text, /执行结果未知/);
 });

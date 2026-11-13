@@ -6,6 +6,10 @@ export interface CollaboratorView {
   role: string;
   status: string;
   parentId: string | null;
+  brief?: string;
+  model?: string | null;
+  wait?: { reason: string | null; replyTo: string | null; from: string | null; jobId: string | null } | null;
+  recent?: string[];
 }
 
 export function renderCollaborators(workers: Worker[], selfId: string): string {
@@ -61,11 +65,20 @@ export function workerStateBlock(input: {
   override?: { content: string; version: number } | null;
 }): string {
   const { task, worker, collaborators, isOwner, taskFacts, artifactTable, noteText, noteStaleEpoch } = input;
+  const others = collaborators.filter((item) => item.id !== worker.id);
   const collabLines =
-    collaborators.length === 0
+    others.length === 0
       ? '（暂无其他协作者）'
-      : collaborators
-          .map((item) => `- ${item.id}｜${item.role}｜状态 ${item.status}${item.parentId ? `｜来源 ${item.parentId}` : ''}`)
+      : others
+          .map((item) => {
+            const brief = item.brief?.replace(/\s+/g, ' ').trim();
+            const work = brief && brief.length > 240 ? `${brief.slice(0, 240)}…` : brief;
+            const wait = item.wait;
+            const waiting = wait ? [wait.reason && `原因 ${wait.reason}`, wait.replyTo && `请求 ${wait.replyTo}`, wait.from && `来自 ${wait.from}`, wait.jobId && `作业 ${wait.jobId}`].filter(Boolean).join('，') || '详情未提供' : '';
+            return `- ${item.id}｜${item.role}｜状态 ${item.status}${item.model ? `｜模型 ${item.model}` : ''}${item.parentId ? `｜来源 ${item.parentId}` : ''}` +
+              `${work ? `\n  工作：${work}` : ''}${wait ? `\n  有效等待：${waiting}` : ''}` +
+              (item.recent?.length ? `\n  最近相关消息：${item.recent.join('；')}` : '');
+          })
           .join('\n');
   const noteBlock = noteText
     ? `# 你的工作记录（覆盖 turn#1–${input.noteCoveredSeq}，更早的原文已退出近期窗口）\n${noteText}\n`
@@ -140,11 +153,10 @@ export function workerSystemPrompt(input: {
 # 执行与协作
 - 围绕用户目标和实际完成条件行动，兼顾质量与成本，不降低明确要求。有依据时形成可检验的暂定结论或实现，随新证据修正；不必等穷尽所有材料才思考或求助；用户明确要求全文阅读或逐项核验时仍须完成。
 - 决定推荐或下一步行动时，把关键依据与其来源、适用条件和尚未验证的部分一起保留；若关键推断缺少依据，可缩小结论、补证或寻求独立判断。
-- 调查和验证应针对会影响结果的未知。新证据可能改变关键结论、正确性或重要风险时继续查；次要未知可通过缩小论断或说明适用范围处理，但未满足的明确要求不能说成完成。
-- 区分事实、推测和未验证部分。按协作能否提供新的证据、独立判断、反例或可独立执行的工作决定是否求助；考虑已有成员是否合适，并提供必要上下文，不假设他们记得所有历史。
-- 同职责已有成员时不要新建：create_worker 会被拒绝，改用 wake_worker 或直接 message_send。请求说明当前理解、未定问题、相关依据和结果如何影响后续，不把待判断的结论当事实要求对方背书。
+- 围绕已有依据判断是否足以交付，继续处理会影响正确性、用户决策或明确要求的未知及必要依赖；可选探索可缩小结论或说明限制，不把未满足的明确要求说成完成。
+- 区分事实、推测和未验证部分。根据协作能否提供新证据、独立判断、反例或可独立执行的工作判断是否求助；结合工作内容、模型与已有上下文，决定复用已有成员还是新建成员，受程序资源限制。需要帮助解决困难或冲突时，说明问题、相关假设和证据，以及不同答案会如何影响下一步；可按需选择已有或不同模型的成员，不把模型固定成规划或审批层。
 - 通过 message_send 直接与同组协作。请求用 kind=request，回复原请求者用 kind=reply 并带 reply_to；每个请求只能回复一次。只有负责人可以发 update/stop。
-- 普通求助用 intent=help；正式检查用 intent=review，指定具体检查者，并在 refs 中列出产物 id。若关键反例或阻塞能改变对方当前工作或解除阻塞，可另发 intent=help 的 request 说明只是反馈、无需额外调查；原检查请求的唯一 reply 留给正式结论。发送成功只代表投递，不代表完成。
+- 普通求助用 intent=help；正式检查用 intent=review，指定具体检查者，并在 refs 中列出产物 id。同组成员可点对点发送 kind=notice 提供进度或关键反馈；关联原 request 时只有该请求双方可互发，并用 reply_to 指向原 request。notice 不带 outcome，不代替唯一 reply 或正式检查结论。等待某请求答复的发送者收到接收者的关联 notice 时会被唤醒，原等待仍有效；其他 notice 在下次运行时可见。发送成功只代表投递，不代表完成。
 - 等待依赖结果时用 wait_for，并尽可能指定 reply_to 或 from；有独立工作可先推进。不要反复轮询或重复催问。
 # 上下文与证据
 - 读文件用 fs_read，不要用 shell 的 cat/sed/head/python 去读。fs_read 自带分段、截断与续读提示；shell 输出是无界的——读到什么就原样进上下文，而且之后每一轮都重发一次。
@@ -159,11 +171,11 @@ export function workerSystemPrompt(input: {
 - 你改的代码只在主系统重启后才生效。你跑在主系统进程里，自己杀进程等于把整台系统连同自己一起停掉；而且没人会把它拉起来。
 - 需要生效时用 request_maintenance(kind="restart", reason, refs)：
   - **调用前先 artifact_save**。重启会中断你，成果不能只存在上下文里。
-  - refs 只放可核对的东西：commit、改动文件、你跑过的命令。不要写「已完成」「测试通过」——维护者不信这句话，它会自己再跑一遍。
+  - refs 提供可核对的版本、改动范围、检查命令与结果位置；说明尚未验证的部分。
   - 提交后正常结束本轮，不要反复提交，也不要自己去 kill 进程。
-- 维护者是独立进程，会自己看 git 状态、跑检查、判断现在重启会不会把别人打断。它可能拒绝，也可能先回滚。你只管把改动做到可验证。
+- 维护者是独立进程，会核对现有证据是否对应当前版本和范围，按缺口与风险决定是否复查，并判断重启影响；它也可能拒绝申请。
 - 改代码前先确认工作区状态。这是共享仓库：切分支、reset、stash 都会影响正在跑的其他进程和别的任务，不是只有你一个人在用。
-- 不要在没跑过测试的情况下申请重启：维护者会跑，你被拒绝之后还得重来一轮。
+- 申请前做适合改动的验证；无法验证时说明原因和风险。
 
 # 检查与交付
 - 正式检查依据当前任务要求和引用的具体版本。回复必须带 outcome：approved（通过）、changes_required（必须修改）、inconclusive（证据不足以判断）；正文列出依据，将必须修改的问题与可选建议分开，不为尽快结束而放行。
