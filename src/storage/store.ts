@@ -29,6 +29,35 @@ import { SCHEMA_SQL } from './schema.ts';
 
 type Row = Record<string, unknown>;
 
+export interface TaskUsageBucket {
+  purpose: string;
+  calls: number;
+  ok: number;
+  failed: number;
+  running: number;
+  usageKnownCalls: number;
+  explicitZeroCalls: number;
+  usageUnknownCalls: number;
+  promptTokens: number;
+  cachedTokens: number;
+  cacheWriteTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+}
+
+export interface TaskUsageReport {
+  taskId: string;
+  taskTitle: string;
+  from: string;
+  to: string;
+  /** task_id 与当前任务直接相等的调用。 */
+  direct: TaskUsageBucket[];
+  /** 同一会话/话题时间窗内的 Router 调用；属于上下文级，不是 task_id 直接归属。 */
+  routerContext: TaskUsageBucket[];
+  /** 同一时间窗内 Watchdog 的全局调用；不能归到某个任务。 */
+  watchdogContext: TaskUsageBucket[];
+}
+
 /** node:sqlite 只接受 null，不接受 undefined。 */
 function bind(value: unknown): null | string | number | Uint8Array {
   if (value === undefined || value === null) return null;
@@ -1058,6 +1087,21 @@ export class Store {
       .reverse();
   }
 
+  /** 按 id 读取维护者完整结论；省略 id 时取最近一条 assistant 输出。 */
+  getWatchdogConclusion(id?: string | null): { id: string; content: string; createdAt: string } | null {
+    const row = id
+      ? this.get(
+          "SELECT id, content, created_at FROM wd_turn WHERE role = 'assistant' AND id = ? LIMIT 1",
+          id,
+        )
+      : this.get(
+          "SELECT id, content, created_at FROM wd_turn WHERE role = 'assistant' ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        );
+    return row
+      ? { id: str(row['id']), content: str(row['content']), createdAt: str(row['created_at']) }
+      : null;
+  }
+
   upsertWdIssue(input: {
     id: string;
     taskId: string | null;
@@ -1300,10 +1344,11 @@ export class Store {
    * 只给可核对的事实，不给维护者的推测——Router 分不清「事实」和「猜测」的话，
    * 会把猜测当结论转述给用户。
    */
-  maintainerStatus(): {
+  maintainerStatus(options: { lastSpawnedRestartAt?: string | null } = {}): {
     openIssues: { id: string; title: string; note: string | null; lastSeen: string }[];
     recentCommands: { command: string; status: string; result: string | null; createdAt: string }[];
     lastRestartAt: string | null;
+    lastRestartActionAt: string | null;
   } {
     const issues = this.all(
       `SELECT id, title, note, last_seen FROM wd_issue WHERE status = 'open' ORDER BY last_seen DESC LIMIT 5`,
@@ -1324,7 +1369,12 @@ export class Store {
     const restart = this.get(
       `SELECT created_at FROM wd_action WHERE action LIKE '%restart%' ORDER BY created_at DESC LIMIT 1`,
     );
-    return { openIssues: issues, recentCommands: commands, lastRestartAt: restart ? str(restart['created_at']) : null };
+    return {
+      openIssues: issues,
+      recentCommands: commands,
+      lastRestartAt: options.lastSpawnedRestartAt ?? null,
+      lastRestartActionAt: restart ? str(restart['created_at']) : null,
+    };
   }
 
   insertWdQuestion(id: string, question: string): void {
@@ -1509,7 +1559,7 @@ export class Store {
       input.workerId ?? null,
       input.sessionId ?? null,
       input.routerSessionKey ?? null,
-      input.purpose === 'router' && 'routerSessionKey' in input ? 1 : 0,
+      (input.purpose === 'router' || input.purpose === 'router-note') && 'routerSessionKey' in input ? 1 : 0,
       input.conversationId ?? null,
       input.model,
       input.modelAlias ?? null,
@@ -1709,6 +1759,106 @@ export class Store {
       failed: num(row['failed']),
       usageKnown: num(row['usageKnown']),
     }));
+  }
+
+  /**
+   * 按任务汇总模型账本。
+   *
+   * 这里故意使用无 LIMIT 的专用查询，不经过 listModelCalls 的展示上限。
+   * task_id 直接相等的 Worker/note 调用单独展示；Router 与 Watchdog 没有
+   * 可靠的任务直接归属关系，只能按时间和会话范围给出上下文参考。
+   */
+  taskUsage(taskId: string, at = nowIso()): TaskUsageReport | null {
+    const task = this.getTask(taskId);
+    if (!task) return null;
+    const to = task.closedAt ?? at;
+    const aggregate = (
+      rows: Record<string, unknown>[],
+    ): TaskUsageBucket[] => {
+      const buckets = new Map<string, TaskUsageBucket>();
+      for (const row of rows) {
+        const purpose = str(row['purpose']);
+        const bucket = buckets.get(purpose) ?? {
+          purpose,
+          calls: 0,
+          ok: 0,
+          failed: 0,
+          running: 0,
+          usageKnownCalls: 0,
+          explicitZeroCalls: 0,
+          usageUnknownCalls: 0,
+          promptTokens: 0,
+          cachedTokens: 0,
+          cacheWriteTokens: 0,
+          completionTokens: 0,
+          totalTokens: 0,
+        };
+        bucket.calls += 1;
+        const status = str(row['status']);
+        if (status === 'ok') bucket.ok += 1;
+        else if (status === 'running') bucket.running += 1;
+        else bucket.failed += 1;
+        if (num(row['usage_known']) === 1) {
+          const prompt = num(row['prompt_tokens'] ?? 0);
+          const cached = num(row['cached_tokens'] ?? 0);
+          const cacheWrite = num(row['cache_write_tokens'] ?? 0);
+          const completion = num(row['completion_tokens'] ?? 0);
+          bucket.usageKnownCalls += 1;
+          bucket.promptTokens += prompt;
+          bucket.cachedTokens += cached;
+          bucket.cacheWriteTokens += cacheWrite;
+          bucket.completionTokens += completion;
+          bucket.totalTokens += prompt + cached + cacheWrite + completion;
+          if (prompt + cached + cacheWrite + completion === 0) bucket.explicitZeroCalls += 1;
+        } else {
+          bucket.usageUnknownCalls += 1;
+        }
+        buckets.set(purpose, bucket);
+      }
+      return [...buckets.values()].sort((left, right) => left.purpose.localeCompare(right.purpose));
+    };
+
+    const directRows = this.all(
+      `SELECT purpose, status, usage_known, prompt_tokens, cached_tokens, cache_write_tokens, completion_tokens
+       FROM model_call WHERE task_id = ?`,
+      taskId,
+    );
+
+    let routerScope = 'router_session_key IS NULL AND conversation_id IS NULL';
+    const routerParams: (string | null)[] = [];
+    const sourceSessionKey = task.sourceSessionKey ?? null;
+    const sourceConversationId = task.sourceConversationId ?? null;
+    if (sourceSessionKey !== null) {
+      routerScope = 'router_session_key = ? AND conversation_id IS ?';
+      routerParams.push(sourceSessionKey);
+      routerParams.push(sourceConversationId);
+    }
+    const routerRows = this.all(
+      `SELECT purpose, status, usage_known, prompt_tokens, cached_tokens, cache_write_tokens, completion_tokens
+       FROM model_call
+       WHERE task_id IS NULL AND purpose IN ('router', 'router-note')
+         AND router_scope_known = 1 AND started_at >= ? AND started_at <= ?
+         AND ${routerScope}`,
+      task.createdAt,
+      to,
+      ...routerParams,
+    );
+    const watchdogRows = this.all(
+      `SELECT purpose, status, usage_known, prompt_tokens, cached_tokens, cache_write_tokens, completion_tokens
+       FROM model_call
+       WHERE task_id IS NULL AND purpose = 'watchdog' AND started_at >= ? AND started_at <= ?`,
+      task.createdAt,
+      to,
+    );
+    return {
+      taskId: task.id,
+      taskTitle: task.title,
+      from: task.createdAt,
+      to,
+      direct: aggregate(directRows),
+      routerContext: aggregate(routerRows),
+      watchdogContext: aggregate(watchdogRows),
+    };
   }
 
   saveRouterDecision(input: {
@@ -2287,6 +2437,26 @@ export class Store {
       'SELECT * FROM event WHERE task_id = ? ORDER BY created_at ASC LIMIT ?',
       taskId, limit,
     ).map((row) => ({
+      id: str(row['id']),
+      taskId: strOrNull(row['task_id']),
+      workerId: strOrNull(row['worker_id']),
+      type: str(row['type']),
+      detail: strOrNull(row['detail']),
+      createdAt: str(row['created_at']),
+    }));
+  }
+
+  /** 最近事件：先按 rowid 取尾部，再恢复为正序，避免 LIMIT 拿到最早 8 条。 */
+  listRecentEvents(taskId: string, limit = 12): EventRecord[] {
+    const rows = this.all(
+      `SELECT * FROM (
+         SELECT *, rowid AS rid FROM event WHERE task_id = ?
+         ORDER BY created_at DESC, rowid DESC LIMIT ?
+       ) ORDER BY created_at ASC, rid ASC`,
+      taskId,
+      limit,
+    );
+    return rows.map((row) => ({
       id: str(row['id']),
       taskId: strOrNull(row['task_id']),
       workerId: strOrNull(row['worker_id']),

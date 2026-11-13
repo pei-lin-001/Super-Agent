@@ -316,6 +316,11 @@ note: null,
     const taskId = newTaskId();
     const groupId = `grp_${taskId.slice(5)}`;
     const now = nowIso();
+    // 执行工具统一把任务目录当作默认 cwd。目录必须在首个 Worker 获准运行前存在，
+    // 否则模型会先撞到 ENOENT，再靠一次额外写入自行“修好”环境。
+    const taskRoot = resolve(this.config.workDir, taskId);
+    const taskRootExisted = existsSync(taskRoot);
+    if (!taskRootExisted) mkdirSync(taskRoot, { recursive: true });
     // 归属在创建时固化：一个空间可以被多个话题引用，但归属只属于建它的那个。
     // 传了 workspaceId 就复用它，否则用这次任务的 groupId 新建一个——迁移期两者同值。
     const workspaceId = input.workspaceId ?? groupId;
@@ -343,9 +348,15 @@ note: null,
     };
     // 聊天里发来的材料必须在建任务时就落到任务目录：Worker 的文件权限范围是
     // workDir/<taskId>，只给一个它读不到的缓存路径等于没给。
-    const staged = input.source
-      ? this.prepareSessionMaterials(taskId, input.source.sessionKey, input.source.conversationId ?? null)
-      : { files: [], inboundIds: [], cleanup: (): void => {} };
+    let staged: ReturnType<Runtime['prepareSessionMaterials']>;
+    try {
+      staged = input.source
+        ? this.prepareSessionMaterials(taskId, input.source.sessionKey, input.source.conversationId ?? null)
+        : { files: [], inboundIds: [], cleanup: (): void => {} };
+    } catch (error) {
+      if (!taskRootExisted) rmSync(taskRoot, { recursive: true, force: true });
+      throw error;
+    }
     const copiedInputs: { path: string; bytes: number; sha256: string }[] = [];
     try {
       for (const artifact of input.inputArtifacts ?? []) {
@@ -359,8 +370,13 @@ note: null,
         task.brief += `\n前次产物输入：inputs/${file.name}（来源任务 ${artifact.taskId}，产物 ${artifact.id}，v${artifact.version}，sha256 ${artifact.sha256}）；这是待核对的快照，不继承检查结论。`;
       }
     } catch (error) {
-      for (const file of copiedInputs) rmSync(resolve(this.config.workDir, file.path), { force: true });
-      staged.cleanup();
+      if (taskRootExisted) {
+        for (const file of copiedInputs) rmSync(resolve(this.config.workDir, file.path), { force: true });
+        staged.cleanup();
+      } else {
+        // taskId 是本次新生成的，整棵新目录都属于这次尚未提交的创建操作。
+        rmSync(taskRoot, { recursive: true, force: true });
+      }
       throw error;
     }
     if (staged.files.length > 0) {
@@ -403,9 +419,13 @@ note: null,
         options.onRecorded?.(task, owner);
       });
     } catch (error) {
-      // 事务失败则清掉本次复制出来的孤立副本，任务目录里不留半份材料。
-      staged.cleanup();
-      for (const file of copiedInputs) rmSync(resolve(this.config.workDir, file.path), { force: true });
+      // 事务失败则清掉本次新建的任务目录，不留下没有数据库记录的半成品。
+      if (taskRootExisted) {
+        staged.cleanup();
+        for (const file of copiedInputs) rmSync(resolve(this.config.workDir, file.path), { force: true });
+      } else {
+        rmSync(taskRoot, { recursive: true, force: true });
+      }
       throw error;
     }
     const created = this.store.getTask(taskId)!;

@@ -5,15 +5,27 @@ import type { ChatMessage, ModelClient, ToolSchema } from '../model/types.ts';
 import { RecordingModel } from '../model/recorder.ts';
 import type { Store } from '../storage/store.ts';
 import type { Config } from '../config.ts';
-import { observe, renderObservation } from './observer.ts';
-import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { observe } from './observer.ts';
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
+import { dirname, join } from 'node:path';
 import { assertInsideRoot, resolveInside } from '../tools/paths.ts';
 import { fileTools } from '../tools/files.ts';
 import { runWorkerTurn } from '../runtime/pi-worker.ts';
 import type { ToolContext, ToolDefinition, ToolOutcome } from '../tools/types.ts';
 import { planWindow } from '../runtime/window.ts';
 import { observationPrompt, WATCHDOG_SYSTEM } from './prompts.ts';
+import { createReviewState, renderReviewContext, type ReviewState } from './review-state.ts';
 
 /**
  * 单次调查的步数上限。原来是无限循环，「结束条件由模型给出」——但那意味着
@@ -53,6 +65,18 @@ const WD_TOOLS: ToolSchema[] = [
         limit: { type: 'number', description: '默认 20 条' },
       },
       required: ['worker_id'],
+    },
+  },
+  {
+    name: 'read_inspection',
+    description:
+      '读取维护者上轮或指定巡检的完整自然语言结论。当前观察摘要里丢失的条件和判断依据应从这里按 inspection_id 查回。',
+    parameters: {
+      type: 'object',
+      properties: {
+        inspection_id: { type: 'string', description: '巡检结论 id；省略表示最近一条维护者结论' },
+      },
+      required: [],
     },
   },
   {
@@ -214,6 +238,73 @@ export interface WatchdogResult {
   acted: boolean;
   summary: string;
   steps: number;
+}
+
+function reviewStatePath(config: Config): string {
+  return join(config.workDir, '.runtime', 'watchdog-review.json');
+}
+
+function loadReviewState(config: Config): { state: ReviewState | null; warning: string | null } {
+  const path = reviewStatePath(config);
+  if (!existsSync(path)) return { state: null, warning: null };
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as Partial<ReviewState>;
+    const tasks = parsed.baseline?.tasks;
+    const validTask = (value: unknown): boolean => {
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+      const task = value as Record<string, unknown>;
+      if (typeof task['title'] !== 'string' || typeof task['status'] !== 'string') return false;
+      return ['workers', 'jobs', 'artifacts', 'reviews', 'events'].every((key) => {
+        const record = task[key];
+        return record === undefined ||
+          (record !== null && typeof record === 'object' && !Array.isArray(record) &&
+            Object.values(record).every((item) => typeof item === 'string'));
+      });
+    };
+    if (
+      parsed.version !== 1 ||
+      !parsed.baseline ||
+      typeof parsed.baseline.generatedAt !== 'string' ||
+      typeof parsed.baseline.mainAlive !== 'boolean' ||
+      tasks === null ||
+      typeof tasks !== 'object' ||
+      Array.isArray(tasks) ||
+      !Object.values(tasks).every(validTask)
+    ) {
+      return { state: null, warning: '上轮巡检基线结构无效，本轮按初始快照处理' };
+    }
+    const conclusion = parsed.conclusion;
+    if (
+      conclusion !== undefined &&
+      conclusion !== null &&
+      (typeof conclusion !== 'object' ||
+        typeof conclusion.id !== 'string' ||
+        typeof conclusion.createdAt !== 'string' ||
+        typeof conclusion.excerpt !== 'string')
+    ) {
+      return { state: null, warning: '上轮巡检结论结构无效，本轮按初始快照处理' };
+    }
+    return { state: parsed as ReviewState, warning: null };
+  } catch (error) {
+    return { state: null, warning: `上轮巡检基线无法解析，本轮按初始快照处理：${(error as Error).message}` };
+  }
+}
+
+function saveReviewState(config: Config, state: ReviewState): void {
+  const path = reviewStatePath(config);
+  const temporary = `${path}.${process.pid}.tmp`;
+  mkdirSync(dirname(path), { recursive: true });
+  try {
+    writeFileSync(temporary, JSON.stringify(state, null, 2), 'utf8');
+    renameSync(temporary, path);
+  } catch (error) {
+    try {
+      rmSync(temporary, { force: true });
+    } catch {
+      // 清理临时文件失败不覆盖原始写盘错误。
+    }
+    throw error;
+  }
 }
 
 export class WatchdogSession {
@@ -533,6 +624,12 @@ export class WatchdogSession {
         })
         .join('\n---\n');
     }
+    if (name === 'read_inspection') {
+      const id = str('inspection_id').trim() || null;
+      const conclusion = store.getWatchdogConclusion(id);
+      if (!conclusion) return failed(id ? `找不到巡检结论 ${id}` : '还没有维护者结论');
+      return `# 巡检结论 ${conclusion.id}｜${beijingTime(conclusion.createdAt)}\n${conclusion.content}`;
+    }
     if (name === 'maintain') {
       const action = str('action');
       if (action === 'restart_main') {
@@ -610,7 +707,8 @@ export class WatchdogSession {
     const { store, config, model, modelName } = this.deps;
     const observation = observe(store, config);
     const health = this.deps.health?.();
-    const toolLog = store.listWdToolLog(12);
+    const openIssues = store.listOpenIssues();
+    const prior = loadReviewState(config);
     store.appendWdTurn({ id: `wdt_${randomBytes(4).toString('hex')}`, role: 'user', content: question });
 
     // 循环交给 pi 的 agent-loop（和 Worker 同一条路）：工具批处理、步数、截断作废都在内核里。
@@ -622,27 +720,16 @@ export class WatchdogSession {
       modelClient: new RecordingModel(model, store, 'watchdog', { sessionId: null }),
       systemPrompt: context.system,
       history: context.history,
-      prompts: [
-        ...(toolLog.length > 0
-          ? [
-              {
-                role: 'user' as const,
-                content:
-                  '# 上一次调查的工具记录（仅作背景，不是重新发起的调用）\n' +
-                  toolLog.map((entry) => `- ${entry.tool}：${entry.summary}`).join('\n'),
-              },
-            ]
-          : []),
-        {
-          role: 'user',
-          content:
-            `# 维护者提问\n${question}\n\n## 当前观察\n${renderObservation(observation)}\n\n` +
-            `## 主系统健康\n${health ? `${health.state}｜${health.detail}` : '未知'}\n\n` +
-            `## 未解决事件\n${store.listOpenIssues().map((issue) => `- ${issue.id}｜${issue.title}｜${issue.note ?? ''}`).join('\n') || '（无）'}\n\n` +
-            `先用工具核对证据再回答。说清楚哪些是已确认的事实、哪些还不确定。`,
-        },
-      ],
-      protectedMessageIndexes: [context.history.length + (toolLog.length > 0 ? 1 : 0)],
+      prompts: [{
+        role: 'user',
+        content:
+          `# 维护者提问\n${question}\n\n## 当前观察\n` +
+          `${renderReviewContext(observation, prior.state, openIssues, prior.warning)}\n\n` +
+          `## 主系统健康\n${health ? `${health.state}｜${health.detail}` : '未知'}\n\n` +
+          `## 未解决事件\n${openIssues.map((issue) => `- ${issue.id}｜${issue.title}｜${issue.note ?? ''}`).join('\n') || '（无）'}\n\n` +
+          `先用工具核对证据再回答。说清楚哪些是已确认的事实、哪些还不确定。`,
+      }],
+      protectedMessageIndexes: [context.history.length],
       onStep: (message) => { if (!message.content.some((block) => block.type === 'toolCall')) lastAssistant = message; },
       tools: WD_TOOLS,
       maxSteps: MAX_WATCHDOG_STEPS,
@@ -685,9 +772,9 @@ export class WatchdogSession {
     const { store, config, model, modelName } = this.deps;
     const observation = observe(store, config);
     const now = Date.now();
-    const toolLog = store.listWdToolLog(12);
-    const issues = store
-      .listOpenIssues()
+    const openIssues = store.listOpenIssues();
+    const prior = loadReviewState(config);
+    const issues = openIssues
       .map((issue) => {
         const due = issue.checkAfter ? Date.parse(issue.checkAfter) <= now : true;
         return (
@@ -696,13 +783,11 @@ export class WatchdogSession {
         );
       })
       .join('\n');
-    const actions = store
-      .listWdActions(6)
-      .map((action) => `- ${beijingTime(action.createdAt)} ${action.action}｜${action.reason}｜结果：${action.result}`)
-      .join('\n');
-
     let acted = false;
-    const context = await this.contextForTurn();
+    // 周期巡检不从旧问答历史开始：上轮结论有稳定 id，可按需读取全文；
+    // 当前变化、open issues 和未答 intercom 已由本轮提示明确给出。
+    // 人工 ask() 仍走 contextForTurn()，保留完整维护对话。
+    const context = { system: WATCHDOG_SYSTEM, history: [] as ChatMessage[] };
     const routerMessages = renderRouterMessages(store);
     const newMessages = store.listPendingIntercom('watchdog', 8);
     if (newMessages.length > 0) {
@@ -718,30 +803,18 @@ export class WatchdogSession {
       modelClient: new RecordingModel(model, store, 'watchdog', { sessionId: null }),
       systemPrompt: context.system,
       history: context.history,
-      prompts: [
-        ...(toolLog.length > 0
-          ? [
-              {
-                role: 'user' as const,
-                content:
-                  '# 上一次调查的工具记录（仅作背景，不是重新发起的调用）\n' +
-                  toolLog.map((entry) => `- ${entry.tool}：${entry.summary}`).join('\n'),
-              },
-            ]
-          : []),
-        {
-          role: 'user',
-          content: observationPrompt({
-            observation: renderObservation(observation),
-            issues,
-            lastActions: actions,
-            now: nowIso(),
-            intervalMinutes,
-            routerMessages,
-          }),
-        },
-      ],
-      protectedMessageIndexes: [context.history.length + (toolLog.length > 0 ? 1 : 0)],
+      prompts: [{
+        role: 'user',
+        content: observationPrompt({
+          observation: renderReviewContext(observation, prior.state, openIssues, prior.warning),
+          issues,
+          lastActions: '',
+          now: nowIso(),
+          intervalMinutes,
+          routerMessages,
+        }),
+      }],
+      protectedMessageIndexes: [context.history.length],
       onStep: (message) => { if (!message.content.some((block) => block.type === 'toolCall')) lastAssistant = message; },
       tools: WD_TOOLS,
       maxSteps: MAX_WATCHDOG_STEPS,
@@ -764,15 +837,27 @@ export class WatchdogSession {
     const answer = (result.assistantText ?? '').trim();
     const summary = answer !== '' ? answer : `本轮达到 ${result.steps} 步上限，已记录当前观察`;
     if (answer !== '') {
-      store.appendWdTurn({ id: `wdt_${randomBytes(4).toString('hex')}`, role: 'assistant', content: answer, ...(lastAssistant ? { piMessage: lastAssistant } : {}) });
+      const inspectionId = `wdt_${randomBytes(4).toString('hex')}`;
+      store.appendWdTurn({ id: inspectionId, role: 'assistant', content: answer, ...(lastAssistant ? { piMessage: lastAssistant } : {}) });
       store.appendWdAction({
         id: `wda_${randomBytes(4).toString('hex')}`,
         issueId: null,
         action: 'inspect',
         reason: '定时巡检',
         expected: '',
-        result: answer.slice(0, 400),
+        result: `完整结论 ${inspectionId}｜${answer.slice(0, 160)}`,
       });
+      saveReviewState(config, createReviewState(observation, store.getWatchdogConclusion(inspectionId)));
+    } else {
+      store.appendWdAction({
+        id: `wda_${randomBytes(4).toString('hex')}`,
+        issueId: null,
+        action: 'inspect_incomplete',
+        reason: '定时巡检',
+        expected: '',
+        result: `本轮达到 ${result.steps} 步上限，没有形成可定位结论`,
+      });
+      saveReviewState(config, createReviewState(observation, null));
     }
     return { acted, summary, steps: result.steps };
   }

@@ -5,7 +5,7 @@ import { existsSync, statSync } from 'node:fs';
 import { isAbsolute, relative, resolve } from 'node:path';
 import { readdirSync } from 'node:fs';
 import { ToolError } from './paths.ts';
-import { resolveReadPath, resolveWritePath } from './files.ts';
+import { describeReadSource, resolveReadPathInfo, resolveWritePath } from './files.ts';
 import {
   argOptionalNumber,
   argOptionalString,
@@ -99,7 +99,8 @@ export const editTools: ToolDefinition[] = [
       const pattern = argString(args, 'pattern');
       // 只在读文件时放开到仓库；写入仍然限制在任务目录（fs_write/fs_edit 没变）。
       const logical = argOptionalString(args, 'path') ?? '.';
-      const start = resolveReadPath(context, logical);
+      const resolved = resolveReadPathInfo(context, logical);
+      const start = resolved.absolute;
       if (!statSync(start).isDirectory()) throw new ToolError(`不是目录：${logical}`);
       const limit = Math.max(1, Math.min(MAX_GLOB_RESULTS, argOptionalNumber(args, 'limit') ?? 100));
       const files: string[] = [];
@@ -111,13 +112,14 @@ export const editTools: ToolDefinition[] = [
         .map((absolute) => ({ absolute, local: relative(start, absolute), path: prefix ? `${prefix}/${relative(start, absolute)}` : relative(start, absolute) }))
         .filter((item) => matcher.test(item.path) || matcher.test(item.local))
         .sort((a, b) => a.path.localeCompare(b.path));
-      if (matched.length === 0) return ok(`没有匹配 ${pattern} 的文件`);
+      const source = describeReadSource(context, logical, resolved);
+      if (matched.length === 0) return ok(`${source}\n没有匹配 ${pattern} 的文件`);
       const shown = matched.slice(0, limit).map((item) => {
         const info = statSync(item.absolute);
         return `${isAbsolute(logical) ? resolve(root, item.path) : item.path}（${info.size}B）`;
       });
       const suffix = matched.length > limit ? `\n…共 ${matched.length} 个，已显示 ${limit} 个` : '';
-      return ok(shown.join('\n') + suffix);
+      return ok(`${source}\n${shown.join('\n')}${suffix}`);
     },
   },
   {
@@ -130,10 +132,12 @@ export const editTools: ToolDefinition[] = [
     },
     async run(args, context) {
       const logical = argString(args, 'path');
-      const absolute = resolveReadPath(context, logical);
+      const resolved = resolveReadPathInfo(context, logical);
+      const absolute = resolved.absolute;
       if (!existsSync(absolute)) throw new ToolError(`路径不存在：${logical}`);
       const info = await stat(absolute);
       const lines = [
+        describeReadSource(context, logical, resolved),
         `${logical}`,
         `类型：${info.isDirectory() ? '目录' : '文件'}`,
         `大小：${info.size} 字节`,

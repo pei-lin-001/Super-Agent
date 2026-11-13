@@ -63,6 +63,7 @@ export function resolveWritePath(context: ToolContext, logical: string): string 
  * `materials/` 映射到只读材料目录；绝对路径必须在 readRoot 内；
  * 相对路径先看任务目录，没有就按仓库根解释——这样 Worker 像用 pi 一样
  * 直接读代码库，而不是被迫走 shell（shell 输出无界，会撑爆上下文窗口）。
+ * 返回值同时携带实际来源，回执必须告诉模型读的是哪一个根。
  */
 /**
  * 凭据文件一律不读。
@@ -83,27 +84,51 @@ function assertNotSecret(absolute: string): string {
   return absolute;
 }
 
-export function resolveReadPath(context: ToolContext, logicalPath: string): string {
+export type ReadPathSource = 'task' | 'materials' | 'readRoot' | 'absolute';
+
+export interface ResolvedReadPath {
+  absolute: string;
+  source: ReadPathSource;
+}
+
+export function resolveReadPathInfo(context: ToolContext, logicalPath: string): ResolvedReadPath {
   if (logicalPath === 'materials' || logicalPath.startsWith('materials/')) {
     const rest = logicalPath.slice('materials'.length).replace(/^\/+/, '');
     const absolute = assertNotSecret(resolveInside(context.materialsDir, rest));
     assertInsideRoot(context.materialsDir, absolute);
-    return absolute;
+    return { absolute, source: 'materials' };
   }
   const trimmed = logicalPath.trim();
   if (isAbsolute(trimmed)) {
     const absolute = assertNotSecret(resolve(trimmed));
     assertInsideRoot(context.readRoot, absolute);
-    return absolute;
+    return { absolute, source: 'absolute' };
   }
   const inTask = assertNotSecret(resolveInside(taskDir(context), trimmed));
   if (existsSync(inTask)) {
     assertInsideRoot(taskDir(context), inTask);
-    return inTask;
+    return { absolute: inTask, source: 'task' };
   }
   const absolute = assertNotSecret(resolveInside(context.readRoot, trimmed));
   assertInsideRoot(context.readRoot, absolute);
-  return absolute;
+  return { absolute, source: 'readRoot' };
+}
+
+/** 兼容只需要绝对路径的编辑与文档工具；读取类工具应使用 Info 版本标注来源。 */
+export function resolveReadPath(context: ToolContext, logicalPath: string): string {
+  return resolveReadPathInfo(context, logicalPath).absolute;
+}
+
+export function describeReadSource(context: ToolContext, logical: string, resolved: ResolvedReadPath): string {
+  const label =
+    resolved.source === 'task'
+      ? `任务目录（${context.task.id}）`
+      : resolved.source === 'materials'
+        ? `只读材料目录（${context.materialsDir}）`
+        : resolved.source === 'readRoot'
+          ? `仓库只读根（${context.readRoot}）`
+          : '显式绝对路径';
+  return `路径来源：${label}｜请求路径：${logical}｜实际路径：${resolved.absolute}`;
 }
 
 async function readTextFile(absolute: string): Promise<string> {
@@ -154,8 +179,8 @@ export const fileTools: ToolDefinition[] = [
     },
     async run(args, context) {
       const logical = argOptionalString(args, 'path') ?? '.';
-      const absolute = resolveReadPath(context, logical);
-      const entries = await readdir(absolute, { withFileTypes: true });
+      const resolved = resolveReadPathInfo(context, logical);
+      const entries = await readdir(resolved.absolute, { withFileTypes: true });
       const lines = entries
         .slice(0, MAX_LIST_ENTRIES)
         .map((entry) => {
@@ -163,7 +188,7 @@ export const fileTools: ToolDefinition[] = [
           return `${entry.name}${suffix}`;
         });
       if (entries.length > MAX_LIST_ENTRIES) lines.push(`…共 ${entries.length} 项，已截断`);
-      return ok(lines.length > 0 ? lines.join('\n') : '(空目录)');
+      return ok(`${describeReadSource(context, logical, resolved)}\n${lines.length > 0 ? lines.join('\n') : '(空目录)'}`);
     },
   },
   {
@@ -185,14 +210,15 @@ export const fileTools: ToolDefinition[] = [
         const logical = argString(args, 'path');
         const offset = Math.max(1, Math.trunc(argOptionalNumber(args, 'offset') ?? 1));
         const limit = Math.max(1, Math.min(DEFAULT_MAX_LINES, Math.trunc(argOptionalNumber(args, 'limit') ?? DEFAULT_MAX_LINES)));
-        const absolute = resolveReadPath(context, logical);
-        const text = await readTextFile(absolute);
+        const resolved = resolveReadPathInfo(context, logical);
+        const text = await readTextFile(resolved.absolute);
+        const sourceLine = describeReadSource(context, logical, resolved);
         const all = text.split('\n');
         if (text.endsWith('\n')) all.pop();
-        if (all.length === 0 || text === '') return ok('(空文件)');
+        if (all.length === 0 || text === '') return ok(`${sourceLine}\n(空文件)`);
         // 行号越界直接说清楚，不要返回空串让模型以为文件是空的。
         if (offset > all.length) {
-          return ok(`（文件共 ${all.length} 行，offset=${offset} 超出末尾）`);
+          return ok(`${sourceLine}\n（文件共 ${all.length} 行，offset=${offset} 超出末尾）`);
         }
         const selected = all.slice(offset - 1, offset - 1 + limit);
         const slice = selected.join('\n');
@@ -209,7 +235,7 @@ export const fileTools: ToolDefinition[] = [
         if (!clipped.firstLineExceedsLimit && lastLine < all.length && !clipped.truncated) {
           parts.push(`\n…（文件共 ${all.length} 行；继续请用 offset=${lastLine + 1}）`);
         }
-        return ok(parts.join(''));
+        return ok(`${sourceLine}\n${parts.join('')}`);
       },
   },
   {
@@ -228,13 +254,15 @@ export const fileTools: ToolDefinition[] = [
     },
     async run(args, context) {
       const logical = argString(args, 'path');
-      const absolute = resolveReadPath(context, logical);
-      const info = await stat(absolute).catch(() => null);
+      const resolved = resolveReadPathInfo(context, logical);
+      const info = await stat(resolved.absolute).catch(() => null);
       if (!info || !info.isFile()) throw new ToolError(`图片不存在：${logical}`);
-      const view = await readImageFile(absolute, info.size);
+      const view = await readImageFile(resolved.absolute, info.size);
       return {
         type: 'ok',
-        content: `已加载 ${logical}（${view.mimeType}，${formatSize(info.size)}）。画面内容见随附图片。`,
+        content:
+          `${describeReadSource(context, logical, resolved)}\n` +
+          `已加载 ${logical}（${view.mimeType}，${formatSize(info.size)}）。画面内容见随附图片。`,
         images: [{ mimeType: view.mimeType, data: view.data }],
       };
     },
@@ -285,7 +313,9 @@ export const fileTools: ToolDefinition[] = [
       } catch (error) {
         throw new Error(`正则无效：${(error as Error).message}`);
       }
-      const start = resolveReadPath(context, logical);
+      const resolvedStart = resolveReadPathInfo(context, logical);
+      const start = resolvedStart.absolute;
+      const source = describeReadSource(context, logical, resolvedStart);
       const results: string[] = [];
       let scanned = 0;
       let skippedPdf = 0;
@@ -372,6 +402,7 @@ export const fileTools: ToolDefinition[] = [
             ? [`达到 ${MAX_SEARCH_FILES} 个已读取文本文件上限，剩余范围未检查且数量未知`]
             : [startInfo.isDirectory() ? '已遍历起点下符合搜索规则的文件' : '已检查显式指定文件']),
         '这是文本搜索，不包含被跳过的 PDF 内容',
+        source,
       ].join('；');
       const result = results.length > 0 ? results.join('\n') : `未找到匹配 ${patternText}`;
       return ok(`搜索范围：${scope}\n${result}`);

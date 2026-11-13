@@ -14,16 +14,46 @@ export interface Observation {
     id: string;
     title: string;
     status: string;
+    updatedAt: string;
+    closedAt: string | null;
     maintenance: number;
     reviewEpoch: number;
     requireReview: boolean;
     ownerWorkerId: string | null;
-    workers: { id: string; role: string; status: string; steps: number; lastError: string | null; waits: string[] }[];
-    artifacts: { name: string; version: number; bytes: number }[];
+    workers: {
+      id: string;
+      role: string;
+      status: string;
+      steps: number;
+      lastError: string | null;
+      waits: string[];
+      waitDetails: {
+        id: string;
+        reason: string;
+        replyTo: string | null;
+        from: string | null;
+        jobId: string | null;
+        jobStatus: string | null;
+        jobExitCode: number | null;
+        deadlineAt: string;
+      }[];
+    }[];
+    artifacts: { id: string; name: string; version: number; bytes: number; sha256: string }[];
+    reviews: {
+      id: string;
+      name: string | null;
+      version: number;
+      sha256: string;
+      epoch: number;
+      outcome: string;
+      current: boolean;
+    }[];
+    jobs: { id: string; command: string; status: string; exitCode: number | null; endedAt: string | null }[];
     pendingReviews: number;
     approvedReviews: number;
     runningJobs: number;
     recentEvents: string[];
+    eventDetails: { id: string; type: string; detail: string | null; createdAt: string }[];
     stuckSignals: string[];
   }[];
 }
@@ -112,7 +142,7 @@ export function observe(store: Store, config: Config): Observation {
     const workers = store.listTaskWorkers(task.id);
     const artifacts = store.listArtifacts(task.id);
     const reviews = store.listReviews(task.id);
-    const events = store.listEvents(task.id, 8);
+    const events = store.listRecentEvents(task.id, 12);
     const jobs = store.listJobs(task.id);
     const running = jobs.filter((job) => job.status === 'running');
 
@@ -129,6 +159,11 @@ export function observe(store: Store, config: Config): Observation {
       return map;
     }, new Map<string, typeof artifacts[number]>()).values()];
     const currentReviews = reviews.filter((review) => latest.some((artifact) => artifact.id === review.artifactId && artifact.sha256 === review.artifactSha256) && review.epoch === task.reviewEpoch);
+    const recentEndedJobs = jobs.filter((job) => job.status !== 'running').slice(-8);
+    const trackedJobs = [
+      ...running,
+      ...recentEndedJobs.filter((job) => !running.some((active) => active.id === job.id)),
+    ];
     if (task.requireReview && latest.some((artifact) => !currentReviews.some((review) => review.artifactId === artifact.id && review.outcome === 'approved'))) {
       signals.push('当前产物存在未获当前要求版本 approved 的版本（是否必须交付由负责人决定）');
     }
@@ -139,6 +174,8 @@ export function observe(store: Store, config: Config): Observation {
       id: task.id,
       title: task.title,
       status: task.status,
+      updatedAt: task.updatedAt,
+      closedAt: task.closedAt,
       maintenance: Number(task.maintenance ?? 0),
       reviewEpoch: task.reviewEpoch,
       requireReview: task.requireReview,
@@ -150,12 +187,60 @@ export function observe(store: Store, config: Config): Observation {
         steps: worker.stepCount,
         lastError: worker.lastError,
         waits: store.listActiveWaitsForWorker(worker.id).map((wait) => `${wait.reason}${wait.matchReplyTo ? ` 请求:${wait.matchReplyTo}` : ''}${wait.matchFrom ? ` 来源:${wait.matchFrom}` : ''}${wait.matchJob ? ` 作业:${wait.matchJob}` : ''}`),
+        waitDetails: store.listActiveWaitsForWorker(worker.id).map((wait) => {
+          const job = wait.matchJob ? jobs.find((item) => item.id === wait.matchJob) ?? null : null;
+          return {
+            id: wait.id,
+            reason: wait.reason,
+            replyTo: wait.matchReplyTo,
+            from: wait.matchFrom,
+            jobId: wait.matchJob ?? null,
+            jobStatus: job?.status ?? null,
+            jobExitCode: job?.exitCode ?? null,
+            deadlineAt: wait.deadlineAt,
+          };
+        }),
       })),
-      artifacts: artifacts.map((artifact) => ({ name: artifact.name, version: artifact.version, bytes: artifact.bytes })),
+      artifacts: latest.map((artifact) => ({
+        id: artifact.id,
+        name: artifact.name,
+        version: artifact.version,
+        bytes: artifact.bytes,
+        sha256: artifact.sha256,
+      })),
+      reviews: currentReviews.map((review) => {
+        const artifact = artifacts.find((item) => item.id === review.artifactId) ?? null;
+        return {
+          id: review.id,
+          name: artifact?.name ?? null,
+          version: review.artifactVersion,
+          sha256: review.artifactSha256,
+          epoch: review.epoch,
+          outcome: review.outcome,
+          current:
+            artifact !== null &&
+            latest.some((item) => item.id === artifact.id) &&
+            review.artifactSha256 === artifact.sha256 &&
+            review.epoch === task.reviewEpoch,
+        };
+      }),
+      jobs: trackedJobs.map((job) => ({
+        id: job.id,
+        command: job.command,
+        status: job.status,
+        exitCode: job.exitCode,
+        endedAt: job.endedAt,
+      })),
       pendingReviews: currentReviews.filter((review) => review.outcome === 'pending').length,
       approvedReviews: currentReviews.filter((review) => review.outcome === 'approved').length,
       runningJobs: running.length,
       recentEvents: events.map((event) => `${event.type} ${event.detail ?? ''}`.trim()),
+      eventDetails: events.map((event) => ({
+        id: event.id,
+        type: event.type,
+        detail: event.detail,
+        createdAt: event.createdAt,
+      })),
       stuckSignals: signals,
     };
   });

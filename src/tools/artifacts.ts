@@ -1,8 +1,44 @@
-import { argOptionalNumber, argOptionalString, argString, type ToolDefinition, type ToolOutcome } from './types.ts';
+import {
+  argOptionalNumber,
+  argOptionalString,
+  argString,
+  type ToolDefinition,
+  type ToolHost,
+  type ToolOutcome,
+} from './types.ts';
 import { beijingTime } from '../domain/ids.ts';
+
+const DEFAULT_READ_CHARS = 8000;
+const MAX_READ_CHARS = 20_000;
 
 function ok(content: string): ToolOutcome {
   return { type: 'ok', content };
+}
+
+/**
+ * Worker 的 artifact_read 与 Router 的 read_artifact 共用这一实现。
+ *
+ * 产物查找、sha256 指纹校验和 UTF-8 检查都由 readArtifactVersion 完成；
+ * 这里只负责统一的字符分页和续读位置，避免两个入口出现不同的截断规则。
+ */
+export async function formatArtifactRead(
+  host: Pick<ToolHost, 'readArtifactVersion'>,
+  taskId: string,
+  name: string,
+  version?: number | null,
+  offset = 0,
+  limit = DEFAULT_READ_CHARS,
+): Promise<string> {
+  const start = Math.max(0, Math.trunc(offset));
+  const size = Math.max(1, Math.min(MAX_READ_CHARS, Math.trunc(limit)));
+  const { artifact, content } = await host.readArtifactVersion(taskId, name, version ?? null);
+  const slice = content.slice(start, start + size);
+  const end = start + slice.length;
+  const suffix =
+    end < content.length
+      ? `\n…（${artifact.name} v${artifact.version} 共 ${content.length} 字符，已读到 ${end}；继续请用 offset=${end}）`
+      : '';
+  return `# ${artifact.name} v${artifact.version}（${content.length} 字符）\n${slice}${suffix}`;
 }
 
 export const artifactTools: ToolDefinition[] = [
@@ -80,16 +116,9 @@ export const artifactTools: ToolDefinition[] = [
     async run(args, context) {
       const name = argString(args, 'name');
       const version = argOptionalNumber(args, 'version') ?? null;
-      const offset = Math.max(0, argOptionalNumber(args, 'offset') ?? 0);
-      const limit = Math.max(1, Math.min(20_000, argOptionalNumber(args, 'limit') ?? 8000));
-      const { artifact, content } = await context.host.readArtifactVersion(context.task.id, name, version);
-      const slice = content.slice(offset, offset + limit);
-      const end = offset + slice.length;
-      const suffix =
-        end < content.length
-          ? `\n…（${artifact.name} v${artifact.version} 共 ${content.length} 字符，已读到 ${end}；继续请用 offset=${end}）`
-          : '';
-      return ok(`# ${artifact.name} v${artifact.version}（${content.length} 字符）\n${slice}${suffix}`);
+      const offset = argOptionalNumber(args, 'offset') ?? 0;
+      const limit = argOptionalNumber(args, 'limit') ?? DEFAULT_READ_CHARS;
+      return ok(await formatArtifactRead(context.host, context.task.id, name, version, offset, limit));
     },
   },
   {

@@ -186,3 +186,33 @@ test('首次写入任务目录以及路径链接边界', async () => {
     assert.throws(() => assertInsideRoot(join(f.root, 'linked-task'), join(f.root, 'linked-task', 'escape-back', 'x')), /目录之外/);
   } finally { server.closeAllConnections(); await new Promise<void>((done) => server.close(() => done())); await f.close(); }
 });
+
+test('读取回执明确区分任务目录、materials、仓库根与绝对路径', async () => {
+  const f = await fixture();
+  try {
+    await writeFile(join(f.dir, 'inside.txt'), 'task needle');
+    await writeFile(join(f.root, 'repo.txt'), 'root needle');
+    await writeFile(join(f.materials, 'input.txt'), 'material');
+    const read = get(fileTools, 'fs_read');
+
+    assert.match((await read.run({ path: 'inside.txt' }, f.context)).content, /路径来源：任务目录（task）.*实际路径：.*task\/inside\.txt/s);
+    assert.match((await read.run({ path: 'repo.txt' }, f.context)).content, /路径来源：仓库只读根.*请求路径：repo\.txt.*实际路径：.*repo\.txt/s);
+    assert.match((await read.run({ path: 'materials/input.txt' }, f.context)).content, /路径来源：只读材料目录.*实际路径：.*materials\/input\.txt/s);
+    assert.match((await read.run({ path: join(f.root, 'repo.txt') }, f.context)).content, /路径来源：显式绝对路径.*实际路径：.*repo\.txt/s);
+
+    const search = await get(fileTools, 'fs_search').run({ pattern: 'needle' }, f.context);
+    assert.match(search.content, /路径来源：任务目录（task）/);
+    assert.match(search.content, /inside\.txt:1: task needle/);
+    assert.doesNotMatch(search.content, /repo\.txt/);
+    const rootSearch = await get(fileTools, 'fs_search').run({ pattern: 'needle', path: f.root }, f.context);
+    assert.match(rootSearch.content, /路径来源：显式绝对路径/);
+    assert.match(rootSearch.content, /repo\.txt:1: root needle/);
+
+    const glob = await get(editTools, 'fs_glob').run({ path: f.root, pattern: '*.txt' }, f.context);
+    assert.match(glob.content, /路径来源：显式绝对路径/);
+    assert.match(glob.content, /repo\.txt/);
+    const stat = await get(editTools, 'fs_stat').run({ path: 'repo.txt' }, f.context);
+    assert.match(stat.content, /路径来源：仓库只读根/);
+    assert.match(stat.content, /绝对路径：.*repo\.txt/);
+  } finally { await f.close(); }
+});

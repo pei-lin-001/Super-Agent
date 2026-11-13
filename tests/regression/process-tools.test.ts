@@ -1,5 +1,6 @@
 import { strict as assert } from 'node:assert';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import test from 'node:test';
 import { getEventListeners } from 'node:events';
@@ -40,6 +41,66 @@ test('同步等待读取真实尾部并将非零退出标记为失败', async ()
     assert.match(result.content, /ERR/);
     assert.match(result.content, /只给末尾/);
   } finally { await f.harness.cleanup(); }
+});
+
+test('建任务即预建默认 cwd，首条进程命令无需先写文件', async () => {
+  const harness = await createHarness({
+    worker: () => ({ text: 'ok', toolCalls: [], finishReason: 'stop' }) as never,
+    limits: { maxConcurrentRuns: 0 },
+  });
+  try {
+    const { task, owner } = harness.runtime.createTask({
+      title: '目录预建',
+      goal: '验证首条命令',
+      ownerRole: '负责人',
+      ownerBrief: '运行命令',
+    });
+    const dir = join(harness.config.workDir, task.id);
+    assert.equal(existsSync(dir), true);
+    const context: ToolContext = {
+      host: harness.runtime,
+      worker: owner,
+      task,
+      workDir: harness.config.workDir,
+      materialsDir: harness.config.materialsDir,
+      readRoot: harness.config.readRoot,
+    };
+    const result = await tool('proc_run').run({
+      command: process.execPath,
+      args: ['-e', 'process.stdout.write(process.cwd())'],
+      wait: true,
+    }, context);
+    assert.equal(result.type, 'ok');
+    assert.equal(result.content.trim().split('\n').at(-1), await realpath(dir));
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test('建任务事务失败时删除本次新目录且不留无数据库记录的半成品', async () => {
+  const harness = await createHarness({
+    worker: () => ({ text: 'ok', toolCalls: [], finishReason: 'stop' }) as never,
+    limits: { maxConcurrentRuns: 0 },
+  });
+  let taskId = '';
+  try {
+    assert.throws(() => harness.runtime.createTask({
+      title: '失败清理',
+      goal: 'g',
+      ownerRole: '负责人',
+      ownerBrief: 'b',
+    }, {
+      onRecorded: (task) => {
+        taskId = task.id;
+        throw new Error('模拟事务失败');
+      },
+    }), /模拟事务失败/);
+    assert.notEqual(taskId, '');
+    assert.equal(harness.store.getTask(taskId), null);
+    assert.equal(existsSync(join(harness.config.workDir, taskId)), false);
+  } finally {
+    await harness.cleanup();
+  }
 });
 
 test('超过 20MB 的中文日志保持字符偏移与分页，emoji 不被拆开', async () => {

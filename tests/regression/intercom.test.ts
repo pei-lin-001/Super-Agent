@@ -91,11 +91,57 @@ test('维护者状态：只给可核对的事实，不给推测', () => {
       expected: '主系统重启',
       result: '成功',
     } as never);
-    const status = store.maintainerStatus();
-    assert.ok(status.lastRestartAt !== null, '重启记录要能读到');
+    const actionOnly = store.maintainerStatus();
+    assert.equal(actionOnly.lastRestartAt, null, '维护动作不能冒充真实主进程拉起记录');
+    assert.ok(actionOnly.lastRestartActionAt !== null);
+    const status = store.maintainerStatus({ lastSpawnedRestartAt: '2026-11-13T04:06:58.695Z' });
+    assert.equal(status.lastRestartAt, '2026-11-13T04:06:58.695Z');
     assert.deepEqual(status.openIssues, [], '没有未解决事件时是空数组，不是 null');
     assert.ok(Array.isArray(status.recentCommands));
   });
+});
+
+test('维护者状态：Router 使用 restart.json 拉起记录，不拿旧动作冒充最近启动', async () => {
+  const { createHarness, toolResult } = await import('../helpers.ts');
+  const { mockReply } = await import('../../src/model/mock.ts');
+  const { recordRestart } = await import('../../src/watchdog/process.ts');
+  let captured = '';
+  const harness = await createHarness({
+    worker: () => mockReply({ text: 'ok' }),
+    router: ({ request }) => {
+      const result = toolResult(request);
+      if (result) {
+        captured = result;
+        return mockReply({ text: '已核对' });
+      }
+      return mockReply({ toolCalls: [{ id: 'status', name: 'read_maintainer_status', arguments: '{}' }] });
+    },
+    limits: { maxConcurrentRuns: 0 },
+  });
+  try {
+    harness.store.appendWdAction({
+      id: 'wda_old',
+      issueId: null,
+      commandId: null,
+      action: 'restart_main',
+      reason: '旧动作',
+      expected: '',
+      result: '动作已提交',
+    });
+    recordRestart(harness.config, {
+      attemptedAt: '2026-11-13T04:06:58.695Z',
+      outcome: 'spawned',
+      detail: '测试进程已创建',
+      pid: 56525,
+    });
+    await harness.router.handleUserMessage('系统最近重启过吗？');
+    assert.match(captured, /来源 restart\.json/);
+    assert.match(captured, /2026-11-13/);
+    assert.match(captured, /最近维护者重启动作：.*不代表这次启动成功/);
+    assert.doesNotMatch(captured, /上次重启：/);
+  } finally {
+    await harness.cleanup();
+  }
 });
 
 test('通信：路由筛选先于批次限制，定向消息保留话题且不能被 CLI 窃取', async () => {

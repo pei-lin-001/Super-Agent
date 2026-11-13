@@ -9,6 +9,9 @@ import type { OutboundArtifact, RuntimeEvent, Task } from '../domain/types.ts';
 import type { ChatMessage, ModelClient, ToolSchema } from '../model/types.ts';
 import type { Runtime } from './runtime.ts';
 import { Execution, ExecutionRevoked } from './execution.ts';
+import { formatArtifactRead } from '../tools/artifacts.ts';
+import { readRestartLog } from '../watchdog/process.ts';
+import { resolveArtifactPath } from '../channels/storage.ts';
 
 import { renderWorkspaces, routerStateBlock, routerSystemPrompt } from './prompts.ts';
 import type { DecisionClient } from '../model/decision.ts';
@@ -114,6 +117,22 @@ const ROUTER_TOOLS: ToolSchema[] = [
     },
   },
   {
+    name: 'read_artifact',
+    description:
+      '按名字和可选版本读取当前会话任务已登记的 UTF-8 文本产物。内容分页返回；需要核对报告正文、覆盖范围或证据强度时使用。',
+    parameters: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string', description: '任务 id' },
+        name: { type: 'string', description: '产物文件名，例如 report.md' },
+        version: { type: 'number', description: '版本号；省略表示最新版本' },
+        offset: { type: 'number', description: '字符偏移，默认 0' },
+        limit: { type: 'number', description: '本次读取字符数，默认 8000，最大 20000' },
+      },
+      required: ['task_id', 'name'],
+    },
+  },
+  {
     name: 'conversation_list',
     description: '列出当前聊天里的所有话题（编号、名字、是否当前）。用户问"有哪些话题/之前聊了什么话题"时用。',
     parameters: { type: 'object', properties: {}, required: [] },
@@ -165,7 +184,7 @@ const ROUTER_TOOLS: ToolSchema[] = [
   {
     name: 'read_maintainer_status',
     description:
-      '只读查看维护者当前掌握的事实：未解决事件、最近的控制指令结果、上次重启时间。' +
+      '只读查看维护者当前掌握的事实：未解决事件、最近的控制指令结果、最近主系统拉起记录。' +
       '回答"系统最近有什么问题""刚才为什么断了一下"之前先看它，不要猜。',
     parameters: { type: 'object', properties: {}, required: [] },
   },
@@ -198,6 +217,13 @@ function text(value: unknown, field: string): string {
 
 function optional(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() !== '' ? value : undefined;
+}
+
+function optionalNumber(value: unknown, field: string): number | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  const parsed = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : Number.NaN;
+  if (!Number.isFinite(parsed)) throw new Error(`参数 ${field} 必须是数字`);
+  return parsed;
 }
 
 /**
@@ -964,7 +990,11 @@ export class Router {
             }`;
           }
           const sessionKey = receipt?.sessionKey ?? null;
-          if (sessionKey === null) return `已找到产物 ${name}（CLI 会话不通过聊天发送文件）`;
+          if (sessionKey === null) {
+            const absolute = resolveArtifactPath(this.config.workDir, artifact.path);
+            if (!absolute) return `产物 ${artifact.name} v${artifact.version} 的登记快照已缺失或被移动，不能返回本机路径`;
+            return `已找到产物 ${artifact.name}（v${artifact.version}）；CLI 会话不通过聊天发送文件，本机路径：${absolute}`;
+          }
           this.publish({
             type: 'channel.outbound',
             sessionKey,
@@ -1056,9 +1086,23 @@ export class Router {
           return '已回复维护者。';
         }
         case 'read_maintainer_status': {
-          const status = this.runtime.store.maintainerStatus();
+          const lastSpawned = readRestartLog(this.config)
+            .filter((record) => record.outcome === 'spawned')
+            .at(-1);
+          const status = this.runtime.store.maintainerStatus({
+            lastSpawnedRestartAt: lastSpawned?.attemptedAt ?? null,
+          });
           const lines = [
-            `上次重启：${status.lastRestartAt ? beijingTime(status.lastRestartAt) : '（没有重启记录）'}`,
+            `最近主系统进程拉起记录：${
+              status.lastRestartAt
+                ? `${beijingTime(status.lastRestartAt)}（来源 restart.json；只证明进程已创建，不证明心跳恢复）`
+                : '（restart.json 中没有 spawned 记录）'
+            }`,
+            `最近维护者重启动作：${
+              status.lastRestartActionAt
+                ? `${beijingTime(status.lastRestartActionAt)}（只是动作记录，不代表这次启动成功）`
+                : '（没有）'
+            }`,
             `未解决事件：${status.openIssues.length === 0 ? '无' : ''}`,
             ...status.openIssues.map(
               (issue) => `- ${issue.id}｜${issue.title}｜最后出现 ${beijingTime(issue.lastSeen)}${issue.note ? `｜${issue.note}` : ''}`,
@@ -1132,6 +1176,22 @@ export class Router {
             ...recent.map((message) => `  - [${message.id}] ${message.fromId}→${message.toId} ${message.kind} ${message.status}：${message.body.slice(0, 120)}`),
           ];
           return lines.join('\n');
+        }
+        case 'read_artifact': {
+          const allowed = this.taskForAction(
+            text(args['task_id'], 'task_id'),
+            receipt?.sessionKey ?? null,
+            receipt?.scope?.conversationId ?? null,
+          );
+          if (!allowed.ok) return allowed.message;
+          return await formatArtifactRead(
+            this.runtime,
+            allowed.task.id,
+            text(args['name'], 'name'),
+            optionalNumber(args['version'], 'version') ?? null,
+            optionalNumber(args['offset'], 'offset') ?? 0,
+            optionalNumber(args['limit'], 'limit') ?? 8000,
+          );
         }
         default:
           return `未知工具：${name}`;

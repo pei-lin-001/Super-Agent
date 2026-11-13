@@ -2,6 +2,7 @@ import { createInterface } from 'node:readline';
 import type { Message, Task, Worker } from '../domain/types.ts';
 import type { Runtime } from '../runtime/runtime.ts';
 import type { Router } from '../runtime/router.ts';
+import { formatTaskUsage } from './usage.ts';
 
 export interface ReplOptions {
   runtime: Runtime;
@@ -15,6 +16,7 @@ const HELP = `可用命令：
   /messages <workerId>   查看某个 Worker 的收发消息
   /trace <taskId>        查看任务完整消息链与事件
   /artifacts <taskId>    查看产物
+  /usage <taskId>        查看任务相关模型调用与 token 用量
   /stop <taskId> [原因]   取消任务
   /help                  显示本帮助
   /quit                  退出
@@ -183,6 +185,15 @@ export async function startRepl(options: ReplOptions): Promise<void> {
               .join('\n'),
           );
         }
+        return true;
+      }
+      case 'usage': {
+        if (!argument) {
+          write('用法：/usage <taskId>');
+          return true;
+        }
+        const usage = runtime.store.taskUsage(argument);
+        write(usage ? formatTaskUsage(usage) : `任务不存在：${argument}`);
         return true;
       }
       case 'stop': {

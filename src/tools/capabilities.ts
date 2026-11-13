@@ -41,6 +41,10 @@ export const capabilityTools: ToolDefinition[] = [
       lines.push(`任务目录：${join(context.workDir, context.task.id)}`);
       lines.push(`只读材料目录：${context.materialsDir}`);
       lines.push(`额外只读根：${context.readRoot}`);
+      lines.push(
+        `默认工作目录和 fs_* 的 "." 都是任务目录。相对路径先查任务目录，未命中才查只读根；` +
+          `要查看整个仓库或只读根，请显式传入绝对路径 ${context.readRoot}。`,
+      );
       lines.push('文件写入限于任务目录；命令执行不受此限制（见下方隔离说明）。');
 
       lines.push('\n# 解释器与系统工具');
